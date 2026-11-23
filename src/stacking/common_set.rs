@@ -1081,6 +1081,8 @@ mod tests {
 
     #[test]
     fn the_match_goes_through_a_flipped_registration_map() {
+        // It maps through TPS frames: hold the grid counters' lock (`grid_counters::exclusive`).
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
         let world = sky(200, 20);
         let anchor_fits = fits_of(&world, &Shot::new(1.0, 3.0));
         let ident = identity();
