@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+env:
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The tag must name the version in Cargo.toml.
+      - name: Check the tag against Cargo.toml
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$version" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # The release notes are the version's CHANGELOG.md section: from its `## [X.Y.Z]` heading to the next `## [`.
+      - name: Release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          awk -v head="## [$VERSION]" '
+            index($0, head) == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for $VERSION"
+            exit 1
+          fi
+
+      # A re-run of the workflow edits the release it made the first time. No binaries and no crates.io leg yet.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "starloom $VERSION" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "starloom $VERSION" --notes-file notes.md
+          fi

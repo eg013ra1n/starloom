@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Every layer on Linux: none, engine, stack, ts, and the default (stack + ts).
+  linux:
+    name: Linux (${{ matrix.features.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - { name: base, args: "--no-default-features" }
+          - { name: engine, args: "--no-default-features --features engine" }
+          - { name: stack, args: "--no-default-features --features stack" }
+          - { name: ts, args: "--no-default-features --features ts" }
+          - { name: default, args: "" }
+    steps:
+      - uses: actions/checkout@v5
+      # rustup reads rust-toolchain.toml and installs what it pins on the first call that needs it.
+      - name: Resolve the pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features.name }}
+      - name: Test
+        run: cargo test --locked ${{ matrix.features.args }}
+
+  # The default layer set on the other two platforms. The float golden rows are recorded for aarch64-macos; a platform
+  # without rows checks determinism only (tests/stage_goldens.rs).
+  platforms:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve the pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked
+
+  # crates.io refuses a git dependency, so this fails until solvemyastro is published there (see README). The job
+  # passes on exactly that failure and says so when publishing starts to work. The error goes to RUNNER_TEMP: a file in
+  # the checkout would make the tree dirty and cargo would refuse for that instead.
+  publish-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve the pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version
+      - name: cargo publish --dry-run
+        run: |
+          if cargo publish --dry-run --locked 2> "$RUNNER_TEMP/publish.err"; then
+            echo "::notice::cargo publish --dry-run passes now: crates.io publication is possible"
+          elif grep -q 'dependency `solvemyastro` does not specify a version' "$RUNNER_TEMP/publish.err"; then
+            echo "expected: solvemyastro is a git dependency"
+          else
+            cat "$RUNNER_TEMP/publish.err"
+            exit 1
+          fi
