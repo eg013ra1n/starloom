@@ -2693,6 +2693,8 @@ mod tests {
 
     #[test]
     fn deposit_skip_predicate_never_rejects_a_pixel_with_nonzero_clipped_area() {
+        // It builds TPS grids: hold the grid counters' lock (`grid_counters::exclusive`).
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
         const DROP_SHRINK: f64 = 0.9;
         const SCALE: u32 = 2;
         let out_w = W * SCALE as usize;
