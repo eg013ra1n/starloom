@@ -215,6 +215,14 @@ pub mod grid_counters {
     }
 
     pub(super) fn on_build() {
+        // This crate's own tests: a grid built while nobody holds the lock comes from a test that forgot
+        // `exclusive()`; it fails there, by name, instead of skewing another test's count (v0.1.1 and v0.1.2 each
+        // fixed one such test, found by a Windows run). Never a false alarm: a build under the lock finds it taken.
+        // Not under `test-support`: Athenaeum's tests build grids with their own rules.
+        #[cfg(test)]
+        if EXCLUSIVE.try_lock().is_ok() {
+            panic!("a TPS grid was built outside grid_counters::exclusive(): the test that builds it must hold the lock");
+        }
         BUILDS.fetch_add(1, Ordering::Relaxed);
         let now = ALIVE.fetch_add(1, Ordering::Relaxed) + 1;
         PEAK_ALIVE.fetch_max(now, Ordering::Relaxed);
