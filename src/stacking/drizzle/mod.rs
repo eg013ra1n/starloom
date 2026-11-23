@@ -4363,6 +4363,8 @@ mod tests {
     #[test]
     fn the_phase_table_tracks_the_exact_clip_on_a_tps_frame() {
         use crate::geometry::{DistortionModel, ThinPlateSpline};
+        // It builds TPS grids: hold the grid counters' lock (`grid_counters::exclusive`).
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
         const W: usize = 600;
         const H: usize = 400;
         assert!(
