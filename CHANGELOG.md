@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-11-23
+
+Test-only. No stage output moves; every stage version stays and the golden rows are unchanged.
+
+### Fixed
+
+- The drizzle phase-table TPS pin and the common-set flipped-map test hold `grid_counters::exclusive()`, as every
+  test that builds a TPS grid must: the counters are process-global, and on a 16-thread Windows runner one of their
+  grids landed inside `registered_source`'s one-grid-per-frame count (2, not 1).
+
 ## [0.1.0] — 2026-11-23
 
 The stacking kernel as its own repository, extracted from Athenaeum bit for bit: geometry and resampling, the
