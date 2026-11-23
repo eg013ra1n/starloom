@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-11-23
+
+Test-only. No stage output moves; every stage version stays and the golden rows are unchanged.
+
+### Fixed
+
+- The drizzle test `deposit_skip_predicate_never_rejects_a_pixel_with_nonzero_clipped_area` holds
+  `grid_counters::exclusive()`: it built TPS grids without it, and on a 16-thread Windows runner one of them again
+  landed inside `registered_source`'s one-grid-per-frame count. It was the last such test (an `on_build` check run on
+  one thread found no other).
+
+### Changed
+
+- This crate's own tests enforce the rule: a TPS grid built while nobody holds the lock panics in the test that built
+  it, by name, instead of skewing another test's count (`cfg(test)` only; `test-support` builds are unchanged).
+
 ## [0.1.1] — 2026-11-23
 
 Test-only. No stage output moves; every stage version stays and the golden rows are unchanged.
