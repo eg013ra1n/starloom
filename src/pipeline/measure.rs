@@ -15,7 +15,8 @@
 //!
 //! [`finish`] is the second half of Athenaeum's `measure_group_finish`: the fold, the weights and the selection, computed
 //! from the stored measurements. `measure` runs it once; a later command that runs under another weight mode runs it
-//! again (P2-R21) and never measures again.
+//! again over the stored values (P2-R21) and never measures again. The fold lives in `finish` only: reading
+//! `measure.json` returns the values before it, and a report `finish` has folded says so ([`MeasureReport::folded`]).
 //!
 //! Measure reads plain FITS only, as Athenaeum's run does: an XISF or compressed frame is refused with the reason, and
 //! `calibrate` writes plain FITS unless `--format xisf` was given (P2-R11). Everything that decodes a pixel or fits a
@@ -28,7 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Context, Result};
-use astroimage::header::{read_header_key_map, FrameFacts, HeaderKeyMap};
+use astroimage::header::{normalize_keyword, read_header_key_map, FrameFacts, HeaderKeyMap};
 
 use crate::calibration_library::flat_cards::slm_cscl;
 use crate::geometry::header_pixel_scale_arcsec;
@@ -107,23 +108,39 @@ fn stars_in(dir: &Path, stem: &str, plane: usize) -> PathBuf {
 // Inputs
 // ---------------------------------------------------------------------------------------------------------------
 
-/// The refusal of a frame Measure cannot read (P2-R11): an XISF file or a compressed one, by name or by magic bytes.
-/// `None` for anything else, which the plane reader then judges.
-fn unsupported_format(path: &Path) -> Option<&'static str> {
+/// What `calibrate` does about an XISF frame.
+const XISF_HINT: &str = "`starloom calibrate` writes plain FITS unless --format xisf is given, so run it again without that option";
+/// What to do about a compressed frame.
+const COMPRESSED_HINT: &str = "give measure the plain FITS frames `starloom calibrate` writes, or decompress this one first";
+
+/// The refusal of a frame Measure cannot read (P2-R11): an XISF file or a compressed one, by name or by magic bytes,
+/// as `(what it is, what to do)`. `None` for anything else, which the plane reader then judges.
+fn unsupported_format(path: &Path) -> Option<(&'static str, &'static str)> {
     let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
     if ext.as_deref() == Some("xisf") {
-        return Some("an XISF file");
+        return Some(("an XISF file", XISF_HINT));
     }
     if matches!(ext.as_deref(), Some("fz" | "gz")) {
-        return Some("a compressed file");
+        return Some(("a compressed file", COMPRESSED_HINT));
     }
     let mut magic = [0u8; 8];
     let read = std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic));
     match read {
-        Ok(()) if magic[..2] == [0x1f, 0x8b] => Some("a gzip-compressed file"),
-        Ok(()) if &magic == b"XISF0100" => Some("an XISF file"),
+        Ok(()) if magic[..2] == [0x1f, 0x8b] => Some(("a gzip-compressed file", COMPRESSED_HINT)),
+        Ok(()) if &magic == b"XISF0100" => Some(("an XISF file", XISF_HINT)),
         _ => None,
     }
+}
+
+/// A header card's number by the key as written (Athenaeum reads `FitsHeader::get_f64` with the configured key and does
+/// not normalise it): the key map holds the cards' keywords trimmed and upper-cased, as `FitsHeader` does, so a key
+/// that normalisation would change (`ssweight`, `SSWEIGHT `) matches no card, exactly as it matches none there. The one
+/// divergence is a mixed-case `HIERARCH` keyword, which `FitsHeader` keeps as written and the map upper-cases.
+fn number_as_written(map: &HeaderKeyMap, key: &str) -> Option<f64> {
+    if normalize_keyword(key).as_deref() != Some(key) {
+        return None;
+    }
+    map.number(key)
 }
 
 /// A calibrated frame's gain in e- per calibrated unit (Athenaeum's `gain_from_header`, P2-R7): `EGAIN` times
@@ -137,7 +154,7 @@ fn header_gain(path: &Path) -> Option<f64> {
             return None;
         }
     };
-    let gain = map.number("EGAIN").zip(slm_cscl(&map)).map(|(egain, cscl)| egain * cscl);
+    let gain = number_as_written(&map, "EGAIN").zip(slm_cscl(&map)).map(|(egain, cscl)| egain * cscl);
     if gain.is_none() {
         tracing::debug!(path = %path.display(), "snr: no EGAIN and SLM_CSCL in the header; the shot term is omitted");
     }
@@ -360,9 +377,10 @@ fn run_pass1_and_spill(
 /// frame's own header (P2-R3); the weight keyword is read from the calibrated frame's header. `fwhm_arcsec` in
 /// `measure.csv` needs the pixel size and focal length of those facts and is empty without them.
 ///
-/// A frame whose measurement fails is excluded with the reason and the run goes on; one that is XISF or compressed
-/// refuses the whole run (P2-R11). A group with fewer than 3 included frames is warned about, as Athenaeum's run skips
-/// such a group. The returned report is what `measure.json` holds: measurements before the fold, weights and selection
+/// A frame whose measurement fails, or whose header cannot be read, is excluded with the reason and a warning and the
+/// run goes on; one that is XISF or compressed refuses the whole run (P2-R11), and so does a run in which no frame could
+/// be measured (nothing is written then). A group with fewer than 3 included frames is warned about: Athenaeum's run
+/// skips such a group, and a stack needs the 3. The returned report is what `measure.json` holds: measurements before the fold, weights and selection
 /// after it. The products are built in `<work>/measure.part/` and renamed into place together with the manifest entry
 /// ([`commit_stage`]), so a failure or a cancel leaves no entry and no half-written folder. Everything that decodes a
 /// pixel or fits a star runs on the context's pool (SL-9).
@@ -385,12 +403,8 @@ pub fn measure(
     let mut files: Vec<PathBuf> = Vec::with_capacity(frames.len());
     for frame in frames {
         let abs = std::path::absolute(frame).with_context(|| format!("cannot make {} absolute", frame.display()))?;
-        if let Some(what) = unsupported_format(&abs) {
-            bail!(
-                "{}: measure reads plain FITS only, and this is {what}; `starloom calibrate` writes plain FITS unless \
-                 --format xisf is given, so run it again without that option",
-                abs.display()
-            );
+        if let Some((what, hint)) = unsupported_format(&abs) {
+            bail!("{}: measure reads plain FITS only, and this is {what}; {hint}", abs.display());
         }
         files.push(abs);
     }
@@ -417,7 +431,18 @@ fn run(
 ) -> Result<MeasureReport> {
     // The raw lights' facts: exposure and date (P2-R3), and the pixel scale.
     let manifest = Manifest::load(ctx.work_dir)?;
-    let sources = source_facts(&manifest, &files)?;
+    // A frame whose header cannot be read has no facts; the plane reader then excludes it with its own reason, as
+    // Athenaeum excludes a calibrated frame it cannot read, and the run goes on.
+    let mut sources: BTreeMap<PathBuf, FrameFacts> = BTreeMap::new();
+    for file in &files {
+        match source_facts(&manifest, std::slice::from_ref(file)) {
+            Ok(one) => sources.extend(one),
+            Err(e) => {
+                tracing::warn!(path = %file.display(), error = %format!("{e:#}"), "frame header facts could not be read; the frame has none");
+                sources.insert(file.clone(), FrameFacts::default());
+            }
+        }
+    }
     let facts: Vec<FrameFacts> = files.iter().map(|f| sources[f].clone()).collect();
     let order = order_lights(&files, &facts)?;
     let files: Vec<PathBuf> = order.iter().map(|&i| files[i].clone()).collect();
@@ -436,20 +461,19 @@ fn run(
         let frame_gain = if unreadable.is_none() { gain.or_else(|| header_gain(file)) } else { None };
         members.push(Member { file: file.clone(), stem: frame_stem(file).to_string(), unreadable, size, gain: frame_gain });
     }
-    let mut warnings: Vec<String> = Vec::new();
-    let mut warn = |message: String| {
-        tracing::warn!("{message}");
-        ctx.progress.warn(&message);
-        warnings.push(message);
-    };
+    // The caller's progress sink gets the text; every call site writes its own log line (a stable message, data in fields).
+    let warn = |message: &str| ctx.progress.warn(message);
     for m in members.iter().filter(|m| m.unreadable.is_some()) {
-        warn(format!("{}: {}; the frame is excluded", m.file.display(), m.unreadable.as_deref().unwrap_or_default()));
+        let reason = m.unreadable.as_deref().unwrap_or_default();
+        tracing::warn!(path = %m.file.display(), reason = %reason, "frame excluded");
+        warn(&format!("{}: {reason}; the frame is excluded", m.file.display()));
     }
     let measurable: Vec<usize> = (0..members.len()).filter(|&i| members[i].unreadable.is_none()).collect();
     if gain.is_none() {
         let missing = measurable.iter().filter(|&&i| members[i].gain.is_none()).count();
         if missing > 0 {
-            warn(format!(
+            tracing::warn!(missing, frames = measurable.len(), "frames without a gain; their SNR has no shot term");
+            warn(&format!(
                 "{missing} of {} frames have no gain (EGAIN and SLM_CSCL are not both in their headers), so their SNR has no \
                  shot term; give --gain to set one",
                 measurable.len()
@@ -461,7 +485,7 @@ fn run(
     let part_dir = part_path(&final_dir);
     remove_dir_if_present(&part_dir)?;
     std::fs::create_dir_all(&part_dir).with_context(|| format!("cannot create {}", part_dir.display()))?;
-    let built = build(ctx, cfg, &opts, auto, &members, &measurable, &sources, &part_dir, stars_csv, &mut warn);
+    let built = build(ctx, cfg, &opts, auto, &members, &measurable, &sources, &part_dir, stars_csv, &warn);
     let (report, csv, mut produced) = match built {
         Ok(v) => v,
         Err(e) => {
@@ -526,7 +550,7 @@ fn build(
     sources: &BTreeMap<PathBuf, FrameFacts>,
     dir: &Path,
     stars_csv: bool,
-    warn: &mut dyn FnMut(String),
+    warn: &dyn Fn(&str),
 ) -> Result<(MeasureReport, String, Vec<PathBuf>)> {
     let mut report = MeasureReport::new(cfg.clone(), recorded_versions());
     report.frames = members
@@ -575,7 +599,7 @@ fn build(
         for (k, res) in results.into_iter().enumerate() {
             let i = measurable[k];
             match res.ok_or_else(|| anyhow!("cancelled"))? {
-                Ok(done) => take(&mut report, i, done, &mut produced, &mut *warn),
+                Ok(done) => take(&mut report, i, done, &mut produced, warn),
                 Err(message) => exclude(&mut report, i, message),
             }
         }
@@ -629,7 +653,7 @@ fn build(
                     match read_pass1(&spill, &m.file, opts) {
                         Ok(p) => Some(p),
                         Err(e) => {
-                            tracing::warn!(path = %spill.display(), error = %e, "measure: first-pass artifact refused after it was validated; pass 1 re-runs");
+                            tracing::warn!(path = %spill.display(), error = %e, "measure: first-pass artifact refused on read; pass 1 re-runs");
                             None
                         }
                     }
@@ -662,7 +686,7 @@ fn build(
                 match res.ok_or_else(|| anyhow!("cancelled"))? {
                     Ok((done, written)) => {
                         spilled[i] = spilled[i] || written;
-                        take(&mut report, i, done, &mut produced, &mut *warn);
+                        take(&mut report, i, done, &mut produced, warn);
                     }
                     Err(failure) => {
                         spilled[i] = spilled[i] || failure.written;
@@ -678,6 +702,16 @@ fn build(
         }
     }
 
+    // A measure in which no frame was measured has nothing to store: it fails, naming why each frame is out.
+    if report.frames.iter().all(|f| f.measurement.is_none()) {
+        let reasons: Vec<String> = report
+            .frames
+            .iter()
+            .map(|f| format!("{}: {}", f.file.display(), f.reason.as_deref().unwrap_or("not measured")))
+            .collect();
+        bail!("no frame could be measured: {}", reasons.join("; "));
+    }
+
     // Weights and selection over what was measured; the stored measurements stay as the module made them.
     let finished = finish(&report, cfg, sources);
     for (stored, done) in report.frames.iter_mut().zip(&finished.frames) {
@@ -689,20 +723,18 @@ fn build(
     report.group_c = finished.group_c.clone();
     let included = report.frames.iter().filter(|f| f.included).count();
     if included < 3 {
-        warn(format!(
-            "only {included} of {} frames are included; a stack needs at least 3 (Athenaeum's run skips such a group)",
-            report.frames.len()
-        ));
+        tracing::warn!(included, frames = report.frames.len(), "fewer than 3 frames included; a stack needs at least 3");
+        warn(&format!("only {included} of {} frames are included; a stack needs at least 3", report.frames.len()));
     }
     let csv = measure_csv(&finished, sources);
     Ok((report, csv, produced))
 }
 
 /// Records a measured frame in the report and its files in `produced`; the worker's warnings are raised here.
-fn take(report: &mut MeasureReport, i: usize, done: Measured, produced: &mut Vec<PathBuf>, warn: &mut dyn FnMut(String)) {
+fn take(report: &mut MeasureReport, i: usize, done: Measured, produced: &mut Vec<PathBuf>, warn: &dyn Fn(&str)) {
     report.frames[i].measurement = Some(done.measurement);
     produced.extend(done.files);
-    for w in done.warnings {
+    for w in &done.warnings {
         warn(w);
     }
 }
@@ -711,10 +743,17 @@ fn take(report: &mut MeasureReport, i: usize, done: Measured, produced: &mut Vec
 // Weights and selection
 // ---------------------------------------------------------------------------------------------------------------
 
-/// The weight keyword's value in a calibrated frame's header; `None` when the header or the card is missing.
+/// The weight keyword's value in a calibrated frame's header, by the key as written ([`number_as_written`]); `None`
+/// when the header is unreadable (logged: the frame then has no weight) or the card is missing.
 fn keyword_value(path: &Path, keyword: &str) -> Option<f64> {
-    let map: HeaderKeyMap = read_header_key_map(path).ok()?;
-    map.number(keyword)
+    let map: HeaderKeyMap = match read_header_key_map(path) {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), keyword, error = %format!("{e:#}"), "weight keyword: the header could not be read; no value");
+            return None;
+        }
+    };
+    number_as_written(&map, keyword)
 }
 
 /// The second half of Athenaeum's `measure_group_finish`, over the stored measurements: the group's aperture-correction
@@ -723,14 +762,20 @@ fn keyword_value(path: &Path, keyword: &str) -> Option<f64> {
 /// channel's median aperture correction), and its `weight`, `included`, `reason` and `measure_floored` recomputed; a frame
 /// with no measurement keeps its reason. `group_c` holds the per-plane inputs of the fold.
 ///
-/// `report` must hold the module's values, as `measure.json` stores them: a folded report folds a second time, which
-/// scales the substituted planes again. `sources` gives each frame's raw-light facts by the frame's path: the exposure
+/// `report` holds the module's values, as `measure.json` stores them. The result is marked
+/// [`folded`](MeasureReport::folded); a report that is already marked is not folded again (a second fold would scale
+/// the substituted planes a second time), its weights and selection are recomputed over the values it holds and its
+/// `group_c` is kept. `sources` gives each frame's raw-light facts by the frame's path: the exposure
 /// the exposure weight reads comes from there (P2-R3; a frame with no entry has none), and a caller takes the map from
 /// the manifest ([`source_facts`]). The keyword weight reads the calibrated frame's header, as Athenaeum's run does.
 pub fn finish(report: &MeasureReport, cfg: &AlgorithmConfig, sources: &BTreeMap<PathBuf, FrameFacts>) -> MeasureReport {
     let mut out = report.clone();
     out.config = cfg.clone();
-    out.group_c.clear();
+    let already_folded = out.folded;
+    out.folded = true;
+    if !already_folded {
+        out.group_c.clear();
+    }
     for f in &mut out.frames {
         if f.measurement.is_some() {
             f.weight = None;
@@ -741,7 +786,11 @@ pub fn finish(report: &MeasureReport, cfg: &AlgorithmConfig, sources: &BTreeMap<
     }
 
     // The fold: one channel at a time, over every measured member (never narrowed to the included ones).
-    let channels = out.frames.iter().filter_map(|f| f.measurement.as_ref()).map(|m| m.channels.len()).max().unwrap_or(0);
+    let channels = if already_folded {
+        0
+    } else {
+        out.frames.iter().filter_map(|f| f.measurement.as_ref()).map(|m| m.channels.len()).max().unwrap_or(0)
+    };
     for plane in 0..channels {
         let kept = channel_c_inputs(out.frames.iter().filter_map(|f| f.measurement.as_ref()).filter_map(|m| m.channels.get(plane)));
         let c = channel_c_summary(&kept);
@@ -785,6 +834,12 @@ pub fn finish(report: &MeasureReport, cfg: &AlgorithmConfig, sources: &BTreeMap<
     }
 
     let mode = cfg.measurement.weight_mode;
+    if mode == WeightMode::Keyword && normalize_keyword(&cfg.measurement.keyword).as_deref() != Some(cfg.measurement.keyword.as_str()) {
+        tracing::warn!(
+            keyword = %cfg.measurement.keyword,
+            "weight keyword is not a card name as written (upper case, no surrounding space); no frame has a value"
+        );
+    }
     let keywords: Vec<Option<f64>> = weigh
         .iter()
         .map(|&i| if mode == WeightMode::Keyword { keyword_value(&out.frames[i].file, &cfg.measurement.keyword) } else { None })
@@ -880,4 +935,22 @@ fn measure_csv(finished: &MeasureReport, sources: &BTreeMap<PathBuf, FrameFacts>
         }
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A header that cannot be read is logged, never dropped silently: the weight keyword and the gain both say so.
+    #[test]
+    fn an_unreadable_header_is_logged_and_gives_no_keyword_value_and_no_gain() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("none.fits");
+        let (value, logs) = crate::test_support::capture_logs(|| keyword_value(&missing, "SSWEIGHT"));
+        assert_eq!(value, None);
+        assert!(logs.contains("weight keyword: the header could not be read"), "{logs}");
+        let (gain, logs) = crate::test_support::capture_logs(|| header_gain(&missing));
+        assert_eq!(gain, None);
+        assert!(logs.contains("snr: the header could not be read"), "{logs}");
+    }
 }

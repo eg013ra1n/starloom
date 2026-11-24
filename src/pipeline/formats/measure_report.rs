@@ -1,8 +1,9 @@
 //! `measure.json`: what `measure` found in every frame.
 //!
 //! The report stores the module's values **before** the group's fold (the floored planes' stand-in aperture
-//! correction, P2-R21), and the fold is applied on read, as Athenaeum's run does (`measure_group_finish`), so a later
-//! command recomputes weights and the selection from it under its own config. `weight` and `included` are what the
+//! correction, P2-R21). The fold is not applied by [`MeasureReport::read`]: [`finish`](crate::pipeline::finish) applies
+//! it, as Athenaeum's run does on every run (`measure_group_finish`), so a later command recomputes the fold, the
+//! weights and the selection from the stored values under its own config. `weight` and `included` are what the
 //! `measure` command computed; they are a record, never an input.
 
 use std::collections::BTreeMap;
@@ -79,7 +80,11 @@ pub struct MeasureFrame {
     pub included: bool,
     /// Why it did not, or a note on why it did.
     pub reason: Option<String>,
-    /// Whether a plane of the frame is at the fit-call floor.
+    /// Whether the weight floor the PSF weight modes defer (Athenaeum's PD-18) will exclude the frame: its weight at
+    /// `measure` time is below `selection.min_weight_fraction` of the group's best, and the frame is kept for now
+    /// because registration judges the floor on the weight over the stars the members have in common. The reference
+    /// pick must not choose such a frame. Always `false` under the other weight modes (they exclude at `measure` time)
+    /// and for a frame that is not included.
     pub measure_floored: bool,
 }
 
@@ -103,6 +108,15 @@ pub struct MeasureReport {
     pub group_c: Vec<GroupC>,
     /// One row per frame, in the pipeline's frame order (P2-R10).
     pub frames: Vec<MeasureFrame>,
+    /// Whether the group's aperture-correction fold is already applied to the measurements: `false` in everything
+    /// `measure` stores and returns, `true` in what [`finish`](crate::pipeline::finish) returns. `finish` folds a
+    /// report once and leaves a folded one as it is (a second fold would scale the substituted planes again).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub folded: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl MeasureReport {
@@ -116,6 +130,7 @@ impl MeasureReport {
             group_beta: None,
             group_c: Vec::new(),
             frames: Vec::new(),
+            folded: false,
         }
     }
 

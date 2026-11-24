@@ -63,10 +63,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the weights, the selection and the group beta), `measure.csv` (one row per frame and channel, folded values), the
   `.athf` star fits per plane and, on request, a CSV of every accepted star; `finish` is all of Athenaeum's
   `measure_group_finish` (the fold, the weights of any weight mode, the selection) over stored measurements, for a later
-  command that runs under another weight mode. The gain is `--gain`, else `EGAIN` times `SLM_CSCL`; a frame's exposure
-  and date come from the raw light's facts the `calibrate` entry recorded. An XISF or compressed frame is refused with
-  the reason. A frame with no measurement is a row with `measurement: null` in `measure.json` (it was unreadable or its
-  measurement failed).
+  command that runs under another weight mode; it folds a report once (the report it returns is marked `folded`). The
+  gain is `--gain`, else `EGAIN` times `SLM_CSCL`; a frame's exposure and date come from the raw light's facts the
+  `calibrate` entry recorded, else from the frame's own header. The keyword weight and `EGAIN` are read by the key as
+  written, as Athenaeum reads them (a configured `ssweight` finds no `SSWEIGHT` card), and an unreadable header is
+  logged. An XISF or compressed frame is refused with the reason. A frame with no measurement is a row with
+  `measurement: null` in `measure.json` (it was unreadable, with a warning, or its measurement failed); a measure in
+  which no frame could be measured fails and writes nothing.
 - `[profile.release]` is `lto = "thin"`, `codegen-units = 4`, Athenaeum's release profile, for a standalone build.
 
 ## [0.1.2] — 2026-11-23
