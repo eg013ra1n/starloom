@@ -1872,7 +1872,7 @@ fn register_accepts_a_reference_outside_the_frames() {
         let (dx, dy) = (SHIFTS[k].0 - 1.0, SHIFTS[k].1 - 1.0);
         assert!((x - (cx - dx)).abs() < 0.05 && (y - (cy - dy)).abs() < 0.05, "frame {k}: ({x}, {y})");
         // No frame is the reference, so none has the identity: even the unshifted frame moves by one pixel.
-        assert!(row.rms_px > 0.0 && row.inlier_ratio < 1.0 + 1e-12);
+        assert!(row.rms_px > 0.0 && row.inlier_ratio > 0.5 && row.inlier_ratio <= 1.0, "frame {k}: {row:?}");
         assert!(!(x == cx && y == cy), "frame {k} got the identity");
     }
     assert!(!report.transforms.frames.iter().any(|t| t.file == outside));
@@ -1914,8 +1914,12 @@ fn register_auto_picks_the_best_weighted_frame_and_skips_floored_ones() {
 
     // Under the default config the best weighted frame is the reference, and it gets the identity.
     let report = register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::Auto, &c, false).unwrap();
-    let normalized: Vec<f64> = report.weights.frames.iter().map(|f| f.weight.as_ref().unwrap().normalized_mean).collect();
-    let best = normalized.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    // The pick reads Measure's weights (`finish`'s), not the reweighed ones the report holds.
+    let sources = source_facts(&Manifest::load(&work).unwrap(), &frames).unwrap();
+    let measure_weights: Vec<f64> =
+        finish(&measured, &c, &sources).frames.iter().map(|f| f.weight.as_ref().unwrap().normalized_mean).collect();
+    let best = measure_weights.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    assert_eq!(best, 0, "frame 0 is the brightest: {measure_weights:?}");
     assert_eq!(report.transforms.reference, frames[best]);
     assert!(!report.transforms.reference_pinned);
     let (x, y) = report.transforms.frames[best].map.as_ref().unwrap().forward_exact(12.5, 40.25);
@@ -1938,6 +1942,8 @@ fn register_auto_picks_the_best_weighted_frame_and_skips_floored_ones() {
     // Naming a reference needs no pick.
     let named = register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::File(frames[2].clone()), &selective, false).unwrap();
     assert_eq!(named.transforms.reference, frames[2]);
+    // PD-17: it stays included under the floor it is below.
+    assert!(named.weights.frames[2].included && named.weights.frames[2].reason.is_none());
 }
 
 #[test]
@@ -2001,4 +2007,302 @@ fn current_weights_refuses_a_newly_included_frame_without_a_transform() {
     let stranger = field_frame(&tmp.path().join("cal").join("c_Light_0042.fits"), &grid_stars(), 0.0, 0.0, 1.0, 5, &[]);
     let err = format!("{:#}", register(&env.ctx(&work), &[stranger], &measured, &ReferenceChoice::Auto, &c, false).unwrap_err());
     assert!(err.contains("c_Light_0042.fits") && err.contains("`starloom measure`"), "{err}");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The review round for `register`
+// ---------------------------------------------------------------------------------------------------------------
+
+fn name_of(p: &Path) -> String {
+    p.file_name().unwrap().to_string_lossy().into_owned()
+}
+
+/// The map of every frame at the plane's centre, for comparing two runs.
+fn centre_maps(report: &RegisterReport) -> Vec<(f64, f64)> {
+    report.transforms.frames.iter().map(|t| t.map.as_ref().unwrap().forward_exact(384.0, 256.0)).collect()
+}
+
+#[test]
+fn a_named_reference_the_selection_cuts_is_forced_into_the_stack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let frames = shifted_frames(&tmp.path().join("cal"));
+    let c = cfg();
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    // Frame 2 has too few stars for the selection below, and is named the reference.
+    let mut tampered = measured.clone();
+    tampered.frames[2].measurement.as_mut().unwrap().channels[0].stars_fitted = 2;
+    let mut selective = c.clone();
+    selective.selection.min_stars = Some(10);
+
+    let report = register(&env.ctx(&work), &frames, &tampered, &ReferenceChoice::File(frames[2].clone()), &selective, false).unwrap();
+    let row = &report.weights.frames[2];
+    assert!(row.included && row.reason.is_none(), "{:?}", row.reason);
+    // It is a member of the reweigh: weighed, and its channel carries the common-set terms.
+    assert!(row.weight.is_some());
+    let ch = &row.measurement.as_ref().unwrap().channels[0];
+    assert!(ch.common_stars.is_some_and(|n| n >= 20) && ch.common_tflux.is_some(), "{ch:?}");
+    assert!(report.weights.frames.iter().all(|f| f.included));
+    assert!(env.progress.all().iter().any(|w| w.contains("c_Light_0002.fits") && w.contains("kept despite selection")), "{:?}", env.progress.all());
+    // Its row in transforms is the identity, and every other frame is registered onto it.
+    assert!(report.transforms.frames.iter().all(|t| t.ok));
+    // `current_weights` over the same inputs forces it in the same way.
+    let again = current_weights(&env.ctx(&work), &tampered, &report, &selective).unwrap();
+    assert_eq!(again, report.weights);
+
+    // An auto pick does not: the frame stays out, with its reason, and is no member.
+    let auto = register(&env.ctx(&work), &frames, &tampered, &ReferenceChoice::Auto, &selective, false).unwrap();
+    assert!(!auto.weights.frames[2].included && auto.weights.frames[2].weight.is_none());
+    assert!(!auto.transforms.frames[2].ok);
+}
+
+#[test]
+fn a_named_reference_under_the_weight_floor_stays_and_an_auto_reference_does_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let frames = shifted_frames(&tmp.path().join("cal"));
+    let mut c = cfg();
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    // A floor that only the group's best weight clears (weights are normalized to the maximum): the reweigh excludes
+    // every other member it does not pin.
+    c.selection.min_weight_fraction = 0.999;
+    let report = register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::File(frames[2].clone()), &c, false).unwrap();
+    assert!(report.transforms.reference_pinned);
+    let clears = |f: &starloom::pipeline::formats::WeightFrame| f.weight.as_ref().unwrap().normalized_mean >= 0.999;
+    assert!(!clears(&report.weights.frames[2]), "frame 2 must be under the floor for this test to mean anything");
+    for (k, f) in report.weights.frames.iter().enumerate() {
+        if k == 2 || clears(f) {
+            assert!(f.included && f.reason.is_none(), "frame {k}: {:?}", f.reason);
+        } else {
+            assert!(!f.included && f.reason.as_deref().unwrap().contains("below"), "frame {k}: {:?}", f.reason);
+        }
+    }
+    assert!(report.weights.frames.iter().filter(|f| !f.included).count() >= 3);
+    assert!(env.progress.all().iter().any(|w| w.contains("c_Light_0002.fits") && w.contains("kept despite its weight")));
+
+    // The same stored transforms, read as an auto pick's: nothing pins the frame, and the floor excludes it too.
+    let mut unpinned = report.clone();
+    unpinned.transforms.reference_pinned = false;
+    let again = current_weights(&env.ctx(&work), &measured, &unpinned, &c).unwrap();
+    assert!(!again.frames[2].included && again.frames[2].reason.as_deref().unwrap().contains("below"), "{:?}", again.frames[2].reason);
+    for (k, f) in again.frames.iter().enumerate().filter(|(k, _)| *k != 2) {
+        assert_eq!(f.included, report.weights.frames[k].included, "frame {k}");
+    }
+}
+
+/// Shifts every star of a frame's own `.athf` by half a pixel in x.
+fn doctor_fits(work: &Path, frame: &Path) {
+    let path = athf_path(work, frame, 0);
+    let mut fits = read_fits(&path).unwrap();
+    for f in &mut fits {
+        f.x += 0.5;
+    }
+    starloom::stacking::fits_artifact::write_fits(&path, &fits).unwrap();
+}
+
+#[test]
+fn registration_reads_measures_fits_for_a_one_plane_group_and_detects_for_any_other() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let frames = shifted_frames(&tmp.path().join("cal"));
+    let c = cfg();
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    let reference = ReferenceChoice::File(frames[0].clone());
+    let clean = centre_maps(&register(&env.ctx(&work), &frames, &measured, &reference, &c, false).unwrap());
+    let moved = |a: (f64, f64), b: (f64, f64)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
+
+    // A frame's doctored fits move its own map: the stars came from the artifact, not from the pixels.
+    doctor_fits(&work, &frames[3]);
+    let doctored = centre_maps(&register(&env.ctx(&work), &frames, &measured, &reference, &c, false).unwrap());
+    let d = moved(clean[3], doctored[3]);
+    assert!((0.3..0.7).contains(&d), "frame 3 moved {d} px");
+    for k in [1, 2, 4, 5] {
+        assert!(moved(clean[k], doctored[k]) < 0.05, "frame {k}");
+    }
+
+    // So do the reference's: every other frame is aligned onto the artifact's stars.
+    doctor_fits(&work, &frames[3]);
+    let _ = std::fs::remove_dir_all(measure_dir(&work));
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    doctor_fits(&work, &frames[0]);
+    let ref_doctored = centre_maps(&register(&env.ctx(&work), &frames, &measured, &reference, &c, false).unwrap());
+    let d = moved(clean[1], ref_doctored[1]);
+    assert!((0.3..0.7).contains(&d), "frame 1 moved {d} px against a doctored reference");
+
+    // One frame of the group with a second plane switches the whole group to detection (Athenaeum reuses the fits only
+    // when the group's stage-one planes are 1): the doctored fits are not read, though frame 3 is still one plane.
+    let _ = std::fs::remove_dir_all(measure_dir(&work));
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    doctor_fits(&work, &frames[3]);
+    doctor_fits(&work, &frames[0]);
+    let mut mixed = measured.clone();
+    let extra = mixed.frames[5].measurement.as_ref().unwrap().channels[0].clone();
+    mixed.frames[5].measurement.as_mut().unwrap().channels.push(extra);
+    let by_detection = centre_maps(&register(&env.ctx(&work), &frames, &mixed, &reference, &c, false).unwrap());
+    for k in 1..5 {
+        assert!(moved(clean[k], by_detection[k]) < 0.05, "frame {k} moved {} px", moved(clean[k], by_detection[k]));
+    }
+}
+
+#[test]
+fn registered_frames_carry_their_own_cards_and_no_foreign_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    // Calibrated lights as Athenaeum's export leaves them, plus the checksums and the stamps of another run.
+    let foreign = [
+        str_card("OBJECT", "M42"),
+        str_card("ATH_CSRC", "calibrated"),
+        str_card("ATH_CFLT", "flat.fits"),
+        str_card("CALSTAT", "BDF"),
+        str_card("CHECKSUM", "abcdefghijklmnop"),
+        str_card("DATASUM", "1234567890"),
+        str_card("SLM_VER", "0.0.1"),
+        str_card("SLM_CFG", "0123456789abcdef"),
+        int_card("SLM_PLV", 99),
+        str_card("SLM_CDRK", "master_dark.fits"),
+    ];
+    let frames: Vec<PathBuf> = SHIFTS[..4]
+        .iter()
+        .enumerate()
+        .map(|(k, &(dx, dy))| field_frame(&tmp.path().join("cal").join(format!("c_Light_{k:04}.fits")), &grid_stars(), dx, dy, 1.0, 40 + k as u64, &foreign))
+        .collect();
+    let c = cfg();
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    let report = register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::File(frames[1].clone()), &c, true).unwrap();
+    assert_eq!(report.registered.len(), 4);
+    for path in &report.registered {
+        let cards = keys(path);
+        let foreign_keys: Vec<&String> =
+            cards.keys().filter(|k| k.starts_with("ATH_") || matches!(k.as_str(), "CALSTAT" | "CHECKSUM" | "DATASUM")).collect();
+        assert!(foreign_keys.is_empty(), "{} carries {foreign_keys:?}", path.display());
+        // The file's own stamps, not the source's.
+        assert_eq!(cards.get("SLM_VER").map(String::as_str), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(cards.get("SLM_CFG"), Some(&starloom::pipeline::config_hash(&c)));
+        assert_eq!(cards.get("SLM_PLV"), Some(&starloom::pipeline::PIPELINE_VERSION.to_string()));
+        assert_eq!(cards.get("SLM_REF").map(String::as_str), Some("c_Light_0001.fits"));
+        // What describes the sky and the calibration of the frame stays.
+        assert_eq!(cards.get("OBJECT").map(String::as_str), Some("M42"));
+        assert_eq!(cards.get("SLM_CDRK").map(String::as_str), Some("master_dark.fits"));
+        let order = card_order(path);
+        let at = |k: &str| order.iter().position(|c| c == k).unwrap_or_else(|| panic!("{k} in {order:?}"));
+        assert!(at("SLM_VER") < at("SLM_CFG") && at("SLM_CFG") < at("SLM_PLV") && at("SLM_PLV") < at("SLM_REF"), "{order:?}");
+        assert_eq!(order.iter().filter(|c| matches!(c.as_str(), "SLM_VER" | "SLM_CFG" | "SLM_PLV" | "SLM_REF")).count(), 4, "{order:?}");
+    }
+}
+
+#[test]
+fn registered_pixels_are_the_warp_the_stack_applies_bit_for_bit() {
+    use starloom::resample::{warp_rows, Interpolation, Plane};
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let frames = shifted_frames(&tmp.path().join("cal"))[..4].to_vec();
+    let mut c = cfg();
+    // Neither is the default's, so a call that drops one of them changes the pixels.
+    c.registration.interpolation = Interpolation::Lanczos4;
+    c.registration.clamping_threshold = 0.2;
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    let report = register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::File(frames[0].clone()), &c, true).unwrap();
+    for (k, path) in report.registered.iter().enumerate() {
+        let (w, h, got) = read_plane(path, &tmp.path().join(format!("got{k}")));
+        let (sw, sh, source) = read_plane(&frames[k], &tmp.path().join(format!("src{k}")));
+        assert_eq!((w, h, sw, sh), (768, 512, 768, 512));
+        let mut want = vec![f32::NAN; w * h];
+        let map = report.transforms.frames[k].map.as_ref().unwrap();
+        warp_rows(&Plane::full(&source, sw, sh), map, w, 0, h, c.registration.interpolation, c.registration.clamping_threshold, &mut want);
+        let differing = got.iter().zip(&want).filter(|(a, b)| !(a.is_nan() && b.is_nan()) && a.to_bits() != b.to_bits()).count();
+        assert_eq!(differing, 0, "frame {k}: {differing} pixels differ from a direct warp_rows");
+        // The shifted frame has uncovered corners, written as NaN.
+        if k > 0 {
+            assert!(got.iter().any(|v| v.is_nan()), "frame {k} has no uncovered pixel");
+        }
+    }
+}
+
+#[test]
+fn the_reweigh_writes_the_common_set_terms_and_the_weights_of_the_members_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let gains = [1.0, 1.4, 0.8, 1.2, 1.0, 0.9];
+    let frames: Vec<PathBuf> = gains
+        .iter()
+        .enumerate()
+        .map(|(k, &g)| field_frame(&tmp.path().join("cal").join(format!("c_Light_{k:04}.fits")), &grid_stars(), SHIFTS[k].0, SHIFTS[k].1, g, 60 + k as u64, &[]))
+        .collect();
+    let c = cfg();
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    // Frame 4 is out of the selection, so it is no member.
+    let mut tampered = measured.clone();
+    tampered.frames[4].measurement.as_mut().unwrap().channels[0].stars_fitted = 2;
+    let mut selective = c.clone();
+    selective.selection.min_stars = Some(10);
+    let sources = source_facts(&Manifest::load(&work).unwrap(), &frames).unwrap();
+    let before = finish(&tampered, &selective, &sources);
+    let report = register(&env.ctx(&work), &frames, &tampered, &ReferenceChoice::File(frames[0].clone()), &selective, false).unwrap();
+
+    let set = report.weights.common_stars[0].as_ref().unwrap().len();
+    assert!(set >= 20);
+    let mut changed = 0;
+    for (k, f) in report.weights.frames.iter().enumerate() {
+        if k == 4 {
+            assert!(!f.included && f.weight.is_none(), "a non-member carries no weight");
+            continue;
+        }
+        let ch = &f.measurement.as_ref().unwrap().channels[0];
+        assert_eq!(ch.common_stars, Some(set));
+        let (tflux, tmean) = (ch.common_tflux.unwrap(), ch.common_tmean_flux.unwrap());
+        assert!(tflux > 0.0 && tmean > 0.0);
+        // The PSF terms are the ones the common flux gives, in the channel's own units.
+        assert_eq!(ch.psf_signal_weight.to_bits(), starloom::stacking::psf_signal::psf_signal_weight(tflux, tmean, ch.noise, ch.m_star).to_bits());
+        assert_eq!(ch.psf_snr.to_bits(), starloom::stacking::psf_signal::psf_snr(tflux, ch.noise).to_bits());
+        let (new, old) = (f.weight.as_ref().unwrap(), before.frames[k].weight.as_ref().unwrap());
+        if new.normalized_mean.to_bits() != old.normalized_mean.to_bits() {
+            changed += 1;
+        }
+    }
+    assert!(changed > 0, "the reweigh left every weight at its Measure-time value");
+    // The members' normalized weights are one scale over the members.
+    let sum: f64 = report.weights.frames.iter().filter_map(|f| f.weight.as_ref()).map(|w| w.normalized_mean).sum();
+    assert!(sum.is_finite() && sum > 0.0);
+
+    // Under another mode the set is recorded and the weights are Measure's.
+    let mut noise_cfg = selective.clone();
+    noise_cfg.measurement.weight_mode = WeightMode::Noise;
+    let noise_before = finish(&tampered, &noise_cfg, &sources);
+    let other = register(&env.ctx(&work), &frames, &tampered, &ReferenceChoice::File(frames[0].clone()), &noise_cfg, false).unwrap();
+    assert!(other.weights.common_stars[0].as_ref().is_some_and(|s| s.len() >= 20));
+    for (k, f) in other.weights.frames.iter().enumerate() {
+        assert_eq!(f.weight, noise_before.frames[k].weight, "frame {k}");
+        assert!(f.measurement.as_ref().is_none_or(|m| m.channels[0].common_stars.is_none()), "frame {k}");
+    }
+}
+
+#[test]
+fn the_registered_frames_of_a_report_are_read_in_frame_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    // The dates run against the names, so frame order is not the order of the file names.
+    let frames: Vec<PathBuf> = (0..4)
+        .map(|k| {
+            let stamp = format!("2026-01-01T0{}:00:00", 4 - k);
+            field_frame(&tmp.path().join("cal").join(format!("c_Light_{k:04}.fits")), &grid_stars(), SHIFTS[k].0, SHIFTS[k].1, 1.0, 70 + k as u64, &[str_card("DATE-OBS", &stamp)])
+        })
+        .collect();
+    let c = cfg();
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    let expected = ["c_Light_0003.fits", "c_Light_0002.fits", "c_Light_0001.fits", "c_Light_0000.fits"];
+    assert_eq!(measured.frames.iter().map(|f| name_of(&f.file)).collect::<Vec<_>>(), expected);
+    let report = register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::File(frames[0].clone()), &c, true).unwrap();
+    assert_eq!(report.registered.iter().map(|p| name_of(p)).collect::<Vec<_>>(), expected);
+    let back = RegisterReport::read(&work).unwrap();
+    assert_eq!(back.registered, report.registered);
+    // A file in the folder that no entry lists is not a registered frame of the run.
+    std::fs::write(register_dir(&work).join("registered").join("stray.fits"), b"x").unwrap();
+    assert_eq!(RegisterReport::read(&work).unwrap().registered, report.registered);
 }

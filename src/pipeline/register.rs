@@ -13,6 +13,10 @@
 //! - with `write_registered`, `registered/<stem>.fits`: every registered frame resampled into the reference's grid
 //!   (NaN outside its coverage) by the warp Athenaeum stacks with.
 //!
+//! A named reference that the selection left out is kept in the stack with a warning (a manual pin, as in Athenaeum's
+//! stage 4) and stays under the weight floor; an auto pick is neither. A registered file carries starloom's own cards
+//! (`SLM_VER`, `SLM_CFG`, `SLM_PLV`, `SLM_REF`) and none of its source's `ATH_*` or checksum cards (P2-R6, SL-8).
+//!
 //! A frame that fails to register is excluded when `selection.exclude_on_registration_failure` is set (its row says
 //! why) and refuses the run otherwise, as Athenaeum's run does. A frame that Measure's selection left out is not
 //! registered; its row says so, and a later command that includes it under another config asks for this command again
@@ -33,8 +37,8 @@ use crate::pipeline::formats::{
 };
 use crate::pipeline::measure::fan_out;
 use crate::pipeline::versions::recorded_versions;
-use crate::pipeline::weights::{subset_measure, weigh};
-use crate::pipeline::{athf_path, frame_stem, finish, source_facts, Ctx, Manifest, Stage, SLM_VER};
+use crate::pipeline::weights::{keep_named_reference, subset_measure, weigh};
+use crate::pipeline::{athf_path, common_cards, config_hash, frame_stem, finish, source_facts, Ctx, Manifest, Stage, SLM_CFG, SLM_PLV, SLM_VER};
 use crate::resample::{warp_rows, Plane};
 use crate::stacking::config::AlgorithmConfig;
 use crate::stacking::fits_artifact::read_fits;
@@ -85,18 +89,17 @@ pub struct RegisterReport {
 
 impl RegisterReport {
     /// Reads the products of a `register` run from the working folder `work_dir`: `register/transforms.json`,
-    /// `register/weights.json`, and the registered frames its manifest entry lists.
+    /// `register/weights.json`, and the registered frames (the `.fits` products of the Register manifest entry, in the
+    /// order the entry lists them, which is frame order). A folder with no Register entry is an error.
     pub fn read(work_dir: &Path) -> Result<RegisterReport> {
         let dir = register_dir(work_dir);
         let transforms = TransformsReport::read(&dir.join(TRANSFORMS_FILE))?;
         let weights = WeightsReport::read(&dir.join(WEIGHTS_FILE))?;
-        let registered_dir = dir.join(REGISTERED_DIR);
-        let mut registered: Vec<PathBuf> = match std::fs::read_dir(&registered_dir) {
-            Ok(read) => read.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_file()).collect(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e).with_context(|| format!("cannot read {}", registered_dir.display())),
-        };
-        registered.sort();
+        let manifest = Manifest::load(work_dir)?;
+        let entry = manifest
+            .entry(Stage::Register)
+            .ok_or_else(|| anyhow!("{} has no register entry in its manifest; run `starloom register`", work_dir.display()))?;
+        let registered: Vec<PathBuf> = entry.products.iter().filter(|p| p.extension().is_some_and(|e| e == "fits")).cloned().collect();
         Ok(RegisterReport { transforms, weights, registered })
     }
 }
@@ -211,26 +214,41 @@ fn is_wcs(key: &str) -> bool {
 }
 
 /// The cards a registered frame does not keep from its source: the mosaic's CFA description (the frame is resampled, so
-/// it has none), the stamp of the version that wrote the source, and a reference stamp of an earlier registration.
+/// it has none); every `ATH_*` card and `CALSTAT` (Athenaeum's, and a registered file is starloom's own, P2-R6, SL-8);
+/// the checksums, which describe the source's bytes and would fail on the copy; and the source's own stamps (`SLM_VER`,
+/// `SLM_CFG`, `SLM_PLV`, which name the stage that wrote it, and `SLM_REF` of an earlier registration).
 fn is_dropped_from_source(key: &str) -> bool {
-    matches!(key, "BAYERPAT" | "XBAYROFF" | "YBAYROFF") || key == SLM_VER || key == SLM_REF
+    matches!(key, "BAYERPAT" | "XBAYROFF" | "YBAYROFF" | "CALSTAT" | "CHECKSUM" | "DATASUM")
+        || key.starts_with("ATH_")
+        || matches!(key, SLM_VER | SLM_CFG | SLM_PLV | SLM_REF)
 }
 
-/// The cards of one registered frame: the source's non-structural cards minus the world-coordinate ones, the
-/// reference's world-coordinate cards when it has them (the grid is its grid), `SLM_VER` and `SLM_REF`. `ROWORDER`
-/// is the reference's when it has one, because the registered array is the reference's grid.
-fn registered_cards(source: &Path, reference_wcs: &[Card], reference_roworder: Option<&Card>, reference_name: &str) -> Result<Vec<Card>> {
+/// What a registered copy of one frame is made from besides the frame: the folder it goes to, the reference's grid
+/// cards and name, and the hash of the config `register` ran with.
+struct RegisteredOut<'a> {
+    dir: PathBuf,
+    wcs: &'a [Card],
+    roworder: Option<&'a Card>,
+    reference_name: &'a str,
+    cfg_hash: &'a str,
+}
+
+/// The cards of one registered frame: the source's non-structural cards minus the world-coordinate ones and the
+/// foreign ones ([`is_dropped_from_source`]), the reference's world-coordinate cards when it has them (the grid is its
+/// grid), then the file's own: `SLM_VER`, `SLM_CFG`, `SLM_PLV` ([`common_cards`]) and `SLM_REF` (P2-R6). `ROWORDER` is
+/// the reference's when it has one, because the registered array is the reference's grid.
+fn registered_cards(source: &Path, to: &RegisteredOut<'_>) -> Result<Vec<Card>> {
     let mut cards: Vec<Card> = header_cards(source)?
         .into_iter()
         .filter(|c| !is_structural(&c.keyword) && !is_wcs(&c.keyword) && !is_dropped_from_source(&c.keyword))
         .collect();
-    if let Some(order) = reference_roworder {
+    if let Some(order) = to.roworder {
         cards.retain(|c| c.keyword != "ROWORDER");
         cards.push(order.clone());
     }
-    cards.extend(reference_wcs.iter().cloned());
-    cards.push(Card::new(SLM_VER, CardValue::Str(env!("CARGO_PKG_VERSION").to_string()))?.with_comment("starloom version"));
-    cards.push(Card::new(SLM_REF, CardValue::Str(encode_ident(reference_name)))?.with_comment("registration reference"));
+    cards.extend(to.wcs.iter().cloned());
+    cards.extend(common_cards(to.cfg_hash)?);
+    cards.push(Card::new(SLM_REF, CardValue::Str(encode_ident(to.reference_name)))?.with_comment("registration reference"));
     Ok(cards)
 }
 
@@ -365,7 +383,7 @@ fn run(
     let manifest = Manifest::load(ctx.work_dir)?;
     let files: Vec<PathBuf> = sub.frames.iter().map(|f| f.file.clone()).collect();
     let sources = source_facts(&manifest, &files)?;
-    let finished = finish(sub, cfg, &sources);
+    let mut finished = finish(sub, cfg, &sources);
 
     // The reference: its file, whether the user named it, and which frame it is, if any.
     let (ref_file, pinned, ref_idx) = match reference {
@@ -378,10 +396,14 @@ fn run(
             (files[idx].clone(), false, Some(idx))
         }
     };
-    // Measure's fits seed the reference's stars when it is a single-plane frame of the stack; a reference outside it
-    // gets fresh detection and supplies stars and grid only (P2-R3).
+    // A named reference that the selection left out stays in the stack, as a manual pin does in Athenaeum.
+    keep_named_reference(ctx, &mut finished, ref_idx.filter(|_| pinned).map(|i| files[i].as_path()))?;
+    // Measure's fits seed a frame's stars only when every frame of the group is one plane (Athenaeum reuses them when
+    // the group's stage-one planes are 1); a reference outside the stack gets fresh detection and supplies stars and
+    // grid only (P2-R3).
+    let reuse_fits = finished.frames.iter().filter_map(|f| f.measurement.as_ref()).all(|m| m.channels.len() == 1);
     let ref_planes = ref_idx.and_then(|i| finished.frames[i].measurement.as_ref()).map(|m| m.channels.len());
-    let ref_fits = if ref_planes == Some(1) { frame_fits(work, &ref_file, cfg) } else { None };
+    let ref_fits = if reuse_fits && ref_planes == Some(1) { frame_fits(work, &ref_file, cfg) } else { None };
     let ref_stars: ReferenceStars = reference_stars(&ref_file, &cfg.registration, Some(&ctx.pool), ref_fits.as_deref())
         .map_err(|e| anyhow!("reference star detection failed for {}: {e}", ref_file.display()))?;
     let (ref_w, ref_h) = (ref_stars.width, ref_stars.height);
@@ -422,6 +444,7 @@ fn run(
     let reference_wcs: Vec<Card> = reference_header.iter().filter(|c| is_wcs(&c.keyword)).cloned().collect();
     let reference_roworder: Option<Card> = reference_header.iter().find(|c| c.keyword == "ROWORDER").cloned();
     let reference_name = file_name_of(&ref_file);
+    let cfg_hash = config_hash(cfg);
 
     let final_dir = register_dir(work);
     let part_dir = part_path(&final_dir);
@@ -442,7 +465,14 @@ fn run(
                 &sources,
                 f,
                 Some(i) == ref_idx,
-                write_registered_files.then(|| (part_dir.join(REGISTERED_DIR), &reference_wcs, reference_roworder.as_ref(), reference_name.as_str())),
+                reuse_fits,
+                write_registered_files.then(|| RegisteredOut {
+                    dir: part_dir.join(REGISTERED_DIR),
+                    wcs: &reference_wcs,
+                    roworder: reference_roworder.as_ref(),
+                    reference_name: reference_name.as_str(),
+                    cfg_hash: cfg_hash.as_str(),
+                }),
             );
             let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             ctx.progress.step("register", n, total);
@@ -545,7 +575,8 @@ fn register_one(
     sources: &std::collections::BTreeMap<PathBuf, FrameFacts>,
     frame: &MeasureFrame,
     is_reference: bool,
-    registered_out: Option<(PathBuf, &Vec<Card>, Option<&Card>, &str)>,
+    reuse_fits: bool,
+    registered_out: Option<RegisteredOut<'_>>,
 ) -> Outcome {
     let registration = if is_reference {
         Ok(identity_registration(ref_stars))
@@ -557,7 +588,7 @@ fn register_one(
             let gate = scale_gate_for(frame_scale, ref_scale);
             let policy = if ratio_wants_seed(scale_ratio_for(frame_scale, ref_scale)) { SeedPolicy::WcsFirst } else { SeedPolicy::QuadFirst };
             let planes = frame.measurement.as_ref().map_or(0, |m| m.channels.len());
-            let fits = if planes == 1 { frame_fits(work, &frame.file, cfg) } else { None };
+            let fits = if reuse_fits && planes == 1 { frame_fits(work, &frame.file, cfg) } else { None };
             let detected = detect_frame_stars(&frame.file, &cfg.registration, Some(&ctx.pool), fits.as_deref())
                 .map_err(|e| format!("{REGISTRATION_FAILED}: {e}"))?;
             if ctx.check_cancelled().is_err() {
@@ -567,10 +598,10 @@ fn register_one(
         })()
     };
     let mut write_error = None;
-    if let (Ok(reg), Some((dir, wcs, roworder, ref_name))) = (&registration, registered_out) {
+    if let (Ok(reg), Some(to)) = (&registration, registered_out) {
         if let Ok(alignment) = &reg.outcome {
-            let out = dir.join(format!("{}.fits", frame_stem(&frame.file)));
-            let written = registered_cards(&frame.file, wcs, roworder, ref_name)
+            let out = to.dir.join(format!("{}.fits", frame_stem(&frame.file)));
+            let written = registered_cards(&frame.file, &to)
                 .and_then(|cards| write_registered(&frame.file, &alignment.map, ref_stars.width, ref_stars.height, cfg, &cards, &out));
             if let Err(e) = written {
                 write_error = Some(format!("cannot write the registered frame: {e:#}"));

@@ -198,8 +198,33 @@ pub fn current_weights(
     let manifest = Manifest::load(ctx.work_dir)?;
     let files: Vec<PathBuf> = measure.frames.iter().map(|f| f.file.clone()).collect();
     let sources = source_facts(&manifest, &files)?;
-    let finished = finish(measure, cfg, &sources);
+    let mut finished = finish(measure, cfg, &sources);
+    let named = register.transforms.reference_pinned.then_some(register.transforms.reference.as_path());
+    keep_named_reference(ctx, &mut finished, named)?;
     weigh(ctx, finished, &register.transforms, &sources, cfg)
+}
+
+/// A manual pin stays in the stack: when `named` (the reference the user named, when they named one) is a frame of
+/// `finished` that the selection left out, it is included again, with no reason and a warning, as stage 4 of
+/// Athenaeum's run forces its manual reference in (`run/reference.rs`: `included = true`, `reason = None`, "kept despite
+/// selection"). `register` and [`current_weights`] both call it right after [`finish`], so the common set, the members'
+/// weights and the stack see the same frames. A frame with no measurement cannot be weighed, so it cannot be kept: that
+/// is an error naming it, as Athenaeum refuses a manual reference whose calibrated file is missing.
+pub(crate) fn keep_named_reference(ctx: &Ctx<'_>, finished: &mut MeasureReport, named: Option<&Path>) -> Result<()> {
+    let Some(named) = named else { return Ok(()) };
+    let Some(frame) = finished.frames.iter_mut().find(|f| f.file == named) else { return Ok(()) };
+    if frame.included {
+        return Ok(());
+    }
+    let reason = frame.reason.clone().unwrap_or_else(|| "excluded".to_string());
+    if frame.measurement.is_none() {
+        bail!("the named reference frame {} is excluded: {reason}", frame.file.display());
+    }
+    frame.included = true;
+    frame.reason = None;
+    tracing::warn!(path = %frame.file.display(), note = %reason, "named reference kept despite selection");
+    ctx.progress.warn(&format!("named reference frame {} kept despite selection: {reason}", frame.file.display()));
+    Ok(())
 }
 
 /// [`current_weights`] after [`finish`]: `finished` is `finish`'s result under `cfg`, `transforms` the registration.

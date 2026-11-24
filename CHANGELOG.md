@@ -70,6 +70,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logged. An XISF or compressed frame is refused with the reason. A frame with no measurement is a row with
   `measurement: null` in `measure.json` (it was unreadable, with a warning, or its measurement failed); a measure in
   which no frame could be measured fails and writes nothing.
+- The `register` stage of `pipeline`: `register` registers a group's calibrated plain-FITS frames onto one reference, a
+  frame or any calibrated FITS the user names (`ReferenceChoice::File`; a frame of the stack gets the identity, an
+  outside file supplies the stars and the grid only) or the best-weighted frame (`Auto`, Athenaeum's `best_included_idx`
+  with its Measure-floor rule), then reweighs as Athenaeum's `reweigh_groups` does. It writes `register/transforms.json`
+  (one row per frame: the map, inliers, rms, model and why a frame has none) and `register/weights.json`, and with
+  `write_registered` a resampled copy of every frame in the reference's grid (NaN outside its coverage, by the warp
+  the stack uses). A single-plane frame's stars come from Measure's `.athf` fits when every frame of the group is one
+  plane, as Athenaeum's mono path reuses them, and from detection otherwise. A named reference the selection left out is
+  kept in the stack with a warning, as a manual pin is in Athenaeum, and stays under the weight floor; an auto pick does
+  not. A frame whose registration fails is excluded (`exclude_on_registration_failure`) or refuses the run. A registered
+  file carries its own cards only: the source's non-structural and non-WCS cards minus `ATH_*`, `CALSTAT`, the
+  checksums and the source's own `SLM_VER`/`SLM_CFG`/`SLM_PLV`/`SLM_REF`, the reference's world-coordinate cards, then
+  `SLM_VER`, `SLM_CFG`, `SLM_PLV` and `SLM_REF` (the reference's file name). `current_weights` is the reweigh over the
+  stored measurements and transforms, for the stages after `register` (a changed weight mode re-weighs without
+  measuring again; a frame the config includes with no transform is refused, naming `starloom register`).
+  `RegisterReport::read` reads the products back, the registered frames in the order of the manifest entry (frame
+  order). A group with fewer than three included frames is warned about and registered, where Athenaeum's run skips it.
 - `[profile.release]` is `lto = "thin"`, `codegen-units = 4`, Athenaeum's release profile, for a standalone build.
 
 ## [0.1.2] — 2026-11-23
