@@ -162,7 +162,7 @@ pub(crate) fn cfa_of(facts: &FrameFacts) -> Option<CfaGeometry> {
 
 /// The I/O settings of a run on the context's memory budget: the band budget is the stage's budget within the
 /// engine's own floor and ceiling, and the reads in flight are the pool's width.
-fn io_policy(ctx: &Ctx<'_>) -> IoPolicy {
+pub(crate) fn io_policy(ctx: &Ctx<'_>) -> IoPolicy {
     let budget = usize::try_from(ctx.memory_budget_bytes).unwrap_or(usize::MAX);
     IoPolicy {
         band_budget_bytes: budget.clamp(MIN_BUDGET_BYTES, MAX_BUDGET_BYTES),

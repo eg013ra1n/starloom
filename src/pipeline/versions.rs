@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 
 use crate::calibration_library::LIGHT_CAL_VERSION;
 use crate::integration::engine::ENGINE_VERSION;
-use crate::pipeline::formats::{MANIFEST_VERSION, MEASURE_REPORT_VERSION, TRANSFORMS_VERSION, WEIGHTS_VERSION};
+use crate::pipeline::formats::{
+    MANIFEST_VERSION, MEASURE_REPORT_VERSION, NORMALIZE_REPORT_VERSION, TRANSFORMS_VERSION, WEIGHTS_VERSION,
+};
 use crate::pipeline::PIPELINE_VERSION;
 use crate::stacking::config::DRIZZLE_KERNEL_VERSION;
 use crate::stacking::fits_artifact::FITS_ARTIFACT_VERSION;
@@ -21,7 +23,7 @@ use crate::stacking::register::align::ALIGN_VERSION;
 use crate::star_measure::MEASURE_VERSION;
 
 /// Every version of this build, by its constant's name: the twelve stage and format versions the stage goldens are
-/// keyed on, the four working-folder format versions and [`PIPELINE_VERSION`].
+/// keyed on, the five working-folder format versions and [`PIPELINE_VERSION`].
 pub fn all_versions() -> BTreeMap<&'static str, u32> {
     BTreeMap::from([
         ("ALIGN_VERSION", ALIGN_VERSION),
@@ -36,6 +38,7 @@ pub fn all_versions() -> BTreeMap<&'static str, u32> {
         ("MEASURE_REPORT_VERSION", MEASURE_REPORT_VERSION),
         ("MEASURE_STAGE_VERSION", MEASURE_STAGE_VERSION),
         ("MEASURE_VERSION", MEASURE_VERSION),
+        ("NORMALIZE_REPORT_VERSION", NORMALIZE_REPORT_VERSION),
         ("PASS1_ARTIFACT_VERSION", u32::from(PASS1_ARTIFACT_VERSION)),
         ("PIPELINE_VERSION", PIPELINE_VERSION),
         ("SNR_GAIN_VERSION", SNR_GAIN_VERSION),
@@ -67,7 +70,7 @@ mod tests {
 
     #[test]
     fn each_version_name_holds_its_constant_and_every_version_card_names_one() {
-        let expected: [(&str, u32); 17] = [
+        let expected: [(&str, u32); 18] = [
             ("ALIGN_VERSION", ALIGN_VERSION),
             ("DRIZZLE_KERNEL_VERSION", DRIZZLE_KERNEL_VERSION),
             ("ENGINE_VERSION", ENGINE_VERSION),
@@ -80,6 +83,7 @@ mod tests {
             ("MEASURE_REPORT_VERSION", MEASURE_REPORT_VERSION),
             ("MEASURE_STAGE_VERSION", MEASURE_STAGE_VERSION),
             ("MEASURE_VERSION", MEASURE_VERSION),
+            ("NORMALIZE_REPORT_VERSION", NORMALIZE_REPORT_VERSION),
             ("PASS1_ARTIFACT_VERSION", u32::from(PASS1_ARTIFACT_VERSION)),
             ("PIPELINE_VERSION", PIPELINE_VERSION),
             ("SNR_GAIN_VERSION", SNR_GAIN_VERSION),

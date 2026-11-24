@@ -2306,3 +2306,186 @@ fn the_registered_frames_of_a_report_are_read_in_frame_order() {
     std::fs::write(register_dir(&work).join("registered").join("stray.fits"), b"x").unwrap();
     assert_eq!(RegisterReport::read(&work).unwrap().registered, report.registered);
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// normalize
+// ---------------------------------------------------------------------------------------------------------------
+
+use starloom::pipeline::formats::{FrameStatus, NormalizeReport, NormalizeStatus};
+use starloom::pipeline::{athln_path, ln_dir, normalize};
+use starloom::integration::stats::RejectionNormalization;
+use starloom::stacking::ln::LnFrameGrids;
+
+/// Six shifted frames of the 150-star field with the given star-amplitude `gains` and `cards`, measured and registered
+/// onto the first, ready for `normalize`.
+fn registered_field(tmp: &Path, env: &Env, c: &AlgorithmConfig, gains: &[f64], cards: &[Vec<Card>]) -> (PathBuf, Vec<PathBuf>, MeasureReport, RegisterReport) {
+    let work = tmp.join("work");
+    let frames: Vec<PathBuf> = gains
+        .iter()
+        .enumerate()
+        .map(|(k, &g)| {
+            field_frame(&tmp.join("cal").join(format!("c_Light_{k:04}.fits")), &grid_stars(), SHIFTS[k].0, SHIFTS[k].1, g, 60 + k as u64, &cards[k])
+        })
+        .collect();
+    let measured = measure(&env.ctx(&work), c, &frames, None, false).unwrap();
+    let registered = register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::File(frames[0].clone()), c, false).unwrap();
+    (work, frames, measured, registered)
+}
+
+fn no_cards() -> Vec<Vec<Card>> {
+    vec![Vec::new(); 6]
+}
+
+#[test]
+fn normalize_writes_one_athln_per_frame_that_reads_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let c = cfg();
+    let gains = [1.0, 1.0, 1.0, 1.25, 0.8, 1.0];
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &gains, &no_cards());
+    let report = normalize(&env.ctx(&work), &frames, &measured, &registered, &c).unwrap();
+
+    assert_eq!(report.status, NormalizeStatus::Ran);
+    assert_eq!(report.frames.len(), 6);
+    let dir = ln_dir(&work);
+    assert!(dir.join("reference.fits").is_file() && dir.join("reference-saturation.fits").is_file() && dir.join("normalize.json").is_file());
+    assert!(!tmp.path().join("work").join("ln.part").exists());
+    assert!(report.anchor.is_some());
+    // Star amplitudes carry the gains and the sky does not, so the global normalization leaves them alone and the LN
+    // reference holds the average star: a frame's scale is that average over its own gain.
+    let reference_gain = gains.iter().sum::<f64>() / gains.len() as f64;
+    for (k, row) in report.frames.iter().enumerate() {
+        assert_eq!(row.file, frames[k]);
+        assert_eq!(row.status, FrameStatus::Normalized, "{:?}", row.reason);
+        let path = athln_path(&work, &frames[k]);
+        assert_eq!(row.athln.as_ref(), Some(&path));
+        let grids = LnFrameGrids::read(&path).unwrap();
+        assert_eq!(grids.channels.len(), 1);
+        // The grid maps the frame's star level onto the reference's.
+        let s = grids.channels[0].global_scale;
+        let expected = reference_gain / gains[k];
+        assert!((s - expected).abs() < 0.05 * expected, "frame {k}: scale {s}, expected {expected}");
+        assert!((row.scale.unwrap() - s).abs() < 1e-6);
+        assert_eq!(row.scale_source.as_deref(), Some("seeds"));
+    }
+    assert_eq!(report.scale_px.is_some(), true);
+    assert_eq!(report.k.len(), 1);
+    // The report reads back, and the stage left its entry with every product present.
+    let back = NormalizeReport::read(&dir.join("normalize.json")).unwrap();
+    assert_eq!(serde_json::to_string(&back).unwrap(), serde_json::to_string(&report).unwrap());
+    let manifest = Manifest::load(&work).unwrap();
+    let entry = manifest.entry(Stage::Normalize).unwrap();
+    assert_eq!(entry.inputs.len(), 6);
+    assert_eq!(entry.products.len(), 2 + 6 + 1);
+    assert!(entry.products.iter().all(|p| p.exists()));
+}
+
+#[test]
+fn normalize_runs_when_local_is_enabled_or_rejection_is_local_and_is_skipped_otherwise() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let c = cfg();
+    assert_eq!(c.normalization.rejection, RejectionNormalization::Local);
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+
+    // Neither asked for: nothing runs, nothing is written and no entry is left.
+    let mut off = c.clone();
+    off.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
+    off.normalization.local.enabled = false;
+    let skipped = normalize(&env.ctx(&work), &frames, &measured, &registered, &off).unwrap();
+    assert_eq!(skipped.status, NormalizeStatus::NotRequested);
+    assert!(skipped.frames.is_empty() && skipped.reference.is_none());
+    assert!(!ln_dir(&work).exists());
+    assert!(Manifest::load(&work).unwrap().entry(Stage::Normalize).is_none());
+
+    // Rejection alone is enough, and the frames then stay on the output's own normalization when one fails.
+    let by_rejection = normalize(&env.ctx(&work), &frames, &measured, &registered, &c).unwrap();
+    assert_eq!(by_rejection.status, NormalizeStatus::Ran);
+    assert!(!by_rejection.local_drives_output);
+    assert!(ln_dir(&work).join("reference.fits").is_file());
+    std::fs::remove_dir_all(ln_dir(&work)).unwrap();
+
+    // `normalization.local.enabled` alone is enough too.
+    let mut by_enabled = off.clone();
+    by_enabled.normalization.local.enabled = true;
+    let enabled = normalize(&env.ctx(&work), &frames, &measured, &registered, &by_enabled).unwrap();
+    assert_eq!(enabled.status, NormalizeStatus::Ran);
+    assert!(enabled.local_drives_output);
+    assert_eq!(enabled.frames.iter().filter(|f| f.status == FrameStatus::Normalized).count(), 6);
+}
+
+#[test]
+fn normalize_with_a_moffat_beta_in_local_runs() {
+    use starloom::stacking::psf_signal::PsfModel;
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let mut c = cfg();
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+    // The wire spells it `{"moffat": 3.0}`.
+    c.normalization.local = serde_json::from_value(serde_json::json!({ "psfModel": { "moffat": 3.0 } })).unwrap();
+    assert_eq!(c.normalization.local.psf_model, PsfModel::Moffat(3.0));
+    let report = normalize(&env.ctx(&work), &frames, &measured, &registered, &c).unwrap();
+    assert_eq!(report.status, NormalizeStatus::Ran);
+    assert_eq!(report.frames.iter().filter(|f| f.status == FrameStatus::Normalized).count(), 6);
+    // The reference is fitted at the caller's β, not the group's.
+    assert_eq!(report.reference_beta, Some(3.0));
+    let group_beta = measured.resolved_group_beta().unwrap();
+    assert!((group_beta - 3.0).abs() > 1e-6, "the group beta {group_beta} must differ for the test to tell");
+    // Under `auto` it is the group's.
+    let auto = normalize(&env.ctx(&work), &frames, &measured, &registered, &cfg()).unwrap();
+    assert_eq!(auto.reference_beta.map(f64::to_bits), Some(group_beta.to_bits()));
+}
+
+#[test]
+fn normalize_records_the_ln_members_the_weights_picked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let mut c = cfg();
+    c.measurement.weight_mode = WeightMode::Keyword;
+    c.measurement.keyword = "SSWEIGHT".to_string();
+    c.normalization.local.reference_frames = 3;
+    // Frame 0 is the registration reference and the worst weighted; 4, 2 and 5 are the best, in that order.
+    let weights = [1.0, 2.0, 5.0, 3.0, 9.0, 4.0];
+    let cards: Vec<Vec<Card>> = weights.iter().map(|&w| vec![real_card("SSWEIGHT", w)]).collect();
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &cards);
+    let report = normalize(&env.ctx(&work), &frames, &measured, &registered, &c).unwrap();
+
+    // Equal skies, so the sky penalty ranks by weight alone.
+    assert_eq!(report.reference_members, [frames[4].clone(), frames[2].clone(), frames[5].clone()]);
+    assert_eq!(report.anchor.as_ref(), Some(&frames[4]));
+    // The calibration sample is the registration reference first, then one frame per weight bin.
+    assert_eq!(report.calibration_frames.len(), 6);
+    assert_eq!(report.calibration_frames[0], frames[0]);
+    assert_eq!(report.k.len(), 1);
+    assert!(report.k[0] > 0.9 && report.k[0] < 1.1, "{:?}", report.k);
+
+    // Another weight order gives other members: the stage reads the weights it is run with (P2-R21).
+    let mut flipped = c.clone();
+    flipped.measurement.keyword = "SSWEIGHT".to_string();
+    let inverse: Vec<Vec<Card>> = weights.iter().map(|&w| vec![real_card("SSWEIGHT", 10.0 - w)]).collect();
+    let tmp2 = tempfile::tempdir().unwrap();
+    let (work2, frames2, measured2, registered2) = registered_field(tmp2.path(), &env, &flipped, &[1.0; 6], &inverse);
+    let other = normalize(&env.ctx(&work2), &frames2, &measured2, &registered2, &flipped).unwrap();
+    assert_eq!(other.reference_members, [frames2[0].clone(), frames2[1].clone(), frames2[3].clone()]);
+}
+
+#[test]
+fn normalize_with_too_few_reference_frames_is_off_and_leaves_nothing_and_under_three_members_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let mut c = cfg();
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+
+    // `referenceFrames` under 3 turns local normalization off for the group, with a warning (Athenaeum's fallback).
+    c.normalization.local.reference_frames = 2;
+    let off = normalize(&env.ctx(&work), &frames, &measured, &registered, &c).unwrap();
+    assert_eq!(off.status, NormalizeStatus::Off);
+    assert!(off.note.as_deref().unwrap().contains("referenceFrames is 2"), "{:?}", off.note);
+    assert!(env.progress.all().iter().any(|w| w.contains("referenceFrames is 2")));
+    assert!(!ln_dir(&work).exists() && !tmp.path().join("work").join("ln.part").exists());
+    assert!(Manifest::load(&work).unwrap().entry(Stage::Normalize).is_none());
+
+    // Two frames are no stack.
+    let err = format!("{:#}", normalize(&env.ctx(&work), &frames[..2], &measured, &registered, &cfg()).unwrap_err());
+    assert!(err.contains("at least 3"), "{err}");
+}

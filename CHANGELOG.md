@@ -87,6 +87,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measuring again; a frame the config includes with no transform is refused, naming `starloom register`).
   `RegisterReport::read` reads the products back, the registered frames in the order of the manifest entry (frame
   order). A group with fewer than three included frames is warned about and registered, where Athenaeum's run skips it.
+- The `normalize` stage of `pipeline`: `normalize` mirrors Athenaeum's local normalization for one group without the
+  catalog or the artifact cache. Under `normalization.local.enabled` or a `local` rejection normalization (`ln_runs`) it
+  weighs as `current_weights` does, picks the anchor (`pick_ln_anchor`), integrates the LN reference from the best
+  `referenceFrames` members (sky-penalized order), writes it with its saturation map, models its background and fits its
+  stars once (at the group β under `auto`, else at the profile's own, `moffat4` or `{"moffat": β}`), measures the seeds
+  calibration `k` and writes one `.athln` per frame (Measure's fits seed the scale) under `ln/`, with `ln/normalize.json`
+  (`NormalizeReport`: the anchor, the LN reference members, the calibration frames and `k`, the reference β, the LN scale
+  and each frame's outcome; a record for the user to read). A frame whose own normalization fails is excluded when local
+  normalization drives the output and keeps the global one otherwise. Not asked for, or fewer than three frames to build
+  the reference from, the stage warns or says so and leaves nothing. The versions it records gain
+  `NORMALIZE_REPORT_VERSION`.
 - `[profile.release]` is `lto = "thin"`, `codegen-units = 4`, Athenaeum's release profile, for a standalone build.
 
 ## [0.1.2] — 2026-11-23

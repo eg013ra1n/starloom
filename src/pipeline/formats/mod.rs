@@ -13,6 +13,7 @@
 
 pub mod manifest;
 pub mod measure_report;
+pub mod normalize;
 pub mod transforms;
 pub mod weights;
 
@@ -30,6 +31,9 @@ pub use manifest::{
 pub use measure_report::{
     GroupC, MeasureFrame, MeasureReport, MEASURE_CSV_COLUMNS, MEASURE_REPORT_FILE, MEASURE_REPORT_FORMAT,
     MEASURE_REPORT_VERSION,
+};
+pub use normalize::{
+    FrameStatus, NormalizeFrame, NormalizeReport, NormalizeStatus, NORMALIZE_FILE, NORMALIZE_FORMAT, NORMALIZE_REPORT_VERSION,
 };
 pub use transforms::{
     TransformFrame, TransformsReport, NOT_REGISTERED, REGISTRATION_FAILED, TRANSFORMS_FILE, TRANSFORMS_FORMAT, TRANSFORMS_VERSION,

@@ -1,4 +1,4 @@
-//! SL-9: every step of `master`, `calibrate`, `measure` and `register` that decodes a pixel or fits a star runs on the caller's pool.
+//! SL-9: every step of `master`, `calibrate`, `measure`, `register` and `normalize` that decodes a pixel or fits a star runs on the caller's pool.
 //!
 //! A compressed raw frame, a compressed pre-calibration master and a compressed light all go through the image
 //! reader's spill, which decodes with rayon iterators on whatever pool is current. Outside the caller's pool that is
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use starloom::calibration_library::options::CalibratedLightOptions;
 use starloom::fits_writer::{write_fits_f32, OutputFormat};
 use starloom::pipeline::{
-    build_master, calibrate, measure, register, CalGroup, CalSource, Ctx, FlatPrecalSource, MasterKind, NoProgress, ReferenceChoice,
+    build_master, calibrate, measure, normalize, register, CalGroup, CalSource, Ctx, FlatPrecalSource, MasterKind, NoProgress, ReferenceChoice,
 };
 use starloom::stacking::config::{algorithm_preset, StackingPreset};
 
@@ -123,6 +123,15 @@ fn compressed_frames_decode_on_the_callers_pool_and_never_on_rayons_global_one()
     assert_eq!(registered.registered.len(), 3);
     let in_stack = register(&ctx, &frames, &report, &ReferenceChoice::Auto, &cfg, false).unwrap();
     assert!(in_stack.transforms.frames.iter().all(|t| t.ok));
+
+    // `normalize` builds the LN reference (an integration and its saturation map), models its background, detects and fits
+    // its stars, measures the seeds calibration and normalizes every frame, all on the caller's pool.
+    let normalized = normalize(&ctx, &frames, &report, &in_stack, &cfg).unwrap();
+    assert!(
+        normalized.frames.iter().all(|f| f.athln.is_some()),
+        "{:?}",
+        normalized.frames.iter().map(|f| f.reason.clone()).collect::<Vec<_>>()
+    );
 
     // Nothing built rayon's global pool: asking for it now succeeds (it fails once a pool has been built).
     rayon::ThreadPoolBuilder::new().num_threads(1).build_global().expect("rayon's global pool was built by a stage that ran outside the caller's pool");
