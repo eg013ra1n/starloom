@@ -30,6 +30,12 @@ chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 # The pass-1 artifact's wire encoding (the `stack` layer only).
 postcard = { version = "1", features = ["use-std"], optional = true }
+# `pipeline`: the plan file and `--config` file (TOML) and the input globs. Versions are Athenaeum's lock's (SL-12).
+toml = { version = "1", optional = true }
+glob = { version = "0.3", optional = true }
+# `cli`: the command line and its log layers (the `json` layer writes the per-command log file).
+clap = { version = "4.6", features = ["derive"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
 
 # The platform memory probe (`sys::platform_memory`): GlobalMemoryStatusEx and the job-object limits.
 [target.'cfg(windows)'.dependencies]
@@ -41,6 +47,11 @@ default = ["stack", "ts"]
 engine = ["dep:rustafits"]
 # Layer 3: registration, measurement, rejection, drizzle, weighting. Needs the quad matcher.
 stack = ["engine", "dep:solvemyastro", "dep:postcard"]
+# Layer 4: the working-folder pipeline the `starloom` command drives (inputs, config levels, versioned folder formats, stages).
+# It runs on the caller's rayon pool (SL-9) and writes no stdout or stderr (logs are `tracing`).
+pipeline = ["stack", "dep:toml", "dep:glob"]
+# The `starloom` command: argument parsing, the stderr and file log layers. The one place that writes stdout and stderr.
+cli = ["pipeline", "dep:clap", "dep:tracing-subscriber"]
 # ts-rs derives (the TypeScript types the app generates).
 ts = ["dep:ts-rs"]
 # Test hooks and fixtures that tests in dependent crates read (SL-17); never in default. It forwards rustafits' hooks
@@ -53,6 +64,12 @@ test-support = ["rustafits?/test-support"]
 # this section is ignored (cargo warns that a non-root package's profiles are ignored) and the root's profile applies.
 [profile.dev]
 opt-level = 2
+
+# The release profile Athenaeum's root manifest and the lab server use; the standalone binary is built the same way
+# (P2-R15). Inside Athenaeum's workspace this section is ignored like the dev one.
+[profile.release]
+lto = "thin"
+codegen-units = 4
 
 [lints.rust]
 unexpected_cfgs = "deny"

@@ -2,10 +2,11 @@
 //!
 //! It turns light frames into a stacked master: it aligns frames (geometry and resampling), calibrates
 //! lights against master darks, biases and flats, measures stars, registers, rejects outlier pixels, integrates,
-//! drizzles and weights, and writes FITS and XISF files. The crate is built in three layers, each a cargo feature:
+//! drizzles and weights, and writes FITS and XISF files. The crate is built in layers, each a cargo feature:
 //! - base (no feature): geometry, resampling, the FITS/XISF writer core and small platform helpers;
 //! - `engine`: integration, light calibration and cosmetic correction (needs `rustafits`);
-//! - `stack`: registration, measurement, rejection, drizzle and weighting (needs `solvemyastro`).
+//! - `stack`: registration, measurement, rejection, drizzle and weighting (needs `solvemyastro`);
+//! - `pipeline`: the working-folder stages a command line drives (inputs, config levels, versioned folder formats).
 //!
 //! # Threads
 //!
@@ -51,6 +52,10 @@ pub use astroimage::star_measure;
 // `stack` layer.
 #[cfg(feature = "stack")]
 pub mod stacking;
+
+// `pipeline` layer: the working-folder stages a command line drives.
+#[cfg(feature = "pipeline")]
+pub mod pipeline;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

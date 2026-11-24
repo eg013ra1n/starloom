@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MIN_REFERENCE_COVERAGE` (`stacking::weights`); `header_pixel_scale_arcsec` (`geometry`); the `.athf` format with
   `FITS_ARTIFACT_VERSION` 3 (`stacking::fits_artifact`); and `map_scale`, `wants_cfa_mosaic` and `pick_ln_anchor`
   (`stacking::run_helpers`). No stage output moves and no version changes; the `.athf` format gets a golden row.
+- The `pipeline` layer (feature `pipeline`, on `stack`; optional `toml` and `glob`), the skeleton the working-folder
+  stages hang on, and the `cli` feature (adds `clap` and `tracing-subscriber`; the binary follows). `pipeline` holds
+  `Ctx` and `Progress` (the caller's pool, a cancel flag, a progress sink, a memory budget, the working folder; no
+  thread pool is built); `expand_inputs` (files, folders and globs, by file name, refusing two frames with one stem),
+  `parse_date_obs`, `order_lights` and `read_plan`; `effective_config` (preset, then file, then `--set`), `stage_hash`
+  and `config_hash`; and the versioned working-folder formats: the manifest `starloom.json` (entries, `FileId`s, the
+  per-light facts and the command history) and the `measure`, `transforms` and `weights` reports, each tagged and
+  refused when made by another version, with `check_upstream` and `frames_or_upstream` and the rule that a stage's
+  entry is written only after its products are in place. `fs_util::sampled_xxh3` is Athenaeum's sampled content hash.
+- `[profile.release]` is `lto = "thin"`, `codegen-units = 4`, Athenaeum's release profile, for a standalone build.
 
 ## [0.1.2] — 2026-11-23
 
