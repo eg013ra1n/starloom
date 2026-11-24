@@ -2782,6 +2782,9 @@ fn stack_on_a_synthetic_field_beats_single_frame_noise() {
     assert_eq!(report.stats.included, 8);
     assert_eq!(report.frames.len(), 8);
     assert_eq!(report.stats.ln_frames, 8);
+    // The frame-common star set the reweigh found reached the integration: without it there is no SNR gain at all.
+    assert!(report.weights.common_stars[0].as_ref().is_some_and(|s| s.len() >= 20));
+    assert!(report.stats.snr_gain[0] > 1.0, "snr gain {:?}", report.stats.snr_gain);
     assert_eq!(report.master, master_path(&out, OutputFormat::Fits));
     let (w, h, master) = plane0(&report.master);
     assert_eq!((w, h), (768, 512));
@@ -2853,7 +2856,9 @@ fn stack_with_another_weight_mode_re_weighs_without_re_measuring() {
     let c = ln_off(cfg());
     let out = tmp.path().join("out");
     let gains = [1.0, 0.7, 1.3, 1.0, 0.85, 1.15];
-    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &gains, &no_cards());
+    let exposures: Vec<f64> = (0..6).map(|k| 100.0 + 60.0 * k as f64).collect();
+    let cards: Vec<Vec<Card>> = exposures.iter().map(|&e| vec![real_card("EXPTIME", e)]).collect();
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &gains, &cards);
     let stored: Vec<PathBuf> = std::iter::once(measure_dir(&work).join("measure.json"))
         .chain(frames.iter().map(|f| athf_path(&work, f, 0)))
         .collect();
@@ -2874,6 +2879,15 @@ fn stack_with_another_weight_mode_re_weighs_without_re_measuring() {
     assert_ne!(weights_a, weights_b);
     let mean = |r: &StackReport, k: usize| r.weights.frames[k].weight.as_ref().unwrap().normalized_mean;
     assert!((0..6).any(|k| (mean(&first, k) - mean(&second, k)).abs() > 1e-6));
+    // The integration is fed the weights `weights.json` holds (the reweighed ones), not the ones `measure` stored: its
+    // weighted exposure is the sum of each frame's exposure times its reported weight.
+    let weighted = |r: &StackReport| -> f64 { (0..6).map(|k| exposures[k] * mean(r, k)).sum() };
+    for r in [&first, &second] {
+        assert_eq!(r.stats.included, 6);
+        let expected = weighted(r);
+        assert!((r.stats.weighted_exposure_s - expected).abs() <= 1e-9 * expected, "{} against {expected}", r.stats.weighted_exposure_s);
+    }
+    assert!((first.stats.weighted_exposure_s - second.stats.weighted_exposure_s).abs() > 1e-3 * first.stats.weighted_exposure_s);
     // Nothing was measured again: the stored measurements and star fits are byte-equal.
     assert_eq!(bytes(&stored), before);
 }
@@ -2932,7 +2946,52 @@ fn stack_drops_a_frame_normalize_excluded_and_stacks_the_kept_global_ones_withou
         // Frames 0, 1 and 5 stack with their grids; 3 and 4 on the global normalization.
         assert_eq!(report.stats.ln_frames, 3);
         assert!(report.warnings.iter().any(|w| w.contains(&frames[2].display().to_string()) && w.contains("excluded")), "{:?}", report.warnings);
+        // `weights.json` does not list as stacked a frame that was not: Athenaeum persists the exclusion on its row.
+        let stored = starloom::pipeline::formats::WeightsReport::read(&report.weights_file).unwrap();
+        for (k, row) in stored.frames.iter().enumerate() {
+            if k == 2 {
+                assert!(!row.included && row.reason.as_deref() == Some("too few star matches"), "{:?} {:?}", row.included, row.reason);
+            } else {
+                assert!(row.included && row.reason.is_none(), "frame {k}: {:?}", row.reason);
+            }
+        }
+        assert_eq!(serde_json::to_string(&stored).unwrap(), serde_json::to_string(&report.weights).unwrap());
     }
+}
+
+/// Six frames whose stars grow with `gains` and whose `OBJECT` is its own (`OBJ0` ... `OBJ5`).
+fn own_object_cards() -> Vec<Vec<Card>> {
+    (0..6).map(|k| vec![str_card("OBJECT", &format!("OBJ{k}"))]).collect()
+}
+
+#[test]
+fn the_anchor_is_picked_again_over_the_frames_left_after_normalize_drops_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let c = cfg();
+    let out = tmp.path().join("out");
+    // Frame 1 has the strongest stars: the anchor `normalize` picks. Frame 4 follows.
+    let gains = [1.0, 1.4, 1.0, 1.0, 1.2, 1.0];
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &gains, &own_object_cards());
+    let normalized = normalize(&env.ctx(&work), &frames, &measured, &registered, &c).unwrap();
+    assert_eq!(normalized.anchor.as_ref(), Some(&frames[1]));
+    let whole = stack(&env.ctx(&work), &c, &frames, &measured, &registered, Some(&normalized), &out, OutputFormat::Fits).unwrap();
+    assert_eq!(whole.anchor, frames[1]);
+    assert_eq!(keys(&whole.master)["OBJECT"], "OBJ1");
+
+    // `normalize` excluded its anchor's frame: the stack is anchored on the best of the frames that are left, and its
+    // master carries that frame's header.
+    let doctored = doctored_normalize(&work, &normalized, |k, row| {
+        if k == 1 {
+            row.status = FrameStatus::Excluded;
+            row.reason = Some("too few star matches".to_string());
+        }
+    });
+    let report = stack(&env.ctx(&work), &c, &frames, &measured, &registered, Some(&doctored), &out, OutputFormat::Fits).unwrap();
+    assert_eq!(report.stats.included, 5);
+    assert_eq!(report.anchor, frames[4]);
+    assert!(report.frames.contains(&report.anchor) && !report.frames.contains(&frames[1]));
+    assert_eq!(keys(&report.master)["OBJECT"], "OBJ4");
 }
 
 #[test]
@@ -2969,7 +3028,7 @@ fn the_master_light_carries_athenaeums_standard_cards_and_no_ath_card() {
     let cards: Vec<Vec<Card>> = (0..6)
         .map(|k| {
             let mut v = vec![
-                str_card("OBJECT", "M42"),
+                str_card("OBJECT", &format!("OBJ{k}")),
                 str_card("FILTER", "Ha"),
                 real_card("EXPTIME", 300.0),
                 str_card("DATE-OBS", dates[k]),
@@ -2979,14 +3038,16 @@ fn the_master_light_carries_athenaeums_standard_cards_and_no_ath_card() {
                 str_card("ATH_CDRK", "dark-uuid"),
                 str_card("SLM_CDRK", "master_dark.fits"),
             ];
-            if k == 0 {
-                v.extend([str_card("CTYPE1", "RA---TAN"), str_card("CTYPE2", "DEC--TAN"), real_card("CRVAL1", 83.82), real_card("CRVAL2", -5.39)]);
-            }
+            // Every frame has its own world-coordinate cards; the master takes the registration reference's (frame 0).
+            v.extend([str_card("CTYPE1", "RA---TAN"), str_card("CTYPE2", "DEC--TAN"), real_card("CRVAL1", 83.82 + k as f64), real_card("CRVAL2", -5.39 - k as f64)]);
             v
         })
         .collect();
-    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &cards);
+    // Frame 2 has the strongest stars, so it is the normalization anchor; the registration reference is frame 0.
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0, 1.0, 1.4, 1.0, 1.0, 1.0], &cards);
     let report = stack(&env.ctx(&work), &c, &frames, &measured, &registered, None, &out, OutputFormat::Fits).unwrap();
+    assert_eq!(report.anchor, frames[2]);
+    assert_eq!(report.reference, frames[0]);
 
     let order = card_order(&report.master);
     let mut expected: Vec<&str> = vec!["IMAGETYP", "SWCREATE", "FILTER", "INSTRUME", "OBJECT", "NCOMBINE", "EXPTIME", "DATE-OBS", "DATE-END"];
@@ -2995,6 +3056,9 @@ fn the_master_light_carries_athenaeums_standard_cards_and_no_ath_card() {
     assert_eq!(order, expected);
     let k = keys(&report.master);
     assert_eq!(k["IMAGETYP"], "Master Light");
+    // The copy-through cards are the anchor's, the world-coordinate cards the registration reference's.
+    assert_eq!(k["OBJECT"], "OBJ2");
+    assert!((k["CRVAL1"].parse::<f64>().unwrap() - 83.82).abs() < 1e-9 && (k["CRVAL2"].parse::<f64>().unwrap() + 5.39).abs() < 1e-9, "{:?} {:?}", k["CRVAL1"], k["CRVAL2"]);
     assert_eq!(k["NCOMBINE"], "6");
     let exptime = k["EXPTIME"].parse::<f64>().unwrap();
     assert!((exptime - report.stats.weighted_exposure_s).abs() <= 1e-9 * exptime, "{exptime} against {}", report.stats.weighted_exposure_s);
@@ -3040,4 +3104,73 @@ fn stack_with_large_scale_rejection_runs_the_second_pass_and_leaves_no_bitmaps()
     assert_eq!(report.stats.included, 6);
     // The bitmaps were scratch: nothing is left of them.
     assert!(!work.join(".tmp").join("stack-rej").exists());
+}
+
+#[test]
+fn the_warnings_the_weights_send_to_progress_are_in_the_report_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let out = tmp.path().join("out");
+    let frames = shifted_frames(&tmp.path().join("cal"));
+    let c = cfg();
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    // Frame 2 is cut by the selection and named the registration reference: `current_weights` keeps it, and says so to
+    // the progress sink alone.
+    let mut tampered = measured.clone();
+    tampered.frames[2].measurement.as_mut().unwrap().channels[0].stars_fitted = 2;
+    let mut selective = ln_off(c);
+    selective.selection.min_stars = Some(10);
+    let registered = register(&env.ctx(&work), &frames, &tampered, &ReferenceChoice::File(frames[2].clone()), &selective, false).unwrap();
+
+    let before = env.progress.all().len();
+    let report = stack(&env.ctx(&work), &selective, &frames, &tampered, &registered, None, &out, OutputFormat::Fits).unwrap();
+    assert!(report.warnings.iter().any(|w| w.contains("c_Light_0002.fits") && w.contains("kept despite selection")), "{:?}", report.warnings);
+    // Everything the stage sent to the progress sink is in the report, in order.
+    assert_eq!(report.warnings, env.progress.all()[before..].to_vec());
+}
+
+#[test]
+fn an_xisf_master_of_bottom_up_frames_is_warned_about_and_a_top_down_one_is_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let c = ln_off(cfg());
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+    // The frames state no `ROWORDER`: the astronomical default is bottom-up.
+    let report = stack(&env.ctx(&work), &c, &frames, &measured, &registered, None, &tmp.path().join("xisf"), OutputFormat::Xisf).unwrap();
+    assert!(report.master.extension().is_some_and(|e| e == "xisf") && report.master.is_file());
+    let flipped: Vec<&String> = report.warnings.iter().filter(|w| w.contains("bottom-up row order")).collect();
+    assert_eq!(flipped.len(), 1, "{:?}", report.warnings);
+    assert!(flipped[0].contains("XISF") && flipped[0].contains("flipped relative to the FITS master"), "{}", flipped[0]);
+    assert!(env.progress.all().contains(flipped[0]));
+    // A FITS master of the same frames has nothing to say.
+    let fits = stack(&env.ctx(&work), &c, &frames, &measured, &registered, None, &tmp.path().join("fits"), OutputFormat::Fits).unwrap();
+    assert!(fits.warnings.iter().all(|w| !w.contains("row order")), "{:?}", fits.warnings);
+
+    // Top-down frames carry nothing to flip.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let top_down: Vec<Vec<Card>> = (0..6).map(|_| vec![str_card("ROWORDER", "TOP-DOWN")]).collect();
+    let (work, frames, measured, registered) = registered_field(tmp2.path(), &env, &c, &[1.0; 6], &top_down);
+    let report = stack(&env.ctx(&work), &c, &frames, &measured, &registered, None, &tmp2.path().join("xisf"), OutputFormat::Xisf).unwrap();
+    assert!(report.warnings.iter().all(|w| !w.contains("row order")), "{:?}", report.warnings);
+}
+
+#[test]
+fn a_stack_normalize_leaves_under_three_frames_is_refused_and_leaves_no_product() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let c = cfg();
+    let out = tmp.path().join("out");
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+    let normalized = normalize(&env.ctx(&work), &frames, &measured, &registered, &c).unwrap();
+    // All six pass the included-frames gate; `normalize` excluded four of them, which leaves two.
+    let doctored = doctored_normalize(&work, &normalized, |k, row| {
+        if k < 4 {
+            row.status = FrameStatus::Excluded;
+            row.reason = Some("too few star matches".to_string());
+        }
+    });
+    let err = stack_error(&env, &work, &c, &frames, &measured, &registered, Some(&doctored), &out);
+    assert!(err.contains("local normalization left 2 frames") && err.contains("at least 3"), "{err}");
+    no_stack_products(&work, &out);
 }

@@ -114,6 +114,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SLM_INV` (no `ATH_*` card), the maps `master_rejlow.fits`/`master_rejhigh.fits`, and `stack/weights.json`. A
   missing transform, `.athln` or normalize report is an error naming the frames and the command that makes it, before
   any pixel is read.
+  The anchor is named in the `stack stage written` log line (`SLM_REF` stays the registration reference), a frame
+  `normalize` excluded is marked excluded in `stack/weights.json` with `normalize`'s reason, `StackReport.warnings` holds
+  every warning the stage sent to the progress sink (the weights' and the anchor pick's too), and an XISF master of
+  bottom-up (or unstated) frames is warned about, as Athenaeum warns once per group. `orientation::row_order_is_bottom_up`
+  (the row-order rule over a `ROWORDER` value) moved here from Athenaeum's core, which re-exports it.
 - `[profile.release]` is `lto = "thin"`, `codegen-units = 4`, Athenaeum's release profile, for a standalone build.
 
 ## [0.1.2] — 2026-11-23

@@ -24,7 +24,8 @@
 //!
 //! Products: the master light `<out>/master.fits` (or `.xisf`), the rejection maps `<out>/master_rejlow.fits` and
 //! `<out>/master_rejhigh.fits` (always FITS, as Athenaeum writes them), and `<work>/stack/weights.json`, the weights the
-//! stage stacked with. Each is built beside its destination and renamed into place with the manifest entry.
+//! stage stacked with (a frame local normalization excluded is marked excluded there, with `normalize`'s reason, as
+//! Athenaeum persists the exclusion). Each is built beside its destination and renamed into place with the manifest entry.
 //!
 //! **Before any pixel is read**, every included frame must have its transform and, with local normalization on, its
 //! `.athln`; a missing one is an error naming the frame and the command that makes it (`starloom register`, `starloom
@@ -36,6 +37,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Context, Result};
 use astroimage::header::{header_key_map, header_text, FrameFacts};
@@ -56,8 +58,10 @@ use crate::pipeline::normalize::Ranking;
 use crate::pipeline::register::{header_cards, is_wcs, RegisterReport, SLM_REF};
 use crate::pipeline::weights::{current_weights, subset_measure};
 use crate::pipeline::{
-    athln_path, common_cards, config_hash, frame_stem, ln_dir, ln_runs, parse_date_obs, source_facts, Ctx, Manifest, Stage,
+    athln_path, common_cards, config_hash, frame_stem, ln_dir, ln_runs, parse_date_obs, source_facts, Ctx, Manifest, Progress,
+    Stage,
 };
+use crate::orientation::row_order_is_bottom_up;
 use crate::stacking::config::AlgorithmConfig;
 use crate::stacking::integrate::{
     included_after_min_weight, integrate_group, large_scale_passes, GroupInput, GroupOutput, GroupProgress, GroupStats,
@@ -113,7 +117,8 @@ pub struct StackReport {
     pub rejection_high: Option<PathBuf>,
     /// `<work>/stack/weights.json`: the weights the stage stacked with.
     pub weights_file: PathBuf,
-    /// The weights and the selection the stage stacked with, as `weights.json` holds them.
+    /// The weights and the selection the stage stacked with, as `weights.json` holds them: a frame local normalization
+    /// excluded is marked excluded, with the reason `normalize` gave it.
     pub weights: WeightsReport,
     /// The frames integrated, in the integration's order (after the `integration.minWeight` floor).
     pub frames: Vec<PathBuf>,
@@ -126,7 +131,8 @@ pub struct StackReport {
     /// Set when the weights were made under other weight settings (mode, formula, keyword, selection) than the ones
     /// `measure` ran with: the stage re-weighed from the stored measurements and says so (P2-R21).
     pub reweighed: Option<String>,
-    /// What the stage warned about (also sent to the context's [`Progress`](crate::pipeline::Progress)).
+    /// Everything the stage sent to the context's [`Progress`] as a warning, in order: its own and the ones the weights
+    /// and the anchor pick raise.
     pub warnings: Vec<String>,
 }
 
@@ -163,15 +169,48 @@ pub fn stack(
     let out_dir = std::path::absolute(out_dir).with_context(|| format!("cannot make {} absolute", out_dir.display()))?;
     let sub = subset_measure(measure, frames)?;
     ctx.check_cancelled()?;
+    // The warnings the weights and the anchor pick send to the context's progress sink go to the report too.
+    let tee = WarningTee { inner: ctx.progress, warnings: Mutex::new(Vec::new()) };
+    let teed = Ctx {
+        pool: ctx.pool.clone(),
+        cancel: ctx.cancel,
+        progress: &tee,
+        memory_budget_bytes: ctx.memory_budget_bytes,
+        work_dir: ctx.work_dir,
+    };
     // Everything below decodes, warps or integrates on the caller's pool, never rayon's global one (SL-9).
-    ctx.pool.install(|| run(ctx, cfg, &work, &sub, register, normalize, &out_dir, format))
+    let mut report = ctx.pool.install(|| run(&teed, cfg, &work, &sub, register, normalize, &out_dir, format))?;
+    report.warnings = tee.take();
+    Ok(report)
 }
 
-/// Sends a warning to the log, the context and the report.
-fn warn(ctx: &Ctx<'_>, warnings: &mut Vec<String>, message: String) {
+/// A [`Progress`] that passes everything to the caller's and keeps the warnings for the report.
+struct WarningTee<'a> {
+    inner: &'a dyn Progress,
+    warnings: Mutex<Vec<String>>,
+}
+
+impl WarningTee<'_> {
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.warnings.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+}
+
+impl Progress for WarningTee<'_> {
+    fn step(&self, stage: &str, done: usize, total: usize) {
+        self.inner.step(stage, done, total);
+    }
+
+    fn warn(&self, message: &str) {
+        self.warnings.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(message.to_string());
+        self.inner.warn(message);
+    }
+}
+
+/// Sends a warning to the log and the context (whose sink the report's warnings are taken from).
+fn warn(ctx: &Ctx<'_>, message: String) {
     tracing::warn!("{message}");
     ctx.progress.warn(&message);
-    warnings.push(message);
 }
 
 /// A config value's serde name (`psfSnr`, `noise`, ...), for a message.
@@ -233,11 +272,10 @@ fn run(
     out_dir: &Path,
     format: OutputFormat,
 ) -> Result<StackReport> {
-    let mut warnings: Vec<String> = Vec::new();
     let files: Vec<PathBuf> = sub.frames.iter().map(|f| f.file.clone()).collect();
 
     // The weights under this config; an included frame with no transform is refused here, naming `starloom register`.
-    let weights = current_weights(ctx, sub, register, cfg)?;
+    let mut weights = current_weights(ctx, sub, register, cfg)?;
     let reweighed = reweigh_note(&sub.config, &weights.settings);
     if let Some(note) = &reweighed {
         tracing::info!("{note}");
@@ -281,10 +319,17 @@ fn run(
     }
 
     // Local normalization: each member's grids, read before any pixel is; a frame `normalize` excluded is left out.
-    let ln = if ln_runs(cfg) { ln_grids(ctx, work, &members, normalize, &mut warnings)? } else { LnPlan::default() };
+    let ln = if ln_runs(cfg) { ln_grids(ctx, work, &members, normalize)? } else { LnPlan::default() };
     let mut ln_by_member = ln.grids;
     if !ln.dropped.is_empty() {
-        let keep: Vec<bool> = (0..members.len()).map(|k| !ln.dropped.contains(&k)).collect();
+        // Athenaeum persists the exclusion on the frame's row: `weights.json` says the frame was not stacked.
+        for (k, reason) in &ln.dropped {
+            if let Some(row) = weights.frames.iter_mut().find(|f| f.file == members[*k].path) {
+                row.included = false;
+                row.reason = Some(reason.clone());
+            }
+        }
+        let keep: Vec<bool> = (0..members.len()).map(|k| !ln.dropped.iter().any(|(d, _)| *d == k)).collect();
         let mut k = 0;
         members.retain(|_| {
             k += 1;
@@ -323,7 +368,7 @@ fn run(
         let fits = crate::sys::total_ram_bytes().is_some_and(|total| maps_bytes <= total / 4);
         if !fits {
             integration.write_rejection_maps = false;
-            warn(ctx, &mut warnings, "rejection maps disabled: they would exceed the memory budget".to_string());
+            warn(ctx, "rejection maps disabled: they would exceed the memory budget".to_string());
         }
     }
 
@@ -352,7 +397,7 @@ fn run(
             Ok(set) => rej_set = Some(set),
             Err(e) => {
                 let msg = format!("failed to create the rejection-bitmap set: {e:#}");
-                warn(ctx, &mut warnings, format!("{bitmap_consumers} skipped: {msg}"));
+                warn(ctx, format!("{bitmap_consumers} skipped: {msg}"));
                 rej_set_failure = Some(msg);
             }
         }
@@ -397,19 +442,27 @@ fn run(
 
     // A bitmap write fault keeps the master; what it costs is said here, as is a large-scale pass that did not run.
     if let Some(reason) = rej_set.as_ref().and_then(RejBitmapSet::failure) {
-        warn(ctx, &mut warnings, format!("{bitmap_consumers} skipped: rejection bitmaps could not be written: {reason}"));
+        warn(ctx, format!("{bitmap_consumers} skipped: rejection bitmaps could not be written: {reason}"));
         rej_set_failure = Some(reason);
     }
     if bitmaps_for_large_scale && output.stats.large_scale_rejected_fraction.is_none() && rej_set_failure.is_none() {
         warn(
             ctx,
-            &mut warnings,
             "large-scale rejection did not run: the master is the per-pixel result (see the log for the reason)".to_string(),
         );
     }
 
     // The master and its maps, built beside their destinations; then `weights.json` and the entry.
     let cards = master_cards(cfg, &members, anchor, &reference, &output)?;
+    // XISF has no row order: the master's rows are its frames' order, and a viewer shows a bottom-up (or unstated) set
+    // flipped against the FITS master. The pixels are not flipped, so the user is told (Athenaeum warns once per group).
+    if format == OutputFormat::Xisf && cards_row_order_is_bottom_up(&cards) {
+        warn(
+            ctx,
+            "XISF output keeps the frames' bottom-up row order; XISF viewers will show it flipped relative to the FITS master"
+                .to_string(),
+        );
+    }
     std::fs::create_dir_all(out_dir).with_context(|| format!("cannot create {}", out_dir.display()))?;
     let master = master_path(out_dir, format);
     let mut moves: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -459,6 +512,8 @@ fn run(
         frames = output.stats.included,
         dropped_below_min_weight = output.stats.dropped_below_min_weight,
         ln_frames = output.stats.ln_frames,
+        anchor = %members[anchor].path.display(),
+        reference = %reference.display(),
         path = %master.display(),
         "stack stage written"
     );
@@ -473,7 +528,7 @@ fn run(
         reference,
         stats: output.stats,
         reweighed,
-        warnings,
+        warnings: Vec::new(),
     })
 }
 
@@ -482,8 +537,8 @@ fn run(
 struct LnPlan {
     /// `None` when local normalization does not apply to the stack (off, or `normalize` could not run for the group).
     grids: Option<Vec<Option<LnFrameGrids>>>,
-    /// Indices into the members.
-    dropped: Vec<usize>,
+    /// Indices into the members, each with the reason `normalize` gave.
+    dropped: Vec<(usize, String)>,
 }
 
 /// Each member's `.athln` grids under [`ln_runs`], by the status `normalize` gave the frame in its report (`normalize`
@@ -502,7 +557,6 @@ fn ln_grids(
     work: &Path,
     members: &[StackFrame],
     normalize: Option<&NormalizeReport>,
-    warnings: &mut Vec<String>,
 ) -> Result<LnPlan> {
     let names = || listed(&members.iter().map(|m| m.path.display().to_string()).collect::<Vec<_>>());
     let stored;
@@ -530,21 +584,21 @@ fn ln_grids(
         ),
         NormalizeStatus::Off => {
             let why = report.note.as_deref().unwrap_or("normalize could not run for the group");
-            warn(ctx, warnings, format!("local normalization is off for this stack ({why}); the stack uses the global normalization"));
+            warn(ctx, format!("local normalization is off for this stack ({why}); the stack uses the global normalization"));
             return Ok(LnPlan::default());
         }
     }
     let rows: BTreeMap<&Path, &NormalizeFrame> = report.frames.iter().map(|f| (f.file.as_path(), f)).collect();
     let mut grids: Vec<Option<LnFrameGrids>> = Vec::with_capacity(members.len());
-    let mut dropped: Vec<usize> = Vec::new();
+    let mut dropped: Vec<(usize, String)> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
     for (k, member) in members.iter().enumerate() {
         let row = rows.get(member.path.as_path()).copied();
         match row.map(|r| r.status) {
             Some(FrameStatus::Excluded) => {
                 let reason = row.and_then(|r| r.reason.as_deref()).unwrap_or("its local normalization failed");
-                warn(ctx, warnings, format!("{}: {reason}; the frame is excluded (local normalization)", member.path.display()));
-                dropped.push(k);
+                warn(ctx, format!("{}: {reason}; the frame is excluded (local normalization)", member.path.display()));
+                dropped.push((k, reason.to_string()));
                 grids.push(None);
             }
             Some(FrameStatus::KeptGlobal | FrameStatus::GlobalLowOverlap) => grids.push(None),
@@ -648,6 +702,16 @@ fn rejection_map_cards(label: &str, master: &[Card]) -> Result<Vec<Card>> {
         }
     }
     Ok(cards)
+}
+
+/// Whether the master's cards say its rows run bottom-up, an absent `ROWORDER` included (Athenaeum's
+/// `cards_row_order_is_bottom_up`).
+fn cards_row_order_is_bottom_up(cards: &[Card]) -> bool {
+    let value = cards.iter().find(|c| c.keyword == "ROWORDER").and_then(|c| match c.value.as_ref() {
+        Some(CardValue::Str(s)) => Some(s.as_str()),
+        _ => None,
+    });
+    row_order_is_bottom_up(value)
 }
 
 /// Removes the products built so far after a failure.
