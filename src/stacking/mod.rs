@@ -13,6 +13,7 @@ pub mod common_set;
 pub mod config;
 pub mod crop;
 pub mod drizzle;
+pub mod fits_artifact;
 pub mod groups;
 pub mod integrate;
 pub mod ln;
@@ -22,6 +23,7 @@ pub mod prefilter;
 pub mod psf_signal;
 pub mod register;
 pub mod rej;
+pub mod run_helpers;
 // Robust Chauvenet Rejection lives with the star-measurement module; re-exported so
 // `stacking::robust::…` callers are unchanged.
 pub use crate::star_measure::robust;

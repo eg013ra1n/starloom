@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The pure items a pipeline layer is built from moved here from Athenaeum's core, byte for byte: `StackingPreset`,
+  `AlgorithmConfig` (the seven algorithm sections), `algorithm_preset` and the four stage subtrees
+  (`calibration_subtree`, `measurement_subtree`, `registration_subtree`, `normalization_subtree`, with their
+  versioned variants) in `stacking::config`; `CalibratedLightOptions` (`calibration_library::options`);
+  `resolve_recipe` (`integration::recipe`); the debayer glue and `COPY_THROUGH_KEYWORDS` (`calibration_library`);
+  `flat_channel_norms` (`integration::cfa`); `sky_penalized_order`, `reference_coverage` and
+  `MIN_REFERENCE_COVERAGE` (`stacking::weights`); `header_pixel_scale_arcsec` (`geometry`); the `.athf` format with
+  `FITS_ARTIFACT_VERSION` 3 (`stacking::fits_artifact`); and `map_scale`, `wants_cfa_mosaic` and `pick_ln_anchor`
+  (`stacking::run_helpers`). No stage output moves and no version changes; the `.athf` format gets a golden row.
+
 ## [0.1.2] — 2026-11-23
 
 Test-only. No stage output moves; every stage version stays and the golden rows are unchanged.

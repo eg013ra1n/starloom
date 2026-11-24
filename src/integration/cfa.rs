@@ -142,6 +142,31 @@ pub fn central_third_channel_means(data: &[f32], w: usize, h: usize, g: CfaGeome
     [0, 1, 2].map(|c| if n[c] == 0 { 0.0 } else { sum[c] / n[c] as f64 })
 }
 
+/// The per-channel flat constants of a freshly integrated master flat: [`central_third_channel_means`] of its plane,
+/// accepted only when every channel's mean is finite and positive. These constants are DIVISORS downstream, so a
+/// non-finite or non-positive one is worse than absent: without them a consumer falls back to the global constant,
+/// with them it would divide a whole channel by garbage.
+///
+/// `Ok` carries the `[R, G, B]` means. `Err` carries the same means when one of them is degenerate, so the caller can
+/// say which values it refused. `data` is the master's own plane, in the same units and over the same window as the
+/// global flat constant. The catalog lookup (which pattern and phase a set declares) is the caller's.
+///
+/// # Panics
+/// If `data` is shorter than `width * height`, as [`central_third_channel_means`].
+pub fn flat_channel_norms(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    geom: CfaGeometry,
+) -> Result<[f64; 3], [f64; 3]> {
+    let means = central_third_channel_means(data, width, height, geom);
+    if means.iter().all(|m| m.is_finite() && *m > 0.0) {
+        Ok(means)
+    } else {
+        Err(means)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +399,31 @@ mod tests {
         let data = vec![7.0f32; 4];
         let means = central_third_channel_means(&data, 4, 1, geom(Bayer::Rggb, 0, 0));
         assert_eq!(means, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn flat_channel_norms_refuses_a_degenerate_channel_and_returns_its_means() {
+        // A flat of 6x6 samples: every channel of an RGGB mosaic reads 2.0, 4.0 and 8.0 in the central window.
+        let g = geom(Bayer::Rggb, 0, 0);
+        let mut data = vec![0f32; 36];
+        for y in 0..6usize {
+            for x in 0..6usize {
+                data[y * 6 + x] = match cfa_channel_at(x, y, g) {
+                    CfaChannel::R => 2.0,
+                    CfaChannel::G => 4.0,
+                    CfaChannel::B => 8.0,
+                };
+            }
+        }
+        assert_eq!(flat_channel_norms(&data, 6, 6, g), Ok([2.0, 4.0, 8.0]));
+        // A zero blue plane is degenerate, and the means come back in the error.
+        for y in 0..6usize {
+            for x in 0..6usize {
+                if cfa_channel_at(x, y, g) == CfaChannel::B {
+                    data[y * 6 + x] = 0.0;
+                }
+            }
+        }
+        assert_eq!(flat_channel_norms(&data, 6, 6, g), Err([2.0, 4.0, 0.0]));
     }
 }

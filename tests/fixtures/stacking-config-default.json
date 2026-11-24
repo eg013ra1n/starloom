@@ -1,0 +1,126 @@
+{
+  "version": 1,
+  "grouping": {
+    "exposureToleranceSec": 2.0,
+    "exposureMode": "seconds",
+    "stopsWidth": 1.0
+  },
+  "calibration": {
+    "flatNorm": true,
+    "flatNormMode": "centralThird",
+    "params": {
+      "trimFraction": 0.05,
+      "pedestalDn": 0.0,
+      "biasFallback": "subtractBias",
+      "cfaFlatScaling": true
+    },
+    "hotPixelCorrection": true,
+    "debayerOsc": true,
+    "format": "fits"
+  },
+  "measurement": {
+    "weightMode": "psfSignalWeight",
+    "psfModel": "auto",
+    "maxStars": 9000,
+    "formula": {
+      "fwhm": 15.0,
+      "eccentricity": 15.0,
+      "snr": 20.0,
+      "stars": 0.0,
+      "pedestal": 50.0
+    },
+    "keyword": "SSWEIGHT",
+    "detectionSigma": 20.0,
+    "seedPrefilter": "none",
+    "seedDetector": "peak",
+    "seedSource": "matchedFilter",
+    "seedThreshold": 6.0
+  },
+  "selection": {
+    "minWeightFraction": 0.05,
+    "maxFwhmPx": null,
+    "maxEccentricity": null,
+    "minStars": null,
+    "excludeOnRegistrationFailure": true
+  },
+  "reference": {
+    "mode": "auto",
+    "twoPass": true
+  },
+  "registration": {
+    "geometry": "coRegistered",
+    "model": "auto",
+    "distortion": "off",
+    "tpsSmoothing": 0.5,
+    "localDistortion": false,
+    "interpolation": "bicubicBSpline",
+    "clampingThreshold": 0.3,
+    "maxStars": 2000,
+    "ransacTolerancePx": 1.9,
+    "ransacMaxIterations": 2000,
+    "maxRmsPx": 2.0,
+    "failOnMaxRms": false,
+    "detection": {
+      "minSnr": 10.0,
+      "maxEccentricity": 0.8
+    },
+    "writeRegisteredFrames": false
+  },
+  "normalization": {
+    "output": "additiveWithScaling",
+    "rejection": "local",
+    "scaleEstimator": "bwmv",
+    "local": {
+      "enabled": false,
+      "scale": 1024,
+      "scaleMode": "auto",
+      "gridSize": 4,
+      "referenceFrames": 20,
+      "psfModel": "auto",
+      "localScale": false,
+      "starSelection": {
+        "minPeakSnr": 40.0,
+        "maxStars": 500,
+        "saturation": 0.75
+      },
+      "fluxEstimator": "commonAperture",
+      "aperture": "growthCurve"
+    }
+  },
+  "integration": {
+    "combination": "average",
+    "rejection": {
+      "method": "auto"
+    },
+    "minWeight": 0.005,
+    "rangeLow": 0.0,
+    "rangeHigh": null,
+    "writeRejectionMaps": false,
+    "largeScale": {
+      "enabled": false,
+      "protectedLayers": 2,
+      "growth": 2
+    }
+  },
+  "drizzle": {
+    "enabled": false,
+    "scale": 2,
+    "dropShrink": 0.9,
+    "kernel": "square",
+    "useRejection": true,
+    "useWeights": true,
+    "useLocalNormalization": true,
+    "writeWeightMap": false,
+    "bayer": false
+  },
+  "output": {
+    "format": "fits",
+    "cleanup": "keepAll",
+    "coverageMap": false,
+    "cropToCoverage": 0
+  },
+  "paths": {
+    "workingDir": null,
+    "outputDir": null
+  }
+}

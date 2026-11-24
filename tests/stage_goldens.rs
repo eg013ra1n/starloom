@@ -48,6 +48,7 @@ use starloom::integration::stats::NormalizationPair;
 use starloom::resample::{warp_rows, Plane};
 use starloom::stacking::config::{DrizzleKernel, DRIZZLE_KERNEL_VERSION};
 use starloom::stacking::drizzle::{drizzle_group, DrizzleFrame, DrizzleInput, DrizzleProgress};
+use starloom::stacking::fits_artifact::{write_fits, FITS_ARTIFACT_VERSION};
 use starloom::stacking::integrate::{
     integrate_group, GroupInput, GroupProgress, IntegrationConfig, NormalizationConfig, StackFrame,
     INTEGRATE_VERSION, SNR_GAIN_VERSION,
@@ -61,12 +62,12 @@ use starloom::stacking::measure::{
     MEASURE_STAGE_VERSION,
 };
 use starloom::stacking::pass1_artifact::{write_pass1, PASS1_ARTIFACT_VERSION};
-use starloom::stacking::psf_signal::PsfModel;
+use starloom::stacking::psf_signal::{PsfModel, StarFit};
 use starloom::stacking::register::align::{SeedPolicy, ALIGN_VERSION};
 use starloom::stacking::register::frame::{reference_stars, register_frame};
 use starloom::stacking::register::{scale_gate_for, RegistrationConfig};
 use starloom::stacking::weights::FrameWeight;
-use starloom::star_measure::MEASURE_VERSION;
+use starloom::star_measure::{StarFlags, MEASURE_VERSION};
 use starloom::storage_class::StorageClass;
 use starloom::test_support::{add_noise, synthetic_star_field};
 
@@ -97,6 +98,7 @@ const GOLDENS: &[Golden] = &[
     Golden { stage: "ln_model", platform: "aarch64-macos", versions: &[("LN_MODEL_VERSION", 4), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xe7cffc278266b609 },
     // Float-free, enforced on every platform.
     Golden { stage: "ln_grid_format", platform: "*", versions: &[("LN_GRID_VERSION", 1)], checksum: 0x0c6a45d93ef3d17b },
+    Golden { stage: "fits_artifact_format", platform: "*", versions: &[("FITS_ARTIFACT_VERSION", 3)], checksum: 0xb83708e283d73471 },
     Golden { stage: "integrate", platform: "aarch64-macos", versions: &[("INTEGRATE_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xbeeaee875bbeb3be },
     Golden { stage: "snr_gain", platform: "aarch64-macos", versions: &[("SNR_GAIN_VERSION", 2), ("INTEGRATE_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xcad258e262200dce },
     Golden { stage: "drizzle", platform: "aarch64-macos", versions: &[("DRIZZLE_KERNEL_VERSION", 2)], checksum: 0xbedfc3aff9989e37 },
@@ -115,6 +117,7 @@ fn live_version(name: &str) -> u32 {
         "ALIGN_VERSION" => ALIGN_VERSION,
         "LN_MODEL_VERSION" => LN_MODEL_VERSION,
         "LN_GRID_VERSION" => u32::from(LN_GRID_VERSION),
+        "FITS_ARTIFACT_VERSION" => u32::from(FITS_ARTIFACT_VERSION),
         "INTEGRATE_VERSION" => INTEGRATE_VERSION,
         "ENGINE_VERSION" => ENGINE_VERSION,
         "SNR_GAIN_VERSION" => SNR_GAIN_VERSION,
@@ -520,6 +523,45 @@ fn compute(pool: &Arc<rayon::ThreadPool>) -> Vec<Computed> {
         versions: &["LN_GRID_VERSION"],
         portable: true,
         checksum: digest(&[&std::fs::read(&grid_path).unwrap()]),
+    });
+
+    // fits_artifact_format: five star fits of literal values (binary fractions only, so no float rounding enters), as
+    // `write_fits` lays them out.
+    let fits: Vec<StarFit> = (0..5u32)
+        .map(|i| {
+            let f = f64::from(i);
+            StarFit {
+                x: 100.5 + 64.25 * f,
+                y: 200.25 + 32.5 * f,
+                background: 0.0625 + 0.015625 * f,
+                amplitude: 0.5 + 0.125 * f,
+                fwhm_x: 2.5 + 0.25 * f,
+                fwhm_y: 2.75 + 0.25 * f,
+                fwtm_x: 4.5 + 0.5 * f,
+                fwtm_y: 4.75 + 0.5 * f,
+                theta: 0.125 * f,
+                beta: 3.5 + 0.25 * f,
+                residual: 0.03125 * (f + 1.0),
+                signal: 1024.0 * (f + 1.0),
+                area: 24.0 + f,
+                peak5: f64::NAN,
+                sky_ring: f64::NAN,
+                sky_ring_sigma: f64::NAN,
+                sky_ring_n: 0,
+                ap_sum: if i == 3 { f64::NAN } else { 4096.5 + 512.0 * f },
+                snr: f64::NAN,
+                hfr: f64::NAN,
+                flags: StarFlags(u8::try_from(i).expect("a small index")),
+            }
+        })
+        .collect();
+    let athf_path = d.join("literal.athf");
+    write_fits(&athf_path, &fits).expect("the fits artifact writes");
+    rows.push(Computed {
+        stage: "fits_artifact_format",
+        versions: &["FITS_ARTIFACT_VERSION"],
+        portable: true,
+        checksum: digest(&[&std::fs::read(&athf_path).unwrap()]),
     });
 
     // integrate + snr_gain: 5 frames 128x128, identity maps, one with a planted hot column.
