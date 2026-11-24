@@ -95,9 +95,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calibration `k` and writes one `.athln` per frame (Measure's fits seed the scale) under `ln/`, with `ln/normalize.json`
   (`NormalizeReport`: the anchor, the LN reference members, the calibration frames and `k`, the reference β, the LN scale
   and each frame's outcome; a record for the user to read). A frame whose own normalization fails is excluded when local
-  normalization drives the output and keeps the global one otherwise. Not asked for, or fewer than three frames to build
-  the reference from, the stage warns or says so and leaves nothing. The versions it records gain
-  `NORMALIZE_REPORT_VERSION`.
+  normalization drives the output and keeps the global one otherwise. Not asked for, the stage says so and leaves
+  nothing. When local normalization cannot run for the group (fewer than three frames to build the reference from,
+  `referenceFrames` under 3, a refused background model for the reference, or a failed reference build) the stage warns
+  as Athenaeum's run does and writes the fallback as its outcome: `ln/` is replaced by a folder holding only
+  `normalize.json` with status `off` and the reason (an earlier run's sidecars are gone), and `stack` stacks on the global
+  normalization. The versions it records gain `NORMALIZE_REPORT_VERSION`.
 - The `stack` stage of `pipeline`: `stack` mirrors Athenaeum's output stage for one group up to the master write. It
   re-weighs from the stored measurements and transforms under its own config (`current_weights`, and says so when the
   weight settings are not the ones `measure` ran with), refuses fewer than three included frames, reads each member's

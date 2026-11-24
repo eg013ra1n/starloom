@@ -23,12 +23,14 @@
 //!   reference (a file, or the best-weighted frame), writes `transforms.json`, then reweighs ([`current_weights`]) and
 //!   writes `weights.json`; with a flag it also writes each frame resampled into the reference's grid.
 //! - [`normalize`](mod@normalize): the fifth stage. [`normalize()`](normalize::normalize) builds the LN reference and
-//!   writes one `.athln` per frame under `<work>/ln/`, when local normalization is asked for ([`ln_runs`]).
+//!   writes one `.athln` per frame and `normalize.json` under `<work>/ln/`, when local normalization is asked for
+//!   ([`ln_runs`]); a group it cannot run for gets `normalize.json` alone with status `off`, and `stack` then uses the
+//!   global normalization.
 //! - [`stack`](mod@stack): the sixth stage. [`stack()`](stack::stack) re-weighs from the stored measurements and
 //!   transforms, integrates the included frames with rejection, their weights and their local normalization, and
 //!   writes the master light (and its rejection maps) with starloom's own cards.
-//! - [`formats`]: the manifest (`starloom.json`, with the command history) and the measure, transforms and weights
-//!   reports, each tagged and versioned, plus the rules that keep a half-written stage from looking done.
+//! - [`formats`]: the manifest (`starloom.json`, with the command history) and the measure, transforms, weights and
+//!   normalize reports, each tagged and versioned, plus the rules that keep a half-written stage from looking done.
 //!
 //! # Manual mode
 //!

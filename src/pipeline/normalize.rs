@@ -21,14 +21,23 @@
 //! local normalization drives the output and keeps the global normalization otherwise, as in Athenaeum's run; the
 //! report says which, and `stack` reads it.
 //!
+//! When local normalization cannot run for the group (fewer than 3 frames to build the reference from, a refused
+//! background model, or a failed reference build) Athenaeum's run warns and stacks the group on the global
+//! normalization. Here that outcome is written down: `<work>/ln/` is replaced by a folder holding only `normalize.json`,
+//! with status [`NormalizeStatus::Off`] and the reason, and its manifest entry, so that no earlier run's sidecar is left
+//! for `stack` to pick up and `stack` stacks on the global normalization.
+//!
 //! The stage works from the unwarped calibrated frames and their transforms: the registered copies `register
 //! --write-registered` may have written are not read, because they hold the very pixels the warp gives and a stale
 //! copy would be used without anyone noticing (P2-R24). A frame's id inside the stage is its index among the frames it
 //! was given (the pipeline order), which stands for the catalog id Athenaeum breaks ties on (P2-R10).
 //!
-//! Known divergences from Athenaeum's run, all of the frame-set kind: there is no project grid, so the masked reference
-//! and the low-overlap rule never apply; a group of fewer than 3 members is an error, where the run skips it.
-//! Everything that decodes a pixel or fits a star runs on the context's pool (SL-9).
+//! Known divergences from Athenaeum's run: there is no project grid, so the masked reference never applies, and with it
+//! the low-overlap rule (it reads a masked reference's overlap), so this stage never writes a
+//! [`FrameStatus::GlobalLowOverlap`] row; a group of fewer than 3 members is an error, where the run skips it; the
+//! anchor tie and the seeds calibration's tie break on the frame's index in the pipeline order, where the run breaks
+//! them on the catalog id (P2-R3, P2-R10). Everything that decodes a pixel or fits a star runs on the context's
+//! pool (SL-9).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -185,9 +194,11 @@ fn load_fits(work: &Path, file: &Path, planes: usize, loud: bool) -> Vec<Vec<Sta
 ///
 /// When local normalization is not asked for ([`ln_runs`]) the stage does nothing: the report's status is
 /// [`NormalizeStatus::NotRequested`], no file is written and no manifest entry is left. When it is asked for and cannot
-/// run for the group (fewer than 3 frames to build the reference from, or its background model is refused) the status is
-/// [`NormalizeStatus::Off`], with a warning, and again nothing is left (Athenaeum's run then stacks with the global
-/// normalization).
+/// run for the group (fewer than 3 frames to build the reference from, `referenceFrames` under 3, its background model
+/// refused, or the reference's build failed) the status is [`NormalizeStatus::Off`], with a warning worded as
+/// Athenaeum's run words it, and the outcome is written: `<work>/ln/` is replaced by a folder holding only
+/// `normalize.json` (so no earlier run's sidecars are left), with its manifest entry, and `stack` then stacks the group
+/// on the global normalization, as Athenaeum's run does. A cancel is an error, never `off`.
 ///
 /// The products are built in `<work>/ln.part/` and renamed into place together with the manifest entry
 /// ([`commit_stage`]), so a failure or a cancel leaves no entry and no half-written folder. Everything that decodes a
@@ -214,16 +225,71 @@ pub fn normalize(
     ctx.pool.install(|| run(ctx, &work, &sub, register, cfg))
 }
 
-/// The report of a group local normalization cannot run for: the warning, and nothing written.
-fn off(ctx: &Ctx<'_>, cfg: &AlgorithmConfig, note: String) -> NormalizeReport {
+/// Why local normalization cannot run for a group: Athenaeum's `LnFallback`, without the group key.
+enum Fallback<'a> {
+    /// `referenceFrames` is under 3.
+    ReferenceFramesBelowThree { reference_frames: u32 },
+    /// Fewer than 3 members can build the reference.
+    TooFewMembers { count: usize },
+    /// The reference's background model is refused on a plane.
+    BackgroundRefused { reason: &'a str },
+    /// Building the reference or its products failed.
+    BuildFailed { msg: &'a str },
+}
+
+/// The warning for a fallback, worded as Athenaeum's `ln_fallback_warning` (`rejection_only` when local normalization
+/// was not asked for and only drives the rejection).
+fn fallback_warning(rejection_only: bool, what: &Fallback<'_>) -> String {
+    const TAIL: &str = "rejection used the global normalization, which can clip star cores where seeing varies";
+    match (rejection_only, what) {
+        (false, Fallback::BuildFailed { msg }) => format!("local normalization failed: {msg}"),
+        (true, Fallback::BuildFailed { msg }) => {
+            format!("local rejection normalization could not be computed ({msg}); {TAIL}")
+        }
+        (false, Fallback::ReferenceFramesBelowThree { reference_frames }) => {
+            format!("local normalization off \u{2014} referenceFrames ({reference_frames}) < 3; using global normalization")
+        }
+        (true, Fallback::ReferenceFramesBelowThree { reference_frames }) => {
+            format!("local rejection normalization could not be computed \u{2014} referenceFrames ({reference_frames}) < 3; {TAIL}")
+        }
+        (false, Fallback::TooFewMembers { count }) => format!(
+            "local normalization off \u{2014} only {count} member(s) can build the LN reference (need >= 3); using global normalization"
+        ),
+        (true, Fallback::TooFewMembers { count }) => format!(
+            "local rejection normalization could not be computed \u{2014} only {count} member(s) can build the reference (need >= 3); {TAIL}"
+        ),
+        (false, Fallback::BackgroundRefused { reason }) => format!(
+            "local normalization off \u{2014} the LN reference's background model is refused ({reason}); using global normalization"
+        ),
+        (true, Fallback::BackgroundRefused { reason }) => format!(
+            "local rejection normalization could not be computed \u{2014} the reference frame's background model is refused ({reason}); {TAIL}"
+        ),
+    }
+}
+
+/// The outcome of a group local normalization cannot run for: the warning, and `<work>/ln/` replaced by a folder that
+/// holds only `normalize.json` with status [`NormalizeStatus::Off`] (so an earlier run's sidecars, reference and entry
+/// are gone), committed with the stage's manifest entry.
+fn off(ctx: &Ctx<'_>, work: &Path, cfg: &AlgorithmConfig, files: &[PathBuf], what: Fallback<'_>) -> Result<NormalizeReport> {
+    let note = fallback_warning(!cfg.normalization.local.enabled, &what);
     tracing::warn!("{note}");
     ctx.progress.warn(&note);
-    NormalizeReport::idle(NormalizeStatus::Off, note, cfg.clone(), recorded_versions())
+    let report = NormalizeReport::idle(NormalizeStatus::Off, note, cfg.clone(), recorded_versions());
+    let final_dir = ln_dir(work);
+    let part_dir = part_path(&final_dir);
+    remove_dir_if_present(&part_dir)?;
+    std::fs::create_dir_all(&part_dir).with_context(|| format!("cannot create {}", part_dir.display()))?;
+    report.write(&part_dir.join(NORMALIZE_FILE)).inspect_err(|_| remove_part(&part_dir))?;
+    let entry = Entry::new(Stage::Normalize, cfg, files.to_vec(), vec![final_dir.join(NORMALIZE_FILE)]);
+    if let Err(e) = commit_stage(ctx.work_dir, &[(part_dir.clone(), final_dir)], entry) {
+        remove_part(&part_dir);
+        return Err(e);
+    }
+    Ok(report)
 }
 
 fn run(ctx: &Ctx<'_>, work: &Path, sub: &MeasureReport, register: &RegisterReport, cfg: &AlgorithmConfig) -> Result<NormalizeReport> {
     let ln_cfg = cfg.normalization.local.clone();
-    let ln_drives_output = ln_cfg.enabled;
     let files: Vec<PathBuf> = sub.frames.iter().map(|f| f.file.clone()).collect();
     let weights = current_weights(ctx, sub, register, cfg)?;
     let manifest = Manifest::load(ctx.work_dir)?;
@@ -308,16 +374,12 @@ fn run(ctx: &Ctx<'_>, work: &Path, sub: &MeasureReport, register: &RegisterRepor
     let ranked = sky_penalized_order(&ranking.weights, &included_mask, &ranking.star_counts, &ranking.sky);
     let n = (ln_cfg.reference_frames as usize).min(ranked.len());
     if n < 3 {
-        let what = if ln_drives_output { "local normalization is off for this group" } else { "local rejection normalization could not be computed" };
-        return Ok(off(
-            ctx,
-            cfg,
-            format!(
-                "{what}: {} frame(s) can build the LN reference (referenceFrames is {}, at least 3 are needed); the stack uses the global normalization",
-                ranked.len(),
-                ln_cfg.reference_frames
-            ),
-        ));
+        let what = if (ln_cfg.reference_frames as usize) < 3 {
+            Fallback::ReferenceFramesBelowThree { reference_frames: ln_cfg.reference_frames }
+        } else {
+            Fallback::TooFewMembers { count: ranked.len() }
+        };
+        return off(ctx, work, cfg, &files, what);
     }
     let reference_members: Vec<usize> = ranked[..n].to_vec();
     let member_file = |k: usize| stack_frames[k].path.clone();
@@ -344,13 +406,17 @@ fn run(ctx: &Ctx<'_>, work: &Path, sub: &MeasureReport, register: &RegisterRepor
         Ok(outcome) => outcome,
         Err(e) => {
             remove_part(&part_dir);
-            return Err(e);
+            // A cancel stays an error; any other failure of the build is Athenaeum's "warn and stack on global".
+            ctx.check_cancelled()?;
+            let msg = format!("{e:#}");
+            tracing::warn!(error = %msg, "local normalization failed for this group; falling back to global normalization");
+            return off(ctx, work, cfg, &files, Fallback::BuildFailed { msg: &msg });
         }
     };
     let (mut report, normalized) = match outcome {
-        Built::Off(note) => {
+        Built::Off(reason) => {
             remove_part(&part_dir);
-            return Ok(off(ctx, cfg, note));
+            return off(ctx, work, cfg, &files, Fallback::BackgroundRefused { reason: &reason });
         }
         Built::Ran { report, normalized } => (report, normalized),
     };
@@ -381,7 +447,7 @@ fn run(ctx: &Ctx<'_>, work: &Path, sub: &MeasureReport, register: &RegisterRepor
     report.reference = Some(final_dir.join(LN_REFERENCE_FILE));
     report.reference_saturation = Some(final_dir.join(LN_REFERENCE_SATURATION_FILE));
     report.write(&part_dir.join(NORMALIZE_FILE)).inspect_err(|_| remove_part(&part_dir))?;
-    let entry = Entry::new(Stage::Normalize, cfg, files, products);
+    let entry = Entry::new(Stage::Normalize, cfg, files.clone(), products);
     if let Err(e) = commit_stage(ctx.work_dir, &[(part_dir.clone(), final_dir)], entry) {
         remove_part(&part_dir);
         return Err(e);
@@ -397,7 +463,7 @@ fn run(ctx: &Ctx<'_>, work: &Path, sub: &MeasureReport, register: &RegisterRepor
 }
 
 /// What the build left: the report (without the paths and lists [`run`] fills in) and the members that have a sidecar,
-/// or why local normalization cannot run for the group.
+/// or the reason the reference's background model was refused (local normalization cannot run for the group).
 enum Built {
     Off(String),
     Ran { report: NormalizeReport, normalized: Vec<usize> },
@@ -483,10 +549,8 @@ fn build(
                 ref_models.push(m);
             }
             Err(r) => {
-                let what = if ln_drives_output { "local normalization is off for this group" } else { "local rejection normalization could not be computed" };
-                return Ok(Built::Off(format!(
-                    "{what}: the LN reference's background model is refused on plane {p} ({r}); the stack uses the global normalization"
-                )));
+                tracing::debug!(channel = p, error = %r, "ln reference background refused");
+                return Ok(Built::Off(r.to_string()));
             }
         }
     }
@@ -728,6 +792,39 @@ fn remove_part(dir: &Path) {
     if let Err(e) = std::fs::remove_dir_all(dir) {
         if e.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(path = %dir.display(), error = %e, "cannot remove a half-written stage folder");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fallback sentences are Athenaeum's (`ln_fallback_warning`), without the group key.
+    #[test]
+    fn fallback_warnings_are_worded_as_the_run_words_them() {
+        let cases = [
+            Fallback::BuildFailed { msg: "boom" },
+            Fallback::ReferenceFramesBelowThree { reference_frames: 2 },
+            Fallback::TooFewMembers { count: 2 },
+            Fallback::BackgroundRefused { reason: "no background sample" },
+        ];
+        let tail = "rejection used the global normalization, which can clip star cores where seeing varies";
+        let on = [
+            "local normalization failed: boom".to_string(),
+            "local normalization off \u{2014} referenceFrames (2) < 3; using global normalization".to_string(),
+            "local normalization off \u{2014} only 2 member(s) can build the LN reference (need >= 3); using global normalization".to_string(),
+            "local normalization off \u{2014} the LN reference's background model is refused (no background sample); using global normalization".to_string(),
+        ];
+        let rejection_only = [
+            format!("local rejection normalization could not be computed (boom); {tail}"),
+            format!("local rejection normalization could not be computed \u{2014} referenceFrames (2) < 3; {tail}"),
+            format!("local rejection normalization could not be computed \u{2014} only 2 member(s) can build the reference (need >= 3); {tail}"),
+            format!("local rejection normalization could not be computed \u{2014} the reference frame's background model is refused (no background sample); {tail}"),
+        ];
+        for (k, what) in cases.iter().enumerate() {
+            assert_eq!(fallback_warning(false, what), on[k], "on {k}");
+            assert_eq!(fallback_warning(true, what), rejection_only[k], "rejection only {k}");
         }
     }
 }

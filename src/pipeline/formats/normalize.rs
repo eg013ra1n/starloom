@@ -1,6 +1,7 @@
 //! `normalize.json`: what `normalize` did, for the user to read.
 //!
-//! Nothing reads it back to compare (P2-R24). It records what Athenaeum's local-normalization hashes fold: the anchor,
+//! Nothing reads it back to compare (P2-R24); `stack` reads its per-frame statuses and its group status. It records what
+//! Athenaeum's local-normalization hashes fold: the anchor,
 //! the frames the LN reference was built from (ranked as the stage ranked them), the frames the seeds calibration was
 //! measured over and its factor `k` per plane, plus the β the reference was fitted at and the LN scale. A later command
 //! finds a frame's `.athln` by its name ([`athln_path`](crate::pipeline::athln_path)).
@@ -31,8 +32,9 @@ pub enum NormalizeStatus {
     /// `local`): the stage did nothing and left no entry.
     NotRequested,
     /// Local normalization was asked for and could not run for the group (fewer than 3 frames to build the reference
-    /// from, or the reference's background model was refused); `note` says why. The stage left no entry, and the stack
-    /// would use the global normalization, as Athenaeum's run does.
+    /// from, `referenceFrames` under 3, the reference's background model refused, or the reference's build failed);
+    /// `note` says why. The stage wrote this report alone into `ln/` (an earlier run's sidecars are gone) with its
+    /// manifest entry, and the stack uses the global normalization, as Athenaeum's run does.
     Off,
 }
 
