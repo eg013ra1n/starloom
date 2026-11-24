@@ -1,4 +1,4 @@
-//! SL-9: every step of `master` and `calibrate` that decodes a pixel runs on the caller's pool.
+//! SL-9: every step of `master`, `calibrate` and `measure` that decodes a pixel or fits a star runs on the caller's pool.
 //!
 //! A compressed raw frame, a compressed pre-calibration master and a compressed light all go through the image
 //! reader's spill, which decodes with rayon iterators on whatever pool is current. Outside the caller's pool that is
@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use starloom::calibration_library::options::CalibratedLightOptions;
 use starloom::fits_writer::{write_fits_f32, OutputFormat};
-use starloom::pipeline::{build_master, calibrate, CalGroup, CalSource, Ctx, FlatPrecalSource, MasterKind, NoProgress};
+use starloom::pipeline::{build_master, calibrate, measure, CalGroup, CalSource, Ctx, FlatPrecalSource, MasterKind, NoProgress};
 use starloom::stacking::config::{algorithm_preset, StackingPreset};
 
 // Large enough that the reader's decode runs in parallel (it does from 131,072 samples).
@@ -81,6 +81,20 @@ fn compressed_frames_decode_on_the_callers_pool_and_never_on_rayons_global_one()
     let report = calibrate(&ctx, &cfg, &groups, &CalibratedLightOptions::default(), &tmp.path().join("out"), OutputFormat::Fits).unwrap();
     assert_eq!(report.frames.len(), 3);
     assert!(report.frames.iter().all(|f| f.hot_pixels_replaced.is_some()), "the hot-pixel pass ran from the built master dark");
+
+    // `measure` on star frames, two passes with a spilled first pass: the fits and the fan-out run on the caller's pool.
+    let stars = tmp.path().join("stars");
+    std::fs::create_dir_all(&stars).unwrap();
+    let frames: Vec<PathBuf> = (0..3)
+        .map(|k| {
+            let (data, w, h) = starloom::test_support::fixture_field(7 + k, 1.0, 0.002);
+            let path = stars.join(format!("c_Light_{k:04}.fits"));
+            write_fits_f32(&path, w, h, 1, &data, &[]).unwrap();
+            path
+        })
+        .collect();
+    let report = measure(&ctx, &cfg, &frames, None, false).unwrap();
+    assert!(report.group_beta.is_some() && report.frames.iter().all(|f| f.included));
 
     // Nothing built rayon's global pool: asking for it now succeeds (it fails once a pool has been built).
     rayon::ThreadPoolBuilder::new().num_threads(1).build_global().expect("rayon's global pool was built by a stage that ran outside the caller's pool");

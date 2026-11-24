@@ -218,8 +218,8 @@ mod tests {
         report.group_c = vec![GroupC { plane: 0, planes: 5, count: 1, median: Some(1.0 / 3.0), min: Some(0.9), max: None }];
         report.frames = vec![MeasureFrame {
             file: dir.join("a.fit"),
-            measurement: measurement(),
-            weight: FrameWeight { channels: vec![0.5], normalized: vec![1.0], mean: 0.5, normalized_mean: 1.0, missing: None },
+            measurement: Some(measurement()),
+            weight: Some(FrameWeight { channels: vec![0.5], normalized: vec![1.0], mean: 0.5, normalized_mean: 1.0, missing: None }),
             included: true,
             reason: None,
             measure_floored: false,
@@ -336,8 +336,8 @@ mod tests {
         assert_eq!(back, report);
         assert_eq!(back.group_beta.unwrap().to_bits(), report.group_beta.unwrap().to_bits());
         assert_eq!(
-            back.frames[0].measurement.channels[0].eccentricity.to_bits(),
-            report.frames[0].measurement.channels[0].eccentricity.to_bits()
+            back.frames[0].measurement.as_ref().unwrap().channels[0].eccentricity.to_bits(),
+            report.frames[0].measurement.as_ref().unwrap().channels[0].eccentricity.to_bits()
         );
         set_version(&path, 2);
         assert_refuses_version(MeasureReport::read(&path).unwrap_err(), MEASURE_REPORT_FORMAT);
@@ -395,13 +395,13 @@ mod tests {
     fn non_finite_floats_are_stored_as_null_and_read_back_non_finite() {
         let dir = tempfile::tempdir().unwrap();
         let mut report = measure_report(dir.path());
-        let plane = &mut report.frames[0].measurement.channels[0];
+        let plane = &mut report.frames[0].measurement.as_mut().unwrap().channels[0];
         plane.location = f64::NAN;
         plane.scale = f64::INFINITY;
         plane.psf_snr = f64::NEG_INFINITY;
         plane.aperture_correction = Some(f64::NAN);
         report.group_beta = Some(f64::NAN);
-        report.frames[0].weight.channels = vec![f64::NAN];
+        report.frames[0].weight.as_mut().unwrap().channels = vec![f64::NAN];
         let path = dir.path().join(MEASURE_REPORT_FILE);
         report.write(&path).unwrap();
 
@@ -411,11 +411,14 @@ mod tests {
         assert!(text.contains("\"location\": null"), "the report stores what the metrics payload stores");
 
         let back = MeasureReport::read(&path).unwrap();
-        let (b, f) = (&back.frames[0].measurement.channels[0], &report.frames[0].measurement.channels[0]);
+        let (b, f) = (
+            &back.frames[0].measurement.as_ref().unwrap().channels[0],
+            &report.frames[0].measurement.as_ref().unwrap().channels[0],
+        );
         assert!(b.location.is_nan() && !b.scale.is_finite() && !b.psf_snr.is_finite());
         assert_eq!(b.aperture_correction, None, "an option written as null is None");
         assert_eq!(back.group_beta, None);
-        assert!(back.frames[0].weight.channels[0].is_nan());
+        assert!(back.frames[0].weight.as_ref().unwrap().channels[0].is_nan());
         // Every finite number is untouched.
         assert_eq!(b.fwhm_px.to_bits(), f.fwhm_px.to_bits());
         assert_eq!(b.eccentricity.to_bits(), f.eccentricity.to_bits());
@@ -424,7 +427,7 @@ mod tests {
         // A file written by serde_json itself reads the same way.
         let plain = serde_json::to_string(&report).unwrap();
         std::fs::write(&path, plain).unwrap();
-        assert!(MeasureReport::read(&path).unwrap().frames[0].measurement.channels[0].location.is_nan());
+        assert!(MeasureReport::read(&path).unwrap().frames[0].measurement.as_ref().unwrap().channels[0].location.is_nan());
     }
 
     #[test]

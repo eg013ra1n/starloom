@@ -28,6 +28,11 @@ use starloom::pipeline::{
     build_master, calibrate, preflight, CalGroup, CalSource, Ctx, FlatPrecalSource, Manifest, MasterKind, Progress, Stage,
 };
 use starloom::stacking::config::{algorithm_preset, AlgorithmConfig, StackingPreset};
+use starloom::pipeline::{athf_path, finish, measure, measure_dir, pass1_path, Entry, MeasureReport};
+use starloom::pipeline::formats::{commit_stage, source_facts, MEASURE_CSV_COLUMNS};
+use starloom::stacking::fits_artifact::read_fits;
+use starloom::stacking::psf_signal::PsfModel;
+use starloom::stacking::weights::WeightMode;
 
 const W: usize = 32;
 const H: usize = 24;
@@ -1052,4 +1057,300 @@ fn a_master_dark_shared_by_two_groups_is_measured_and_warned_about_once() {
     assert_eq!(r.frames.len(), 2);
     let skipped = r.warnings.iter().filter(|w| w.starts_with("Hot-pixel correction skipped")).count();
     assert_eq!(skipped, 1, "{:?}", r.warnings);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// measure
+// ---------------------------------------------------------------------------------------------------------------
+
+/// Writes a calibrated mono frame of the 150-star fixture (768 x 512) with `cards`.
+fn star_frame(dir: &Path, name: &str, seed: u64, cards: &[Card]) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let (data, w, h) = starloom::test_support::fixture_field(seed, 1.0, 0.002);
+    write_f32(&dir.join(name), w, h, &data, cards)
+}
+
+fn star_frames(dir: &Path, n: usize, cards: &[Card]) -> Vec<PathBuf> {
+    (0..n).map(|k| star_frame(dir, &format!("c_Light_{k:04}.fits"), 7 + k as u64, cards)).collect()
+}
+
+fn real_card(keyword: &str, value: f64) -> Card {
+    Card::new(keyword, CardValue::Real(value)).unwrap()
+}
+
+fn read_csv(path: &Path) -> (Vec<String>, Vec<Vec<String>>) {
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut lines = text.lines();
+    let head = lines.next().unwrap().split(',').map(str::to_string).collect();
+    (head, lines.map(|l| l.split(',').map(str::to_string).collect()).collect())
+}
+
+#[test]
+fn measure_writes_one_csv_row_per_frame_and_channel_with_the_fixed_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let optics = [real_card("XPIXSZ", 3.76), real_card("FOCALLEN", 1000.0)];
+    let mut frames = star_frames(&tmp.path().join("cal"), 3, &optics);
+    // One debayered frame: three planes, three rows.
+    let (a, w, h) = starloom::test_support::fixture_field(20, 1.0, 0.002);
+    let (b, _, _) = starloom::test_support::fixture_field(21, 1.0, 0.002);
+    let (c, _, _) = starloom::test_support::fixture_field(22, 1.0, 0.002);
+    let all: Vec<f32> = [a, b, c].concat();
+    let rgb = tmp.path().join("cal").join("c_Light_0003_d.fits");
+    write_fits_f32(&rgb, w, h, 3, &all, &optics).unwrap();
+    frames.push(rgb);
+
+    let report = measure(&env.ctx(&work), &cfg(), &frames, None, false).unwrap();
+    assert_eq!(report.frames.len(), 4);
+    let dir = measure_dir(&work);
+    let (head, rows) = read_csv(&dir.join("measure.csv"));
+    assert_eq!(head, MEASURE_CSV_COLUMNS.to_vec());
+    assert_eq!(rows.len(), 3 + 3);
+    assert!(rows.iter().all(|r| r.len() == MEASURE_CSV_COLUMNS.len()));
+    let channels: Vec<&str> = rows.iter().map(|r| r[1].as_str()).collect();
+    assert_eq!(channels, ["0", "0", "0", "0", "1", "2"]);
+    // fwhm_arcsec = fwhm_px x 206.2648 x pixel size / focal length, from the frame's own facts (no manifest).
+    let scale = 206.2648 * 3.76 / 1000.0;
+    for r in &rows {
+        let (px, arcsec): (f64, f64) = (r[2].parse().unwrap(), r[3].parse().unwrap());
+        assert!((arcsec - px * scale).abs() <= 1e-9 * arcsec.abs().max(1.0), "{px} {arcsec}");
+        assert_eq!(r[16], "true");
+    }
+    // The per-plane star fits and, under the default `auto` profile, the first-pass spills are in place.
+    for f in &frames {
+        assert!(athf_path(&work, f, 0).is_file());
+        assert!(pass1_path(&work, f).is_file());
+    }
+    assert!(athf_path(&work, frames.last().unwrap(), 2).is_file());
+    let manifest = Manifest::load(&work).unwrap();
+    let entry = manifest.entry(Stage::Measure).unwrap();
+    assert_eq!(entry.inputs.len(), 4);
+    assert!(entry.products.iter().all(|p| p.exists()));
+    assert!(entry.products.contains(&dir.join("measure.json")));
+    assert!(!tmp.path().join("work").join("measure.part").exists());
+}
+
+#[test]
+fn measure_json_round_trips_the_frame_measurements_bit_for_bit_and_refolds_on_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let frames = star_frames(&tmp.path().join("cal"), 4, &[]);
+    let c = cfg();
+    let report = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    let path = measure_dir(&work).join("measure.json");
+    let back = MeasureReport::read(&path).unwrap();
+    // Whatever was non-finite is null on both sides; every finite number is the same bits.
+    assert_eq!(serde_json::to_string(&back).unwrap(), serde_json::to_string(&report).unwrap());
+    for (a, b) in back.frames.iter().zip(&report.frames) {
+        let (a, b) = (a.measurement.as_ref().unwrap(), b.measurement.as_ref().unwrap());
+        for (ca, cb) in a.channels.iter().zip(&b.channels) {
+            assert_eq!(ca.fwhm_px.to_bits(), cb.fwhm_px.to_bits());
+            assert_eq!(ca.psf_signal_weight.to_bits(), cb.psf_signal_weight.to_bits());
+            assert_eq!(ca.tflux.to_bits(), cb.tflux.to_bits());
+        }
+    }
+    assert_eq!(back.group_beta.map(f64::to_bits), report.group_beta.map(f64::to_bits));
+    assert!(report.group_beta.is_some(), "the auto profile resolves a group beta");
+
+    let manifest = Manifest::load(&work).unwrap();
+    let sources = source_facts(&manifest, &frames).unwrap();
+    // Read back, the stored values give the weights and the selection `measure` computed.
+    let again = finish(&back, &c, &sources);
+    for (a, b) in again.frames.iter().zip(&back.frames) {
+        assert_eq!(a.included, b.included);
+        assert_eq!(a.reason, b.reason);
+        assert_eq!(
+            a.weight.as_ref().unwrap().normalized_mean.to_bits(),
+            b.weight.as_ref().unwrap().normalized_mean.to_bits()
+        );
+    }
+
+    // A plane at the fit-call floor (no aperture correction though stars were fitted) takes its channel's median on
+    // every read; the stored value stays as the module made it.
+    let mut floored = back.clone();
+    let stored = floored.frames[0].measurement.as_mut().unwrap();
+    assert!(stored.channels[0].stars_fitted > 0 && stored.channels[0].aperture_correction.is_some());
+    stored.channels[0].aperture_correction = None;
+    let tflux = stored.channels[0].tflux;
+    let folded = finish(&floored, &c, &sources);
+    let m = folded.group_c[0].median.expect("the other frames carry a correction");
+    let took = &folded.frames[0].measurement.as_ref().unwrap().channels[0];
+    assert_eq!(took.aperture_correction_group, Some(m));
+    assert_eq!(took.tflux.to_bits(), (tflux * m).to_bits());
+    assert_eq!(floored.frames[0].measurement.as_ref().unwrap().channels[0].tflux.to_bits(), tflux.to_bits());
+    assert_eq!(folded.group_c[0].planes, 3);
+    assert_eq!(folded.group_c[0].count, 1);
+}
+
+/// The text of one column of a stars CSV.
+fn stars_column(path: &Path, column: &str) -> Vec<String> {
+    let (head, rows) = read_csv(path);
+    let at = head.iter().position(|h| h == column).unwrap();
+    rows.into_iter().map(|r| r[at].clone()).collect()
+}
+
+#[test]
+fn frames_without_gain_get_one_warning_and_gain_changes_snr() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c = cfg();
+    let gain_warnings = |env: &Env| env.progress.all().iter().filter(|w| w.contains("--gain")).count();
+
+    // Two frames with EGAIN and no SLM_CSCL have no gain: one warning, and no shot term in the star SNR.
+    let plain = star_frames(&tmp.path().join("plain"), 2, &[real_card("EGAIN", 2.0)]);
+    let env = Env::new();
+    let work_a = tmp.path().join("work_a");
+    let a = measure(&env.ctx(&work_a), &c, &plain, None, true).unwrap();
+    assert_eq!(gain_warnings(&env), 1, "{:?}", env.progress.all());
+    assert!(env.progress.all().iter().any(|w| w.contains("2 of 2 frames have no gain")));
+    let none = stars_column(&work_a.join("measure").join("stars").join("c_Light_0000.p0.csv"), "snr");
+    assert!(!none.is_empty());
+
+    // `--gain 0.5` removes the warning and gives every star an SNR.
+    let env = Env::new();
+    let work_b = tmp.path().join("work_b");
+    let b = measure(&env.ctx(&work_b), &c, &plain, Some(0.5), true).unwrap();
+    assert_eq!(gain_warnings(&env), 0, "{:?}", env.progress.all());
+    let given = stars_column(&work_b.join("measure").join("stars").join("c_Light_0000.p0.csv"), "snr");
+    assert_ne!(none, given, "the shot term changes every star's SNR");
+    let (ca, cb) = (&a.frames[0].measurement.as_ref().unwrap().channels[0], &b.frames[0].measurement.as_ref().unwrap().channels[0]);
+    // The classic `snr_weight` is the frame's background statistic and never reads the gain; the aperture correction does
+    // (its star sample is cut by SNR), so the PSF flux and `psf_snr` move.
+    assert_eq!(ca.snr_weight.to_bits(), cb.snr_weight.to_bits());
+    assert_ne!(ca.psf_snr.to_bits(), cb.psf_snr.to_bits());
+
+    // EGAIN x SLM_CSCL in the header is the same gain: the same SNR, with no warning. (Frames named apart.)
+    let cards = [real_card("EGAIN", 2.0), real_card("SLM_CSCL", 0.25)];
+    let headed = star_frames(&tmp.path().join("headed"), 2, &cards);
+    let env = Env::new();
+    let work_c = tmp.path().join("work_c");
+    measure(&env.ctx(&work_c), &c, &headed, None, true).unwrap();
+    assert_eq!(gain_warnings(&env), 0, "{:?}", env.progress.all());
+    let from_header = stars_column(&work_c.join("measure").join("stars").join("c_Light_0000.p0.csv"), "snr");
+    assert_eq!(from_header, given, "EGAIN 2 x SLM_CSCL 0.25 = 0.5");
+}
+
+#[test]
+fn measure_takes_the_exposure_of_the_raw_light() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    // The calibrated frames carry neither EXPTIME nor EXPOSURE; the raw lights' facts are in the manifest.
+    let frames = star_frames(&tmp.path().join("cal"), 3, &[]);
+    let mut entry = Entry::new(Stage::Calibrate, &cfg(), Vec::new(), frames.clone());
+    for (frame, exptime) in frames.iter().zip([120.0, 60.0, 30.0]) {
+        let raw = tmp.path().join("raw").join(frame.file_name().unwrap());
+        std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+        write_f32(&raw, W, H, &vec![1.0; W * H], &[real_card("EXPOSURE", exptime)]);
+        entry.sources.insert(std::path::absolute(frame).unwrap(), read_frame_facts(&raw).unwrap());
+    }
+    commit_stage(&work, &[], entry).unwrap();
+    let mut c = cfg();
+    c.measurement.weight_mode = WeightMode::Exposure;
+    let report = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    let weights: Vec<Vec<f64>> = report.frames.iter().map(|f| f.weight.as_ref().unwrap().channels.clone()).collect();
+    assert_eq!(weights, [[120.0], [60.0], [30.0]]);
+
+    // With no calibrate entry the frame's own header is the source.
+    let own = star_frames(&tmp.path().join("own"), 3, &[real_card("EXPTIME", 45.0)]);
+    let work2 = tmp.path().join("work2");
+    let report = measure(&env.ctx(&work2), &c, &own, None, false).unwrap();
+    assert!(report.frames.iter().all(|f| f.weight.as_ref().unwrap().channels == [45.0]));
+}
+
+#[test]
+fn a_moffat_8_measure_runs_one_pass_at_beta_8() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let frames = star_frames(&tmp.path().join("cal"), 3, &[]);
+    let mut c = cfg();
+    c.measurement.psf_model = PsfModel::Moffat(8.0);
+    let report = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    assert_eq!(report.group_beta, None, "no group beta: one pass at a fixed profile");
+    assert_eq!(report.resolved_group_beta(), Some(8.0));
+    for f in &report.frames {
+        assert!(f.measurement.as_ref().unwrap().channels.iter().all(|c| c.beta == 8.0));
+    }
+    for frame in &frames {
+        let fits = read_fits(&athf_path(&work, frame, 0)).unwrap();
+        assert!(fits.len() > 20 && fits.iter().all(|s| s.beta == 8.0), "{} fits", fits.len());
+        assert!(!pass1_path(&work, frame).exists(), "a fixed profile spills no first pass");
+    }
+    assert!(!measure_dir(&work).join("pass1").exists());
+}
+
+#[test]
+fn finish_with_another_weight_mode_changes_weights_and_not_measurements() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let frames = star_frames(&tmp.path().join("cal"), 4, &[]);
+    let c = cfg();
+    let report = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    let manifest = Manifest::load(&work).unwrap();
+    let sources = source_facts(&manifest, &frames).unwrap();
+    let mut other = c.clone();
+    other.measurement.weight_mode = WeightMode::Noise;
+    assert_ne!(c.measurement.weight_mode, other.measurement.weight_mode);
+    let again = finish(&report, &other, &sources);
+    assert_eq!(again.config, other);
+    let first: Vec<u64> = report.frames.iter().map(|f| f.weight.as_ref().unwrap().channels[0].to_bits()).collect();
+    let second: Vec<u64> = again.frames.iter().map(|f| f.weight.as_ref().unwrap().channels[0].to_bits()).collect();
+    assert_ne!(first, second, "the noise weight is not the PSF signal weight");
+    // The measurements are the same values (no plane was floored in this run, so the fold changed nothing).
+    for (a, b) in again.frames.iter().zip(&report.frames) {
+        assert_eq!(serde_json::to_string(&a.measurement).unwrap(), serde_json::to_string(&b.measurement).unwrap());
+    }
+    // The input is not touched.
+    assert_eq!(report.config, c);
+}
+
+/// Raises the cancel flag when the first unit of work is reported done.
+struct StopAfterFirst<'a>(&'a AtomicBool);
+
+impl Progress for StopAfterFirst<'_> {
+    fn step(&self, _stage: &str, done: usize, _total: usize) {
+        if done >= 1 {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    fn warn(&self, _message: &str) {}
+}
+
+#[test]
+fn an_interrupted_measure_leaves_no_manifest_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    let frames = star_frames(&tmp.path().join("cal"), 4, &[]);
+    let cancel = AtomicBool::new(false);
+    let progress = StopAfterFirst(&cancel);
+    let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
+    let ctx = Ctx { pool, cancel: &cancel, progress: &progress, memory_budget_bytes: 1 << 30, work_dir: &work };
+    let err = measure(&ctx, &cfg(), &frames, None, false).unwrap_err();
+    assert_eq!(err.to_string(), "cancelled");
+    assert!(Manifest::load(&work).unwrap().entry(Stage::Measure).is_none());
+    assert!(!measure_dir(&work).exists());
+    assert!(dir_entries(&work).iter().all(|n| !n.ends_with(".part")), "{:?}", dir_entries(&work));
+}
+
+#[test]
+fn measure_refuses_an_xisf_frame_with_the_reason() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let mut frames = star_frames(&tmp.path().join("cal"), 3, &[]);
+    let xisf = tmp.path().join("cal").join("c_Light_0009.xisf");
+    std::fs::write(&xisf, b"XISF0100").unwrap();
+    frames.push(xisf.clone());
+    let err = format!("{:#}", measure(&env.ctx(&work), &cfg(), &frames, None, false).unwrap_err());
+    assert!(err.contains("c_Light_0009.xisf") && err.contains("plain FITS only") && err.contains("an XISF file"), "{err}");
+    assert!(err.contains("--format xisf"), "{err}");
+    assert!(Manifest::load(&work).unwrap().entry(Stage::Measure).is_none());
+    assert!(!measure_dir(&work).exists());
+    // A gzip frame is refused the same way, by its name.
+    let gz = gzip_copy(&frames[0], &tmp.path().join("cal").join("c_Light_0010.fits.gz"));
+    let err = format!("{:#}", measure(&env.ctx(&work), &cfg(), &[gz], None, false).unwrap_err());
+    assert!(err.contains("a compressed file"), "{err}");
 }

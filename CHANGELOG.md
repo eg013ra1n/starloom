@@ -57,6 +57,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`calibration_library::flat_cards`, engine layer) reads a master flat's stamped constants as Athenaeum's reader of
   its own cards does (plain FITS only), CFA phase check included. `light_cal::calibrate_light_compute_resolved` takes a
   flat divisor the caller resolved once for a batch.
+- The `measure` stage of `pipeline`: `measure` measures calibrated plain-FITS frames (two passes under the `auto` star
+  profile, with the first pass spilled to `measure/pass1/` and one group beta; one pass under `moffat4` or
+  `moffat=<beta>`) and writes `measure/measure.json` (the measurements before the group's aperture-correction fold,
+  the weights, the selection and the group beta), `measure.csv` (one row per frame and channel, folded values), the
+  `.athf` star fits per plane and, on request, a CSV of every accepted star; `finish` is all of Athenaeum's
+  `measure_group_finish` (the fold, the weights of any weight mode, the selection) over stored measurements, for a later
+  command that runs under another weight mode. The gain is `--gain`, else `EGAIN` times `SLM_CSCL`; a frame's exposure
+  and date come from the raw light's facts the `calibrate` entry recorded. An XISF or compressed frame is refused with
+  the reason. A frame with no measurement is a row with `measurement: null` in `measure.json` (it was unreadable or its
+  measurement failed).
 - `[profile.release]` is `lto = "thin"`, `codegen-units = 4`, Athenaeum's release profile, for a standalone build.
 
 ## [0.1.2] — 2026-11-23

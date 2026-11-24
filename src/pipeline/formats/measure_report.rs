@@ -69,10 +69,12 @@ pub struct GroupC {
 pub struct MeasureFrame {
     /// The calibrated frame, absolute.
     pub file: PathBuf,
-    /// The module's measurement, before the fold.
-    pub measurement: FrameMeasurement,
-    /// The weight `measure` computed.
-    pub weight: FrameWeight,
+    /// The module's measurement, before the fold; `None` for a frame that was never measured (it was unreadable or its
+    /// measurement failed: `reason` says which).
+    pub measurement: Option<FrameMeasurement>,
+    /// The weight `measure` computed; `None` for a frame with no measurement and for one whose measurement is not
+    /// finite (nothing to weigh).
+    pub weight: Option<FrameWeight>,
     /// Whether `measure` kept the frame.
     pub included: bool,
     /// Why it did not, or a note on why it did.
@@ -94,7 +96,8 @@ pub struct MeasureReport {
     /// Every version of the build that made the report, by constant name
     /// ([`all_versions`](crate::pipeline::versions::all_versions)).
     pub versions: BTreeMap<String, u32>,
-    /// The group's Moffat β under the two-pass `auto` model; `None` for a fixed profile.
+    /// The group's Moffat β under the two-pass `auto` model; `None` for a fixed profile (the profile's own β is the
+    /// config's: [`MeasureReport::resolved_group_beta`] reads both).
     pub group_beta: Option<f64>,
     /// The aperture-correction inputs per plane.
     pub group_c: Vec<GroupC>,
@@ -114,6 +117,22 @@ impl MeasureReport {
             group_c: Vec::new(),
             frames: Vec::new(),
         }
+    }
+
+    /// The β every member of the group was fitted at, as Athenaeum's `measure_group_finish` resolves it: the two-pass
+    /// group β under `auto`, else the lower median of the measured planes' own β (a fixed profile fits every plane at
+    /// its β). `None` when no plane was measured.
+    pub fn resolved_group_beta(&self) -> Option<f64> {
+        if let Some(beta) = self.group_beta {
+            return Some(beta);
+        }
+        let betas: Vec<f64> = self
+            .frames
+            .iter()
+            .filter_map(|f| f.measurement.as_ref())
+            .flat_map(|m| m.channels.iter().map(|c| c.beta))
+            .collect();
+        (!betas.is_empty()).then(|| crate::stacking::psf_signal::group_beta(&betas))
     }
 
     /// Reads a report; another version or another kind of file is refused.

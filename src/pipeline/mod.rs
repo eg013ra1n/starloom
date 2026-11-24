@@ -16,6 +16,9 @@
 //! - [`master`] and [`calibrate`](mod@calibrate): the first two stages. [`build_master`] integrates raw bias, dark or
 //!   flat frames into a master; [`calibrate()`](calibrate::calibrate) turns raw lights into calibrated frames, refusing
 //!   a mismatch from the headers before any pixel is read ([`preflight`]). Raw frames may be compressed.
+//! - [`measure`](mod@measure): the third stage. [`measure()`](measure::measure) measures every calibrated frame (two passes under the
+//!   `auto` star profile, with a group β), writes `measure.json`, `measure.csv` and the `.athf` star fits, and [`finish`]
+//!   turns stored measurements into weights and a selection under any config.
 //! - [`formats`]: the manifest (`starloom.json`, with the command history) and the measure, transforms and weights
 //!   reports, each tagged and versioned, plus the rules that keep a half-written stage from looking done.
 //!
@@ -42,6 +45,7 @@ pub mod config;
 pub mod formats;
 pub mod inputs;
 pub mod master;
+pub mod measure;
 pub mod versions;
 
 use std::path::Path;
@@ -53,12 +57,14 @@ pub use cards::{common_cards, SLM_CFG, SLM_PLV, SLM_VER};
 pub use config::{config_hash, effective_config, ln_runs, stage_hash};
 pub use formats::{
     append_history, begin_writing, commit_stage, frames_or_upstream, part_path, source_facts, Entry, HistoryRow, Manifest,
+    MeasureFrame, MeasureReport,
 };
 pub use inputs::{
     expand_calibration_frames, expand_inputs, frame_stem, order_lights, parse_date_obs, read_plan, CalGroup, CalSource,
     FlatPrecalSource, InputKind,
 };
 pub use master::{build_master, MasterKind, MasterReport};
+pub use measure::{athf_path, finish, measure, measure_dir, pass1_path, MEASURE_CSV_FILE, MEASURE_DIR};
 pub use versions::{all_versions, recorded_versions, VERSION_CARDS};
 
 /// The version of the pipeline as a whole: what the cards `SLM_PLV` records, and what a golden row of the whole
