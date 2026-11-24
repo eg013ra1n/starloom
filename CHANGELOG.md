@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The pure items a pipeline layer is built from moved here from Athenaeum's core, byte for byte: `StackingPreset`,
   `AlgorithmConfig` (the seven algorithm sections), `algorithm_preset` and the four stage subtrees
-  (`calibration_subtree`, `measurement_subtree`, `registration_subtree`, `normalization_subtree`, with their
-  versioned variants) in `stacking::config`; `CalibratedLightOptions` (`calibration_library::options`);
+  (`calibration_subtree`, `measurement_subtree`, `registration_subtree`, `normalization_subtree`) in
+  `stacking::config`; `CalibratedLightOptions` (`calibration_library::options`);
   `resolve_recipe` (`integration::recipe`); the debayer glue and `COPY_THROUGH_KEYWORDS` (`calibration_library`);
   `flat_channel_norms` (`integration::cfa`); `sky_penalized_order`, `reference_coverage` and
   `MIN_REFERENCE_COVERAGE` (`stacking::weights`); `header_pixel_scale_arcsec` (`geometry`); the `.athf` format with

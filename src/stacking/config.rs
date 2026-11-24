@@ -482,6 +482,9 @@ pub fn measurement_subtree(cfg: &AlgorithmConfig) -> serde_json::Value {
 /// fresh row is its hash and its stat (`plan::is_fresh`). Nothing else should call this with anything but
 /// [`FITS_ARTIFACT_VERSION`]; the pins of earlier versions go through
 /// [`measurement_subtree_with_measure_version`], which keeps the shape from before the fold.
+// doc(hidden): public only for Athenaeum core's pinned hash tests; a stage hash built at another version
+// is not API, so the CLI never calls it.
+#[doc(hidden)]
 pub fn measurement_subtree_with_fits_artifact_version(
     cfg: &AlgorithmConfig,
     fits_artifact_version: u16,
@@ -496,6 +499,9 @@ pub fn measurement_subtree_with_fits_artifact_version(
 /// `measureStageVersion`, only when it is not 1: at 1 the key is absent, so every hash keeps the bytes it had before
 /// the version existed (starloom phase 1, P1-R1). A bump recomputes the measurement, registration and normalization
 /// artifacts, and is raised together with `PASS1_ARTIFACT_VERSION`.
+// doc(hidden): public only for Athenaeum core's pinned hash tests; a stage hash built at another version
+// is not API, so the CLI never calls it.
+#[doc(hidden)]
 pub fn fold_measure_stage_version(subtree: &mut serde_json::Value, version: u32) {
     if version != 1 {
         subtree["measureStageVersion"] = serde_json::json!(version);
@@ -505,6 +511,9 @@ pub fn fold_measure_stage_version(subtree: &mut serde_json::Value, version: u32)
 /// [`measurement_subtree`] with the measure version supplied, so a test can
 /// prove the hash actually follows it (nothing else should call this with
 /// anything but [`MEASURE_VERSION`]).
+// doc(hidden): public only for Athenaeum core's pinned hash tests; a stage hash built at another version
+// is not API, so the CLI never calls it.
+#[doc(hidden)]
 pub fn measurement_subtree_with_measure_version(
     cfg: &AlgorithmConfig,
     measure_version: u32,
@@ -554,6 +563,9 @@ pub fn registration_subtree(cfg: &AlgorithmConfig) -> serde_json::Value {
 /// [`MEASURE_VERSION`] and [`ALIGN_VERSION`]). The measure-version pin
 /// goes through [`registration_subtree_with_measure_version`], which
 /// keeps the shape from before the fold.
+// doc(hidden): public only for Athenaeum core's pinned hash tests; a stage hash built at another version
+// is not API, so the CLI never calls it.
+#[doc(hidden)]
 pub fn registration_subtree_with_versions(
     cfg: &AlgorithmConfig,
     measure_version: u32,
@@ -566,6 +578,9 @@ pub fn registration_subtree_with_versions(
 
 /// [`registration_subtree`] with the measure version supplied and no
 /// `alignVersion` — see [`measurement_subtree_with_measure_version`].
+// doc(hidden): public only for Athenaeum core's pinned hash tests; a stage hash built at another version
+// is not API, so the CLI never calls it.
+#[doc(hidden)]
 pub fn registration_subtree_with_measure_version(
     cfg: &AlgorithmConfig,
     measure_version: u32,
@@ -603,6 +618,9 @@ pub fn normalization_subtree(cfg: &AlgorithmConfig) -> serde_json::Value {
 
 /// [`normalization_subtree`] with the measure version supplied — see
 /// [`measurement_subtree_with_measure_version`].
+// doc(hidden): public only for Athenaeum core's pinned hash tests; a stage hash built at another version
+// is not API, so the CLI never calls it.
+#[doc(hidden)]
 pub fn normalization_subtree_with_measure_version(
     cfg: &AlgorithmConfig,
     measure_version: u32,
