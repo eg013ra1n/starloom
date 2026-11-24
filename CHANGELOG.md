@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MIN_REFERENCE_COVERAGE` (`stacking::weights`); `header_pixel_scale_arcsec` (`geometry`); the `.athf` format with
   `FITS_ARTIFACT_VERSION` 3 (`stacking::fits_artifact`); and `map_scale`, `wants_cfa_mosaic` and `pick_ln_anchor`
   (`stacking::run_helpers`). No stage output moves and no version changes; the `.athf` format gets a golden row.
+- `stacking::config::resolve_algorithm`, the algorithm half of Athenaeum's config resolution, moved here verbatim with
+  `resolve_ln_fields`, `clamp_detection_sigma`, `clamp_tps_smoothing` and their bounds (`MIN_`/`MAX_DETECTION_SIGMA`,
+  `MIN_`/`MAX_TPS_SMOOTHING`, `MIN_`/`MAX_SEED_THRESHOLD`, `MIN_FIT_STARS`): the `tpsSmoothing` and large-scale filter
+  clamps, the LN fields, the seed clamps and the `fitStars` canonicalisation. Athenaeum's resolution calls it; its
+  resolved configs are byte-identical (pinned before the move).
 - The `pipeline` layer (feature `pipeline`, on `stack`; optional `toml` and `glob`), the skeleton the working-folder
   stages hang on, and the `cli` feature (adds `clap` and `tracing-subscriber`; the binary follows). `pipeline` holds
   `Ctx` and `Progress` (the caller's pool, a cancel flag, a progress sink, a memory budget, the working folder; no
