@@ -42,10 +42,12 @@ pub struct WeightFrame {
     pub file: PathBuf,
     /// The frame's measurement after the group's fold and reweigh: what Athenaeum stores in
     /// `stacking_run_frames.metrics_json`, with the same keys (per channel `commonTflux`, `commonTmeanFlux`,
-    /// `commonStars` and `apertureCorrectionGroup`, each present only where it was set).
-    pub measurement: FrameMeasurement,
-    /// The reweighed weight.
-    pub weight: FrameWeight,
+    /// `commonStars` and `apertureCorrectionGroup`, each present only where it was set). `None` for a frame that was
+    /// never measured (`included` is false and `reason` says why).
+    pub measurement: Option<FrameMeasurement>,
+    /// The reweighed weight; `None` for a frame with nothing to weigh (never measured, a non-finite plane) and, as in
+    /// Athenaeum's frames table, for a frame the reweigh did not weigh.
+    pub weight: Option<FrameWeight>,
     /// Whether the selection keeps the frame.
     pub included: bool,
     /// Why it does not, or a note on why it does.

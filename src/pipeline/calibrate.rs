@@ -330,7 +330,7 @@ pub fn preflight_with(groups: &[CalGroup], opts: &CalibratedLightOptions) -> Res
 
 /// A typed card from a `KEYWORD -> value` pair: an integer, else a real, else a string (a keyword the writer rejects
 /// is dropped), as the copied-through cards keep their type.
-fn card_from_kv(keyword: &str, value: &str) -> Option<Card> {
+pub(crate) fn card_from_kv(keyword: &str, value: &str) -> Option<Card> {
     let cv = if let Ok(i) = value.parse::<i64>() {
         CardValue::Integer(i)
     } else if let Ok(f) = value.parse::<f64>() {
@@ -369,7 +369,7 @@ fn source_cards(light: &Path, facts: &FrameFacts) -> Result<Vec<Card>> {
 
 /// A name as Athenaeum writes it into a header card (`encode_ident`): every byte outside printable ASCII, the space
 /// and `%` itself as `%XX`, so a non-ASCII file name survives the writer's ASCII-only rule and reads back unchanged.
-fn encode_ident(s: &str) -> String {
+pub(crate) fn encode_ident(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if (0x21..=0x7E).contains(&b) && b != b'%' {
@@ -382,7 +382,7 @@ fn encode_ident(s: &str) -> String {
 }
 
 /// The file name of a path, as the identity cards carry it.
-fn file_name_of(path: &Path) -> String {
+pub(crate) fn file_name_of(path: &Path) -> String {
     path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 

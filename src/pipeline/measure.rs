@@ -180,7 +180,7 @@ struct Pass2Failed {
 
 /// Runs `work(0)`, `work(1)`, ... `work(jobs - 1)` on the current rayon pool, at most `concurrency` at once, and returns
 /// the results by index. A job not started when the caller's cancel flag was raised is `None`.
-fn fan_out<T: Send>(
+pub(crate) fn fan_out<T: Send>(
     ctx: &Ctx<'_>,
     jobs: usize,
     concurrency: usize,

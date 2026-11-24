@@ -1,4 +1,4 @@
-//! SL-9: every step of `master`, `calibrate` and `measure` that decodes a pixel or fits a star runs on the caller's pool.
+//! SL-9: every step of `master`, `calibrate`, `measure` and `register` that decodes a pixel or fits a star runs on the caller's pool.
 //!
 //! A compressed raw frame, a compressed pre-calibration master and a compressed light all go through the image
 //! reader's spill, which decodes with rayon iterators on whatever pool is current. Outside the caller's pool that is
@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use starloom::calibration_library::options::CalibratedLightOptions;
 use starloom::fits_writer::{write_fits_f32, OutputFormat};
-use starloom::pipeline::{build_master, calibrate, measure, CalGroup, CalSource, Ctx, FlatPrecalSource, MasterKind, NoProgress};
+use starloom::pipeline::{
+    build_master, calibrate, measure, register, CalGroup, CalSource, Ctx, FlatPrecalSource, MasterKind, NoProgress, ReferenceChoice,
+};
 use starloom::stacking::config::{algorithm_preset, StackingPreset};
 
 // Large enough that the reader's decode runs in parallel (it does from 131,072 samples).
@@ -83,18 +85,44 @@ fn compressed_frames_decode_on_the_callers_pool_and_never_on_rayons_global_one()
     assert!(report.frames.iter().all(|f| f.hot_pixels_replaced.is_some()), "the hot-pixel pass ran from the built master dark");
 
     // `measure` on star frames, two passes with a spilled first pass: the fits and the fan-out run on the caller's pool.
+    // The frames are one star field moved by a few pixels, so `register` can align them.
     let stars = tmp.path().join("stars");
     std::fs::create_dir_all(&stars).unwrap();
-    let frames: Vec<PathBuf> = (0..3)
-        .map(|k| {
-            let (data, w, h) = starloom::test_support::fixture_field(7 + k, 1.0, 0.002);
+    let layout: Vec<(f64, f64, f64)> = (0..150)
+        .map(|n| {
+            let (i, j) = ((n % 15) as f64, (n / 15) as f64);
+            (40.0 + i * 48.0 + f64::from(noise(1, n)) * 12.0, 40.0 + j * 48.0 + f64::from(noise(2, n)) * 12.0, 0.1 + 0.2 * f64::from(noise(3, n)))
+        })
+        .collect();
+    let frames: Vec<PathBuf> = [(0.0, 0.0), (2.5, -1.5), (-3.25, 2.0)]
+        .iter()
+        .enumerate()
+        .map(|(k, &(dx, dy))| {
+            let moved: Vec<(f64, f64, f64)> = layout.iter().map(|&(x, y, a)| (x + dx, y + dy, a)).collect();
+            let mut data = starloom::test_support::gaussian_field(768, 512, &moved, 1.8, 0.08);
+            starloom::test_support::add_noise(&mut data, 0.002, 100 + k as u64);
             let path = stars.join(format!("c_Light_{k:04}.fits"));
-            write_fits_f32(&path, w, h, 1, &data, &[]).unwrap();
+            write_fits_f32(&path, 768, 512, 1, &data, &[]).unwrap();
             path
         })
         .collect();
     let report = measure(&ctx, &cfg, &frames, None, false).unwrap();
     assert!(report.group_beta.is_some() && report.frames.iter().all(|f| f.included));
+
+    // `register` detects the reference's and the frames' stars (a single-plane frame reuses Measure's fits, so the
+    // reference outside the stack gets detection), fits the maps, warps the registered copies and reads the `.athf`
+    // files for the reweigh, all on the caller's pool.
+    let outside = stars.join("reference.fits");
+    {
+        let mut data = starloom::test_support::gaussian_field(768, 512, &layout, 1.8, 0.08);
+        starloom::test_support::add_noise(&mut data, 0.002, 999);
+        write_fits_f32(&outside, 768, 512, 1, &data, &[]).unwrap();
+    }
+    let registered = register(&ctx, &frames, &report, &ReferenceChoice::File(outside), &cfg, true).unwrap();
+    assert!(registered.transforms.frames.iter().all(|t| t.ok), "{:?}", registered.transforms.frames.iter().map(|t| t.error.clone()).collect::<Vec<_>>());
+    assert_eq!(registered.registered.len(), 3);
+    let in_stack = register(&ctx, &frames, &report, &ReferenceChoice::Auto, &cfg, false).unwrap();
+    assert!(in_stack.transforms.frames.iter().all(|t| t.ok));
 
     // Nothing built rayon's global pool: asking for it now succeeds (it fails once a pool has been built).
     rayon::ThreadPoolBuilder::new().num_threads(1).build_global().expect("rayon's global pool was built by a stage that ran outside the caller's pool");

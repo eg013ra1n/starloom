@@ -31,7 +31,9 @@ pub use measure_report::{
     GroupC, MeasureFrame, MeasureReport, MEASURE_CSV_COLUMNS, MEASURE_REPORT_FILE, MEASURE_REPORT_FORMAT,
     MEASURE_REPORT_VERSION,
 };
-pub use transforms::{TransformFrame, TransformsReport, TRANSFORMS_FILE, TRANSFORMS_FORMAT, TRANSFORMS_VERSION};
+pub use transforms::{
+    TransformFrame, TransformsReport, NOT_REGISTERED, REGISTRATION_FAILED, TRANSFORMS_FILE, TRANSFORMS_FORMAT, TRANSFORMS_VERSION,
+};
 pub use weights::{WeightFrame, WeightSettings, WeightsReport, WEIGHTS_FILE, WEIGHTS_FORMAT, WEIGHTS_VERSION};
 
 /// The two fields every format starts with, read first so a file of another kind or version is refused before its
@@ -287,8 +289,8 @@ mod tests {
         reweighed.channels[0].aperture_correction_group = Some(1.05);
         report.frames = vec![WeightFrame {
             file: dir.join("a.fit"),
-            measurement: reweighed,
-            weight: FrameWeight { channels: vec![0.25], normalized: vec![0.5], mean: 0.25, normalized_mean: 0.5, missing: Some("no keyword".to_string()) },
+            measurement: Some(reweighed),
+            weight: Some(FrameWeight { channels: vec![0.25], normalized: vec![0.5], mean: 0.25, normalized_mean: 0.5, missing: Some("no keyword".to_string()) }),
             included: false,
             reason: Some("excluded".to_string()),
         }];
@@ -380,7 +382,7 @@ mod tests {
         let report = weights_report(dir.path());
         let row = serde_json::to_value(&report.frames[0]).unwrap();
         let metrics_json: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&report.frames[0].measurement).unwrap()).unwrap();
+            serde_json::from_str(&serde_json::to_string(report.frames[0].measurement.as_ref().unwrap()).unwrap()).unwrap();
         assert_eq!(row["measurement"], metrics_json);
         let plane = &row["measurement"]["channels"][0];
         assert_eq!(plane["commonTflux"], serde_json::json!(1234.5));

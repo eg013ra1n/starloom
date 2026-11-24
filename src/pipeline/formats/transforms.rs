@@ -17,6 +17,14 @@ pub const TRANSFORMS_FORMAT: &str = "starloom-transforms";
 /// The version. Another version is refused.
 pub const TRANSFORMS_VERSION: u32 = 1;
 
+/// What a frame's `error` starts with when `register` did not try it: the frame was out of the selection when `register`
+/// ran, so it has no map. A command that finds the frame included under its own config asks for `starloom register`
+/// again (P2-R24).
+pub const NOT_REGISTERED: &str = "not registered";
+/// What a frame's `error` starts with when `register` tried it and the alignment failed (Athenaeum's text:
+/// `registration failed: <why>`).
+pub const REGISTRATION_FAILED: &str = "registration failed";
+
 /// A stored map is read the way [`PixelMap::from_json`] reads one: a malformed distortion layer or a singular linear
 /// model is an error, and the inverse is recomputed from the linear model, never trusted.
 fn checked_map<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PixelMap>, D::Error> {
@@ -84,6 +92,11 @@ pub struct TransformsReport {
     pub version: u32,
     /// The reference every map goes to: a frame of the stack, or a file outside it.
     pub reference: PathBuf,
+    /// Whether the user named the reference (`--reference <file>`) rather than letting `register` pick it. A named
+    /// reference that is one of the frames stays in the stack under the weight floor, as Athenaeum keeps a manual
+    /// reference ([`current_weights`](crate::pipeline::current_weights)). Absent in a file that predates the field.
+    #[serde(default)]
+    pub reference_pinned: bool,
     /// The effective config the stage ran with.
     pub config: AlgorithmConfig,
     /// Every version of the build that made the report, by constant name
@@ -100,6 +113,7 @@ impl TransformsReport {
             format: TRANSFORMS_FORMAT.to_string(),
             version: TRANSFORMS_VERSION,
             reference,
+            reference_pinned: false,
             config,
             versions,
             frames: Vec::new(),

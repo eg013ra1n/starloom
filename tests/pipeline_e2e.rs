@@ -1354,3 +1354,257 @@ fn measure_refuses_an_xisf_frame_with_the_reason() {
     let err = format!("{:#}", measure(&env.ctx(&work), &cfg(), &[gz], None, false).unwrap_err());
     assert!(err.contains("a compressed file"), "{err}");
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// register
+// ---------------------------------------------------------------------------------------------------------------
+
+use starloom::pipeline::{current_weights, register, register_dir, ReferenceChoice, RegisterReport};
+use starloom::pipeline::formats::TransformsReport;
+
+/// The 150-star layout of the measure fixture (a jittered 15 x 10 grid of a 768 x 512 plane), as `(x, y, amplitude)`.
+fn grid_stars() -> Vec<(f64, f64, f64)> {
+    (0..150)
+        .map(|n| {
+            let (i, j) = ((n % 15) as f64, (n / 15) as f64);
+            (
+                40.0 + i * 48.0 + (f64::from(noise(1, n)) - 0.5) * 16.0,
+                40.0 + j * 48.0 + (f64::from(noise(2, n)) - 0.5) * 16.0,
+                0.1 + 0.2 * f64::from(noise(3, n)),
+            )
+        })
+        .collect()
+}
+
+/// 150 stars at random positions: a field with nothing in common with [`grid_stars`].
+fn random_stars() -> Vec<(f64, f64, f64)> {
+    (0..150)
+        .map(|n| {
+            (30.0 + 700.0 * f64::from(noise(11, n)), 30.0 + 450.0 * f64::from(noise(12, n)), 0.1 + 0.2 * f64::from(noise(13, n)))
+        })
+        .collect()
+}
+
+/// A calibrated mono frame of `stars` moved by `(dx, dy)` pixels, amplitudes times `gain`, with its own noise.
+fn field_frame(path: &Path, stars: &[(f64, f64, f64)], dx: f64, dy: f64, gain: f64, seed: u64, cards: &[Card]) -> PathBuf {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let moved: Vec<(f64, f64, f64)> = stars.iter().map(|&(x, y, a)| (x + dx, y + dy, a * gain)).collect();
+    let mut data = starloom::test_support::gaussian_field(768, 512, &moved, 1.8, 0.08);
+    starloom::test_support::add_noise(&mut data, 0.002, seed);
+    write_f32(path, 768, 512, &data, cards)
+}
+
+const SHIFTS: [(f64, f64); 6] = [(0.0, 0.0), (3.37, -2.81), (-4.2, 5.55), (1.25, 1.9), (-2.6, -3.3), (5.1, 0.45)];
+
+fn shifted_frames(dir: &Path) -> Vec<PathBuf> {
+    SHIFTS
+        .iter()
+        .enumerate()
+        .map(|(k, &(dx, dy))| field_frame(&dir.join(format!("c_Light_{k:04}.fits")), &grid_stars(), dx, dy, 1.0, 40 + k as u64, &[]))
+        .collect()
+}
+
+#[test]
+fn register_recovers_the_injected_shifts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let frames = shifted_frames(&tmp.path().join("cal"));
+    let c = cfg();
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    let report = register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::File(frames[0].clone()), &c, false).unwrap();
+
+    assert_eq!(report.transforms.frames.len(), 6);
+    assert!(report.transforms.reference_pinned);
+    assert_eq!(report.transforms.reference, frames[0]);
+    let (cx, cy) = (384.0, 256.0);
+    for (k, row) in report.transforms.frames.iter().enumerate() {
+        assert!(row.ok, "{:?}", row.error);
+        let map = row.map.as_ref().unwrap();
+        // The frame's stars sit `shift` away from the reference's, so its map moves a point back by that much.
+        let (x, y) = map.forward_exact(cx, cy);
+        let (dx, dy) = SHIFTS[k];
+        assert!((x - (cx - dx)).abs() < 0.05 && (y - (cy - dy)).abs() < 0.05, "frame {k}: ({x}, {y}) against shift ({dx}, {dy})");
+    }
+    // The reference's row is the identity.
+    let first = &report.transforms.frames[0];
+    let (x, y) = first.map.as_ref().unwrap().forward_exact(100.25, 77.5);
+    assert_eq!((x, y), (100.25, 77.5));
+    assert_eq!((first.inlier_ratio, first.rms_px, first.scale), (1.0, 0.0, 1.0));
+    assert!(report.transforms.frames[1..].iter().all(|t| t.rms_px > 0.0));
+
+    // The products are in place and read back; the stage left an entry and no half-written folder.
+    let dir = register_dir(&work);
+    assert!(dir.join("transforms.json").is_file() && dir.join("weights.json").is_file());
+    assert!(!dir.join("registered").exists());
+    assert!(!tmp.path().join("work").join("register.part").exists());
+    let back = RegisterReport::read(&work).unwrap();
+    assert_eq!(back.transforms, report.transforms);
+    // (Compared as text: a plane's non-finite numbers read back as NaN, which is not equal to itself.)
+    assert_eq!(serde_json::to_string(&back.weights).unwrap(), serde_json::to_string(&report.weights).unwrap());
+    assert_eq!(TransformsReport::read(&dir.join("transforms.json")).unwrap().frames.len(), 6);
+    let manifest = Manifest::load(&work).unwrap();
+    let entry = manifest.entry(Stage::Register).unwrap();
+    assert_eq!(entry.inputs.len(), 6);
+    assert!(entry.products.iter().all(|p| p.exists()));
+    // The reweigh ran: the common star set of the one plane is recorded, and every frame has a weight.
+    assert_eq!(report.weights.common_stars.len(), 1);
+    assert!(report.weights.common_stars[0].as_ref().is_some_and(|s| s.len() >= 20));
+    assert!(report.weights.frames.iter().all(|f| f.weight.is_some() && f.included));
+    // `current_weights` over the same inputs gives the same report.
+    let again = current_weights(&env.ctx(&work), &measured, &report, &c).unwrap();
+    assert_eq!(again, report.weights);
+}
+
+#[test]
+fn register_accepts_a_reference_outside_the_frames() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let frames = shifted_frames(&tmp.path().join("cal"))[..5].to_vec();
+    let wcs = [real_card("CRVAL1", 83.82), real_card("CRVAL2", -5.39), str_card("CTYPE1", "RA---TAN")];
+    let outside = field_frame(&tmp.path().join("elsewhere").join("reference.fits"), &grid_stars(), 1.0, 1.0, 1.0, 99, &wcs);
+    let c = cfg();
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    let report = register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::File(outside.clone()), &c, true).unwrap();
+
+    assert_eq!(report.transforms.reference, outside);
+    assert_eq!(report.transforms.frames.len(), 5);
+    let (cx, cy) = (384.0, 256.0);
+    for (k, row) in report.transforms.frames.iter().enumerate() {
+        assert!(row.ok, "{:?}", row.error);
+        let (x, y) = row.map.as_ref().unwrap().forward_exact(cx, cy);
+        // The reference stars sit (1, 1) away from the unshifted field.
+        let (dx, dy) = (SHIFTS[k].0 - 1.0, SHIFTS[k].1 - 1.0);
+        assert!((x - (cx - dx)).abs() < 0.05 && (y - (cy - dy)).abs() < 0.05, "frame {k}: ({x}, {y})");
+        // No frame is the reference, so none has the identity: even the unshifted frame moves by one pixel.
+        assert!(row.rms_px > 0.0 && row.inlier_ratio < 1.0 + 1e-12);
+        assert!(!(x == cx && y == cy), "frame {k} got the identity");
+    }
+    assert!(!report.transforms.frames.iter().any(|t| t.file == outside));
+
+    // The registered frames: one per frame, in the reference's grid, with the reference's world coordinates, never the
+    // frame's own, and the stars where the reference has them.
+    assert_eq!(report.registered.len(), 5);
+    for (k, path) in report.registered.iter().enumerate() {
+        assert_eq!(path, &register_dir(&work).join("registered").join(format!("c_Light_{k:04}.fits")));
+        let cards = keys(path);
+        assert_eq!(cards.get("CTYPE1").map(String::as_str), Some("RA---TAN"));
+        assert!(cards.contains_key("CRVAL1") && cards.contains_key("SLM_VER") && cards.get("SLM_REF").map(String::as_str) == Some("reference.fits"));
+        no_ath_cards(path);
+        let (w, h, data) = read_plane(path, &tmp.path().join(format!("scratch{k}")));
+        assert_eq!((w, h), (768, 512));
+        // The brightest star of the layout, where the reference puts it.
+        let (sx, sy, _) = grid_stars().into_iter().max_by(|a, b| a.2.total_cmp(&b.2)).unwrap();
+        let (cx, cy) = starloom::test_support::centroid(&data, w, sx + 1.0, sy + 1.0, 5, 0.08);
+        assert!((cx - (sx + 1.0)).abs() < 0.15 && (cy - (sy + 1.0)).abs() < 0.15, "frame {k}: ({cx}, {cy}) against ({}, {})", sx + 1.0, sy + 1.0);
+    }
+    let manifest = Manifest::load(&work).unwrap();
+    assert!(manifest.entry(Stage::Register).unwrap().products.iter().filter(|p| p.extension().is_some_and(|e| e == "fits")).count() == 5);
+}
+
+#[test]
+fn register_auto_picks_the_best_weighted_frame_and_skips_floored_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    // Frame 0 is the brightest and so the best weighted; frame 3 is the next.
+    let gains = [2.0, 1.0, 1.0, 1.5, 1.0, 1.0];
+    let frames: Vec<PathBuf> = gains
+        .iter()
+        .enumerate()
+        .map(|(k, &g)| field_frame(&tmp.path().join("cal").join(format!("c_Light_{k:04}.fits")), &grid_stars(), SHIFTS[k].0, SHIFTS[k].1, g, 50 + k as u64, &[]))
+        .collect();
+    let c = cfg();
+    let mut measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+
+    // Under the default config the best weighted frame is the reference, and it gets the identity.
+    let report = register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::Auto, &c, false).unwrap();
+    let normalized: Vec<f64> = report.weights.frames.iter().map(|f| f.weight.as_ref().unwrap().normalized_mean).collect();
+    let best = normalized.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    assert_eq!(report.transforms.reference, frames[best]);
+    assert!(!report.transforms.reference_pinned);
+    let (x, y) = report.transforms.frames[best].map.as_ref().unwrap().forward_exact(12.5, 40.25);
+    assert_eq!((x, y), (12.5, 40.25));
+
+    // Take the brightest frame out of the selection (too few stars) and the next in weight wins.
+    measured.frames[0].measurement.as_mut().unwrap().channels[0].stars_fitted = 2;
+    let mut selective = c.clone();
+    selective.selection.min_stars = Some(10);
+    let report = register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::Auto, &selective, false).unwrap();
+    assert_eq!(report.transforms.reference, frames[3]);
+    assert!(!report.transforms.frames[0].ok);
+    assert!(report.transforms.frames[0].error.as_deref().unwrap().starts_with("not registered"));
+
+    // With the floor above every remaining frame's weight, the PSF family defers it: the frames stay included, are
+    // under the floor, and no reference pick sees them.
+    selective.selection.min_weight_fraction = 0.999;
+    let err = format!("{:#}", register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::Auto, &selective, false).unwrap_err());
+    assert!(err.contains("no frame can be the reference"), "{err}");
+    // Naming a reference needs no pick.
+    let named = register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::File(frames[2].clone()), &selective, false).unwrap();
+    assert_eq!(named.transforms.reference, frames[2]);
+}
+
+#[test]
+fn a_failed_frame_is_excluded_when_the_config_says_so_and_kept_otherwise() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let mut frames = shifted_frames(&tmp.path().join("cal"))[..4].to_vec();
+    // A field with nothing in common with the others: it measures, and cannot be aligned.
+    frames.push(field_frame(&tmp.path().join("cal").join("c_Light_0009.fits"), &random_stars(), 0.0, 0.0, 1.0, 77, &[]));
+    let c = cfg();
+    assert!(c.selection.exclude_on_registration_failure);
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    assert!(measured.frames.iter().all(|f| f.included));
+
+    let report = register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::File(frames[0].clone()), &c, false).unwrap();
+    let bad = &report.transforms.frames[4];
+    assert!(!bad.ok && bad.map.is_none());
+    assert!(bad.error.as_deref().unwrap().starts_with("registration failed"), "{:?}", bad.error);
+    assert!(report.transforms.frames[..4].iter().all(|t| t.ok));
+    let row = &report.weights.frames[4];
+    assert!(!row.included && row.reason.as_deref().unwrap().starts_with("registration failed"), "{:?}", row.reason);
+    assert!(report.weights.frames[..4].iter().all(|f| f.included));
+    assert!(env.progress.all().iter().any(|w| w.contains("c_Light_0009.fits") && w.contains("excluded")));
+
+    let mut strict = c.clone();
+    strict.selection.exclude_on_registration_failure = false;
+    let err = format!("{:#}", register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::File(frames[0].clone()), &strict, false).unwrap_err());
+    assert!(err.contains("c_Light_0009.fits") && err.contains("registration failed"), "{err}");
+    // The refused run changed nothing: the earlier stage's products are as they were.
+    assert_eq!(RegisterReport::read(&work).unwrap().transforms, report.transforms);
+    assert!(!tmp.path().join("work").join("register.part").exists());
+}
+
+#[test]
+fn current_weights_refuses_a_newly_included_frame_without_a_transform() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let frames = shifted_frames(&tmp.path().join("cal"));
+    let c = cfg();
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+
+    // `register` runs under a selection that leaves frame 2 out (too few stars there).
+    let mut tampered = measured.clone();
+    tampered.frames[2].measurement.as_mut().unwrap().channels[0].stars_fitted = 2;
+    let mut selective = c.clone();
+    selective.selection.min_stars = Some(10);
+    let report = register(&env.ctx(&work), &frames, &tampered, &ReferenceChoice::File(frames[0].clone()), &selective, false).unwrap();
+    assert!(!report.transforms.frames[2].ok);
+    assert!(!report.weights.frames[2].included);
+    // The same selection reads the same weights back.
+    let same = current_weights(&env.ctx(&work), &tampered, &report, &selective).unwrap();
+    assert_eq!(same, report.weights);
+
+    // Under the plain config frame 2 is included, and it has no map.
+    let err = format!("{:#}", current_weights(&env.ctx(&work), &measured, &report, &c).unwrap_err());
+    assert!(err.contains("c_Light_0002.fits") && err.contains("`starloom register`"), "{err}");
+    assert!(!err.contains("c_Light_0001.fits"), "{err}");
+    // A frame that `measure` has no row for is refused by `register` with the other command's name.
+    let stranger = field_frame(&tmp.path().join("cal").join("c_Light_0042.fits"), &grid_stars(), 0.0, 0.0, 1.0, 5, &[]);
+    let err = format!("{:#}", register(&env.ctx(&work), &[stranger], &measured, &ReferenceChoice::Auto, &c, false).unwrap_err());
+    assert!(err.contains("c_Light_0042.fits") && err.contains("`starloom measure`"), "{err}");
+}

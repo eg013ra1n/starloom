@@ -19,6 +19,9 @@
 //! - [`measure`](mod@measure): the third stage. [`measure()`](measure::measure) measures every calibrated frame (two passes under the
 //!   `auto` star profile, with a group β), writes `measure.json`, `measure.csv` and the `.athf` star fits, and [`finish`]
 //!   turns stored measurements into weights and a selection under any config.
+//! - [`register`](mod@register): the fourth stage. [`register()`](register::register) aligns every included frame onto one
+//!   reference (a file, or the best-weighted frame), writes `transforms.json`, then reweighs ([`current_weights`]) and
+//!   writes `weights.json`; with a flag it also writes each frame resampled into the reference's grid.
 //! - [`formats`]: the manifest (`starloom.json`, with the command history) and the measure, transforms and weights
 //!   reports, each tagged and versioned, plus the rules that keep a half-written stage from looking done.
 //!
@@ -46,7 +49,9 @@ pub mod formats;
 pub mod inputs;
 pub mod master;
 pub mod measure;
+pub mod register;
 pub mod versions;
+pub mod weights;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,6 +69,8 @@ pub use inputs::{
     FlatPrecalSource, InputKind,
 };
 pub use master::{build_master, MasterKind, MasterReport};
+pub use register::{register, register_dir, registered_path, ReferenceChoice, RegisterReport, REGISTER_DIR, REGISTERED_DIR, SLM_REF};
+pub use weights::{current_weights, subset_measure};
 pub use measure::{athf_path, finish, measure, measure_dir, pass1_path, MEASURE_CSV_FILE, MEASURE_DIR};
 pub use versions::{all_versions, recorded_versions, VERSION_CARDS};
 
