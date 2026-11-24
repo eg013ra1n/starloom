@@ -86,7 +86,8 @@ pub struct TransformsReport {
     pub reference: PathBuf,
     /// The effective config the stage ran with.
     pub config: AlgorithmConfig,
-    /// The versions the maps were made at, by name.
+    /// Every version of the build that made the report, by constant name
+    /// ([`all_versions`](crate::pipeline::versions::all_versions)).
     pub versions: BTreeMap<String, u32>,
     /// One row per frame, in the pipeline's frame order (P2-R10).
     pub frames: Vec<TransformFrame>,
@@ -110,8 +111,8 @@ impl TransformsReport {
         read_versioned(path, TRANSFORMS_FORMAT, TRANSFORMS_VERSION)
     }
 
-    /// Writes the report atomically to `path` (staged in `<work_dir>/.tmp/`).
-    pub fn write(&self, work_dir: &Path, path: &Path) -> Result<()> {
-        write_json_atomic(work_dir, path, self)
+    /// Writes the report atomically to `path` (staged beside it, then renamed).
+    pub fn write(&self, path: &Path) -> Result<()> {
+        write_json_atomic(path, self)
     }
 }

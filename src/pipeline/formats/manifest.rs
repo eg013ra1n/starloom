@@ -1,10 +1,14 @@
-//! The manifest (`starloom.json`): which stage made which products from which inputs, and the history of the commands
-//! run in the working folder.
+//! The manifest (`starloom.json`): a journal of what each stage made in the working folder, and of the commands run
+//! there.
 //!
-//! An entry says "this stage, under this config, made these products from these inputs". A later stage trusts a
-//! product only after [`check_upstream`] has compared the entry with what it is about to read. Products are written in
-//! `<work>/.tmp/` and renamed into place, and [`commit_stage`] writes the entry after them, so an interrupted stage
-//! leaves no entry and the files it did move are not trusted.
+//! Manual mode (P2-R24): the manifest is for the user to read, and nothing checks it. An entry says "this stage, under
+//! a config with these hashes and a build with these versions, made these products from these inputs"; a later
+//! command never compares it with anything and never refuses a product as stale. The user decides what to re-run and
+//! what to clean. Two things are read from it: the frames a command takes when it is given none
+//! ([`frames_or_upstream`], P2-R20), and a calibrated frame's raw-light facts ([`source_facts`]).
+//!
+//! Each product is staged beside its destination ([`part_path`](super::part_path)) and renamed into place, and
+//! [`commit_stage`] writes the entry after them, so an interrupted stage leaves no entry.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,9 +18,9 @@ use astroimage::header::FrameFacts;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::{display_name, read_versioned, write_json_atomic};
-use crate::integration::stats::RejectionNormalization;
-use crate::pipeline::config::stage_hash;
+use super::{read_versioned, write_json_atomic};
+use crate::pipeline::config::{config_hash, stage_hash};
+use crate::pipeline::versions::recorded_versions;
 use crate::pipeline::Stage;
 use crate::stacking::config::AlgorithmConfig;
 
@@ -26,35 +30,11 @@ pub const MANIFEST_FILE: &str = "starloom.json";
 pub const MANIFEST_FORMAT: &str = "starloom-work";
 /// The manifest's version. Another version is refused.
 pub const MANIFEST_VERSION: u32 = 1;
-/// The folder under the working folder where a writing command builds its products before moving them into place.
+/// The working folder's scratch folder: a writing command clears it when it starts ([`begin_writing`]) and may keep
+/// files there that are not products.
 pub const TMP_DIR: &str = ".tmp";
 
-/// A file as a stage saw it: its absolute path, its size and its sampled content hash
-/// ([`sampled_xxh3`](crate::fs_util::sampled_xxh3)). Two ids are equal when the file at the path is the same size
-/// with the same sampled bytes, so a frame rewritten with identical content is the same input and a modification time
-/// is never consulted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileId {
-    /// The absolute path.
-    pub path: PathBuf,
-    /// The size in bytes.
-    pub size: u64,
-    /// The sampled content hash, 16 lowercase hex digits.
-    pub sampled_hash: String,
-}
-
-impl FileId {
-    /// Reads the id of the file at `path` (made absolute with `std::path::absolute`).
-    pub fn of(path: &Path) -> Result<FileId> {
-        let path = std::path::absolute(path).with_context(|| format!("cannot make {} absolute", path.display()))?;
-        let size = std::fs::metadata(&path).with_context(|| format!("cannot stat {}", path.display()))?.len();
-        let sampled_hash = crate::fs_util::sampled_xxh3(&path).with_context(|| format!("cannot hash {}", path.display()))?;
-        Ok(FileId { path, size, sampled_hash })
-    }
-}
-
-/// What one stage made, and what it made it from.
+/// What one stage made, and what it made it from. Every field is a record; nothing compares it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Entry {
@@ -62,25 +42,35 @@ pub struct Entry {
     pub stage: Stage,
     /// The stage hash ([`stage_hash`]) of the config the stage ran with.
     pub stage_hash: String,
-    /// The versions the products were made at (a stage's version constants by name), so a build with another version
-    /// can tell the products are not its own.
+    /// The hash of the whole config the stage ran with ([`config_hash`]), the value its products' `SLM_CFG` holds.
+    pub config_hash: String,
+    /// Every version of the build that ran the stage, by constant name
+    /// ([`all_versions`](crate::pipeline::versions::all_versions)).
     pub versions: BTreeMap<String, u32>,
-    /// The files the stage read. For `measure`, `register` and `normalize` they are the frames, in the order the stage
-    /// kept them (P2-R10), and `frames_or_upstream` hands that order to the next command; other inputs (a reference
-    /// outside the frames) may follow them.
-    pub inputs: Vec<FileId>,
-    /// The files the stage made, absolute. They exist when the entry does.
+    /// The files the stage read, absolute. For `measure`, `register` and `normalize` they are the frames, in the order
+    /// the stage kept them (P2-R10), and [`frames_or_upstream`] hands that order to the next command.
+    pub inputs: Vec<PathBuf>,
+    /// The files the stage made, absolute. They exist when the entry is written.
     pub products: Vec<PathBuf>,
-    /// For `calibrate`: each calibrated product's raw light and that light's facts. `measure` takes a frame's
+    /// For `calibrate`: each calibrated product's raw light's facts, keyed by the product. `measure` takes a frame's
     /// exposure and date from here (P2-R3), because the calibrated file no longer carries them.
     #[serde(default)]
     pub sources: BTreeMap<PathBuf, FrameFacts>,
 }
 
 impl Entry {
-    /// The name a message uses for the entry's files: its first product's file name, or the stage's name.
-    fn file_label(&self) -> String {
-        self.products.first().map_or_else(|| self.stage.name().to_string(), |p| display_name(p))
+    /// An entry for `stage` under `cfg`: its stage hash, the config hash and every version of this build, with
+    /// `inputs` and `products` as given and no `sources` (a `calibrate` stage fills them in).
+    pub fn new(stage: Stage, cfg: &AlgorithmConfig, inputs: Vec<PathBuf>, products: Vec<PathBuf>) -> Entry {
+        Entry {
+            stage,
+            stage_hash: stage_hash(stage, cfg),
+            config_hash: config_hash(cfg),
+            versions: recorded_versions(),
+            inputs,
+            products,
+            sources: BTreeMap::new(),
+        }
     }
 }
 
@@ -101,7 +91,7 @@ pub struct HistoryRow {
     pub exit_code: i32,
     /// The version of starloom that ran it.
     pub starloom_version: String,
-    /// The hash of the whole effective config ([`config_hash`](crate::pipeline::config_hash)).
+    /// The hash of the whole effective config ([`config_hash`]).
     pub config_hash: String,
     /// The command's log file.
     pub log_file: PathBuf,
@@ -117,7 +107,7 @@ pub struct Manifest {
     pub format: String,
     /// Always [`MANIFEST_VERSION`].
     pub version: u32,
-    /// One entry per stage that has run, in stage order.
+    /// One entry per stage that has run, in stage order: the latest run of each.
     pub entries: Vec<Entry>,
     /// Every command run in the folder, oldest first.
     pub history: Vec<HistoryRow>,
@@ -152,7 +142,7 @@ impl Manifest {
 
     /// Writes the manifest atomically.
     pub fn save(&self) -> Result<()> {
-        write_json_atomic(&self.work_dir, &self.work_dir.join(MANIFEST_FILE), self)
+        write_json_atomic(&self.work_dir.join(MANIFEST_FILE), self)
     }
 
     /// The working folder.
@@ -193,21 +183,28 @@ pub fn begin_writing(work_dir: &Path) -> Result<PathBuf> {
     Ok(tmp)
 }
 
-/// Finishes a stage: moves each `(built, final)` pair of `moves` into place, then writes `entry`.
+/// Finishes a stage: renames each `(built, final)` pair of `moves` into place, then writes `entry`.
 ///
-/// The stage's earlier entry is removed first, and the manifest saved without it, so a failure while the products are
-/// moving leaves no entry that a mix of old and new files could satisfy. After the moves every path in
-/// `entry.products` must exist; only then is the entry written. A file or folder already at a destination is replaced.
+/// A product is built beside its destination ([`part_path`](super::part_path)), so the rename never crosses a volume
+/// (an `-o` folder on another drive or a network share works); a `built` file in another folder is refused. The
+/// stage's earlier entry is removed first, and the manifest saved without it, so a failure while the products are
+/// moving leaves no entry. After the moves every path in `entry.products` must exist; only then is the entry written.
+/// A file or folder already at a destination is replaced.
 pub fn commit_stage(work_dir: &Path, moves: &[(PathBuf, PathBuf)], entry: Entry) -> Result<()> {
+    if let Some((built, dest)) = moves.iter().find(|(built, dest)| built.parent() != dest.parent()) {
+        bail!(
+            "{} stage product {} must be built beside its destination {}",
+            entry.stage.name(),
+            built.display(),
+            dest.display()
+        );
+    }
     let mut manifest = Manifest::load(work_dir)?;
     if manifest.entry(entry.stage).is_some() {
         manifest.entries.retain(|e| e.stage != entry.stage);
         manifest.save()?;
     }
     for (built, dest) in moves {
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).with_context(|| format!("cannot create {}", parent.display()))?;
-        }
         if dest.is_dir() {
             std::fs::remove_dir_all(dest).with_context(|| format!("cannot replace {}", dest.display()))?;
         }
@@ -220,79 +217,6 @@ pub fn commit_stage(work_dir: &Path, moves: &[(PathBuf, PathBuf)], entry: Entry)
     tracing::debug!(stage = entry.stage.name(), products = entry.products.len(), inputs = entry.inputs.len(), "stage committed");
     manifest.replace_entry(entry);
     manifest.save()
-}
-
-/// The stages whose products `stage` reads and so must still be the ones the given frames came from.
-fn upstream_stages(stage: Stage, cfg: &AlgorithmConfig) -> Vec<Stage> {
-    match stage {
-        Stage::Calibrate => Vec::new(),
-        Stage::Measure => vec![Stage::Calibrate],
-        Stage::Register => vec![Stage::Measure],
-        Stage::Normalize => vec![Stage::Measure, Stage::Register],
-        Stage::Stack => {
-            let mut v = vec![Stage::Measure, Stage::Register];
-            // Without local normalization there is no `.athln` to be stale.
-            if cfg.normalization.rejection == RejectionNormalization::Local {
-                v.push(Stage::Normalize);
-            }
-            v
-        }
-    }
-}
-
-/// Refuses to run `stage` on frames, or on products, that the stages before it did not make under the current config.
-///
-/// Every stage upstream of `stage` must have an entry, and the entry must agree with `frames` and `cfg`:
-/// - the entry is there; otherwise "run `starloom <stage>` first";
-/// - every given frame is one the entry recorded (a `calibrate` entry's products, the others' inputs) with the same
-///   [`FileId`]: "<file> was made from other frames (N differ, first <name>); re-run `starloom <stage>`";
-/// - the entry's stage hash equals the current config's: "<file> was made with another <subtree> config; re-run
-///   `starloom <stage>`".
-///
-/// A change that no subtree hash holds, such as the weight mode (P2-R21), passes. Stages are checked in order, so the
-/// message names the earliest stage to re-run.
-pub fn check_upstream(manifest: &Manifest, stage: Stage, frames: &[PathBuf], cfg: &AlgorithmConfig) -> Result<()> {
-    for up in upstream_stages(stage, cfg) {
-        let entry = manifest.entry(up).ok_or_else(|| {
-            anyhow!(
-                "{} has no `{}` entry; run `starloom {}` first",
-                manifest.work_dir().display(),
-                up.name(),
-                up.name()
-            )
-        })?;
-        let file = entry.file_label();
-        let mut differing = Vec::new();
-        if up == Stage::Calibrate {
-            let made: Vec<&PathBuf> = entry.products.iter().collect();
-            for frame in frames {
-                let abs = std::path::absolute(frame).with_context(|| format!("cannot make {} absolute", frame.display()))?;
-                if !made.iter().any(|p| **p == abs) {
-                    differing.push(abs);
-                }
-            }
-        } else {
-            let recorded: BTreeMap<&Path, &FileId> = entry.inputs.iter().map(|id| (id.path.as_path(), id)).collect();
-            for frame in frames {
-                let now = FileId::of(frame)?;
-                if recorded.get(now.path.as_path()) != Some(&&now) {
-                    differing.push(now.path);
-                }
-            }
-        }
-        if let Some(first) = differing.first() {
-            bail!(
-                "{file} was made from other frames ({} differ, first {}); re-run `starloom {}`",
-                differing.len(),
-                display_name(first),
-                up.name()
-            );
-        }
-        if entry.stage_hash != stage_hash(up, cfg) {
-            bail!("{file} was made with another {} config; re-run `starloom {}`", up.subtree_name(), up.name());
-        }
-    }
-    Ok(())
 }
 
 /// The frames a command works on: `given` when the command line named any (they win), else the frames the previous
@@ -315,18 +239,33 @@ pub fn frames_or_upstream(manifest: &Manifest, stage: Stage, given: Vec<PathBuf>
             up.name()
         )
     })?;
-    Ok(if up == Stage::Calibrate {
-        entry.products.clone()
-    } else {
-        entry.inputs.iter().map(|id| id.path.clone()).collect()
-    })
+    Ok(if up == Stage::Calibrate { entry.products.clone() } else { entry.inputs.clone() })
+}
+
+/// The raw-light facts of each frame, keyed by the frame's absolute path: the facts the `calibrate` entry recorded for
+/// it when the manifest has them, else the frame's own header facts (a frame calibrated elsewhere, or given from
+/// another folder). `measure` takes exposure and date from here (P2-R3), and `finish` takes the map as its `sources`.
+pub fn source_facts(manifest: &Manifest, frames: &[PathBuf]) -> Result<BTreeMap<PathBuf, FrameFacts>> {
+    let recorded = manifest.entry(Stage::Calibrate).map(|e| &e.sources);
+    let mut out = BTreeMap::new();
+    for frame in frames {
+        let abs = std::path::absolute(frame).with_context(|| format!("cannot make {} absolute", frame.display()))?;
+        let facts = match recorded.and_then(|s| s.get(&abs)) {
+            Some(facts) => facts.clone(),
+            None => astroimage::header::read_frame_facts(&abs)
+                .with_context(|| format!("cannot read the header facts of {}", abs.display()))?,
+        };
+        out.insert(abs, facts);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fits_writer::{write_fits_f32, Card, CardValue};
+    use crate::pipeline::formats::{display_name, part_path};
     use crate::stacking::config::{algorithm_preset, StackingPreset};
-    use crate::stacking::weights::WeightMode;
 
     fn frame(dir: &Path, name: &str, body: &[u8]) -> PathBuf {
         let p = dir.join(name);
@@ -334,114 +273,38 @@ mod tests {
         p
     }
 
-    fn ids(frames: &[PathBuf]) -> Vec<FileId> {
-        frames.iter().map(|f| FileId::of(f).unwrap()).collect()
-    }
-
-    fn entry(stage: Stage, cfg: &AlgorithmConfig, inputs: Vec<FileId>, products: Vec<PathBuf>) -> Entry {
-        Entry {
-            stage,
-            stage_hash: stage_hash(stage, cfg),
-            versions: BTreeMap::new(),
-            inputs,
-            products,
-            sources: BTreeMap::new(),
-        }
+    fn cfg() -> AlgorithmConfig {
+        algorithm_preset(StackingPreset::Default)
     }
 
     /// A working folder with a `calibrate` entry (two calibrated frames) and a `measure` entry over them.
-    fn chain(dir: &Path, cfg: &AlgorithmConfig) -> (Manifest, Vec<PathBuf>) {
+    fn chain(dir: &Path) -> (Manifest, Vec<PathBuf>) {
         let cal = dir.join("calibrated");
         std::fs::create_dir_all(&cal).unwrap();
         let frames = vec![frame(&cal, "a.fit", b"alpha"), frame(&cal, "b.fit", b"bravo")];
         let report = frame(dir, "measure.json", b"{}");
         let mut m = Manifest::new(dir);
-        m.entries.push(entry(Stage::Calibrate, cfg, Vec::new(), frames.clone()));
-        m.entries.push(entry(Stage::Measure, cfg, ids(&frames), vec![report]));
+        m.entries.push(Entry::new(Stage::Calibrate, &cfg(), Vec::new(), frames.clone()));
+        m.entries.push(Entry::new(Stage::Measure, &cfg(), frames.clone(), vec![report]));
         (m, frames)
     }
 
     #[test]
-    fn check_upstream_refuses_products_made_from_other_frames_or_another_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = algorithm_preset(StackingPreset::Default);
-        let (mut m, frames) = chain(dir.path(), &cfg);
-        m.entries.push(entry(Stage::Register, &cfg, ids(&frames), vec![frame(dir.path(), "transforms.json", b"{}")]));
-        m.entries.push(entry(Stage::Normalize, &cfg, ids(&frames), vec![frame(dir.path(), "ln.fit", b"{}")]));
-        for stage in [Stage::Measure, Stage::Register, Stage::Normalize, Stage::Stack] {
-            check_upstream(&m, stage, &frames, &cfg).unwrap_or_else(|e| panic!("{stage:?}: {e:#}"));
-        }
-        // A frame given twice or a subset is fine: every given frame is one the entry recorded.
-        check_upstream(&m, Stage::Stack, &frames[..1], &cfg).unwrap();
-
-        // The user re-ran `calibrate` with another dark: the calibrated frame has new content.
-        std::fs::write(&frames[1], b"bravo recalibrated").unwrap();
-        let err = check_upstream(&m, Stage::Stack, &frames, &cfg).unwrap_err().to_string();
-        assert_eq!(err, "measure.json was made from other frames (1 differ, first b.fit); re-run `starloom measure`");
-        std::fs::write(&frames[1], b"bravo").unwrap();
-        check_upstream(&m, Stage::Stack, &frames, &cfg).unwrap();
-
-        // A frame that is not among the recorded ones.
-        let stranger = frame(dir.path(), "z.fit", b"zulu");
-        let err = check_upstream(&m, Stage::Register, &[frames[0].clone(), stranger], &cfg).unwrap_err().to_string();
-        assert!(err.contains("(1 differ, first z.fit)") && err.contains("re-run `starloom measure`"), "{err}");
-
-        // Another measurement config: the measurement subtree moved, so does the stored hash's comparison.
-        let mut other = cfg.clone();
-        other.measurement.max_stars += 10;
-        let err = check_upstream(&m, Stage::Register, &frames, &other).unwrap_err().to_string();
-        assert_eq!(err, "measure.json was made with another measurement config; re-run `starloom measure`");
-        // Another registration config reaches `normalize` and `stack` through the register entry.
-        let mut other = cfg.clone();
-        other.registration.max_stars += 10;
-        let err = check_upstream(&m, Stage::Stack, &frames, &other).unwrap_err().to_string();
-        assert_eq!(err, "transforms.json was made with another registration config; re-run `starloom register`");
-        // `measure` checks the calibrate entry: the frames must be its products, under the calibration config it has.
-        let err = check_upstream(&m, Stage::Measure, &[stranger_path(dir.path())], &cfg).unwrap_err().to_string();
-        assert!(err.contains("re-run `starloom calibrate`"), "{err}");
-        let mut other = cfg.clone();
-        other.calibration.hot_pixel_correction = !other.calibration.hot_pixel_correction;
-        let err = check_upstream(&m, Stage::Measure, &frames, &other).unwrap_err().to_string();
-        assert!(err.contains("another calibration config; re-run `starloom calibrate`"), "{err}");
-
-        // A missing entry.
-        let empty = Manifest::new(dir.path());
-        let err = check_upstream(&empty, Stage::Register, &frames, &cfg).unwrap_err().to_string();
-        assert!(err.contains("has no `measure` entry; run `starloom measure` first"), "{err}");
-        // Normalize is only required when the rejection normalization is local.
-        let mut no_ln = m.clone();
-        no_ln.entries.retain(|e| e.stage != Stage::Normalize);
-        assert!(check_upstream(&no_ln, Stage::Stack, &frames, &cfg).unwrap_err().to_string().contains("`normalize`"));
-        let mut skip_ln = cfg.clone();
-        skip_ln.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
-        check_upstream(&no_ln, Stage::Stack, &frames, &skip_ln).unwrap();
-    }
-
-    fn stranger_path(dir: &Path) -> PathBuf {
-        dir.join("calibrated").join("elsewhere.fit")
-    }
-
-    #[test]
-    fn check_upstream_lets_a_weight_mode_change_through() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = algorithm_preset(StackingPreset::Default);
-        let (mut m, frames) = chain(dir.path(), &cfg);
-        m.entries.push(entry(Stage::Register, &cfg, ids(&frames), vec![frame(dir.path(), "transforms.json", b"{}")]));
-        m.entries.push(entry(Stage::Normalize, &cfg, ids(&frames), vec![frame(dir.path(), "ln.fit", b"{}")]));
-        let mut other = cfg.clone();
-        other.measurement.weight_mode = WeightMode::PsfSnr;
-        other.measurement.keyword = "MYWEIGHT".to_string();
-        other.measurement.formula.fwhm += 0.25;
-        assert_ne!(cfg, other);
-        for stage in [Stage::Register, Stage::Normalize, Stage::Stack] {
-            check_upstream(&m, stage, &frames, &other).unwrap_or_else(|e| panic!("{stage:?}: {e:#}"));
-        }
+    fn an_entry_records_the_hashes_and_every_version_of_this_build() {
+        let mut other = cfg();
+        other.integration.min_weight += 0.1;
+        let e = Entry::new(Stage::Measure, &other, vec![PathBuf::from("a.fit")], Vec::new());
+        assert_eq!(e.stage_hash, stage_hash(Stage::Measure, &other));
+        assert_eq!(e.config_hash, config_hash(&other));
+        assert_ne!(e.config_hash, config_hash(&cfg()));
+        assert_eq!(e.versions, recorded_versions());
+        assert_eq!(e.versions["MEASURE_VERSION"], crate::star_measure::MEASURE_VERSION);
+        assert!(e.sources.is_empty());
     }
 
     #[test]
     fn frames_or_upstream_takes_the_previous_stage_s_frames_and_names_what_to_run() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = algorithm_preset(StackingPreset::Default);
         let empty = Manifest::new(dir.path());
         let err = frames_or_upstream(&empty, Stage::Measure, Vec::new()).unwrap_err().to_string();
         assert!(
@@ -452,25 +315,64 @@ mod tests {
         assert!(err.contains("has no `measure` entry; give FRAMES or run `starloom measure`"), "{err}");
         assert!(frames_or_upstream(&empty, Stage::Calibrate, Vec::new()).is_err());
 
-        let (m, frames) = chain(dir.path(), &cfg);
+        let (m, frames) = chain(dir.path());
         assert_eq!(frames_or_upstream(&m, Stage::Measure, Vec::new()).unwrap(), frames);
         for stage in [Stage::Register, Stage::Normalize, Stage::Stack] {
             assert_eq!(frames_or_upstream(&m, stage, Vec::new()).unwrap(), frames, "{stage:?}");
         }
-        // Frames on the command line win, in the order given.
-        let given = vec![frames[1].clone(), frames[0].clone()];
+        // Frames on the command line win, in the order given, whatever the manifest holds.
+        let stranger = frame(dir.path(), "z.fit", b"zulu");
+        let given = vec![stranger, frames[0].clone()];
         assert_eq!(frames_or_upstream(&m, Stage::Stack, given.clone()).unwrap(), given);
+    }
+
+    fn tiny_fits(path: &Path, exptime: f64, date: &str) {
+        let cards = vec![
+            Card::new("EXPTIME", CardValue::Real(exptime)).unwrap(),
+            Card::new("DATE-OBS", CardValue::Str(date.to_string())).unwrap(),
+        ];
+        write_fits_f32(path, 2, 2, 1, &[0.0; 4], &cards).unwrap();
+    }
+
+    /// I1: a frame the manifest's `calibrate` entry made takes its raw light's facts from the entry; a frame calibrated
+    /// elsewhere is taken all the same, with its own header's facts.
+    #[test]
+    fn source_facts_come_from_the_calibrate_entry_else_from_the_frame_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = dir.path().join("ours.fits");
+        let elsewhere = dir.path().join("calibrated elsewhere.fits");
+        tiny_fits(&ours, 1.0, "2024-01-01T00:00:00");
+        tiny_fits(&elsewhere, 120.0, "2024-01-02T03:04:05");
+        let mut raw = FrameFacts::default();
+        raw.exptime_s = Some(300.0);
+        raw.date_obs = Some("2024-01-15T20:30:45".to_string());
+        let mut cal = Entry::new(Stage::Calibrate, &cfg(), Vec::new(), vec![ours.clone()]);
+        cal.sources.insert(ours.clone(), raw.clone());
+        let mut m = Manifest::new(dir.path());
+        m.entries.push(cal);
+
+        let facts = source_facts(&m, &[ours.clone(), elsewhere.clone()]).unwrap();
+        assert_eq!(facts[&ours], raw, "the raw light's facts, not the calibrated file's");
+        assert_eq!(facts[&elsewhere].exptime_s, Some(120.0));
+        assert_eq!(facts[&elsewhere].date_obs.as_deref(), Some("2024-01-02T03:04:05"));
+        // No calibrate entry at all: every frame's own facts.
+        let facts = source_facts(&Manifest::new(dir.path()), &[ours.clone()]).unwrap();
+        assert_eq!(facts[&ours].exptime_s, Some(1.0));
+        // A frame that cannot be read names itself.
+        let err = format!("{:#}", source_facts(&m, &[dir.path().join("absent.fits")]).unwrap_err());
+        assert!(err.contains("absent.fits"), "{err}");
     }
 
     #[test]
     fn a_manifest_entry_follows_its_products() {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path();
-        let cfg = algorithm_preset(StackingPreset::Default);
-        let tmp = begin_writing(work).unwrap();
-        let built = frame(&tmp, "measure.json", b"{}");
+        begin_writing(work).unwrap();
         let dest = work.join("measure").join("measure.json");
-        let e = entry(Stage::Measure, &cfg, Vec::new(), vec![dest.clone()]);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let built = frame(dest.parent().unwrap(), &display_name(&part_path(&dest)), b"{}");
+        assert_eq!(built, part_path(&dest));
+        let e = Entry::new(Stage::Measure, &cfg(), Vec::new(), vec![dest.clone()]);
 
         // The process is killed after the products were built and before the commit: nothing is in the manifest.
         assert!(Manifest::load(work).unwrap().entries.is_empty());
@@ -478,9 +380,10 @@ mod tests {
 
         // A commit whose product cannot be moved writes no entry, and drops the stage's earlier one.
         let mut old = Manifest::load(work).unwrap();
-        old.entries.push(entry(Stage::Measure, &cfg, Vec::new(), vec![built.clone()]));
+        old.entries.push(Entry::new(Stage::Measure, &cfg(), Vec::new(), vec![built.clone()]));
         old.save().unwrap();
-        let err = commit_stage(work, &[(tmp.join("never built.json"), dest.clone())], e.clone()).unwrap_err();
+        let never = dest.with_file_name("never built.json.part");
+        let err = commit_stage(work, &[(never, dest.clone())], e.clone()).unwrap_err();
         assert!(format!("{err:#}").contains("never built.json"), "{err:#}");
         assert!(Manifest::load(work).unwrap().entry(Stage::Measure).is_none(), "an old entry must not outlive a failed rewrite");
 
@@ -491,28 +394,53 @@ mod tests {
         assert!(err.contains("ghost.json"), "{err}");
         assert!(Manifest::load(work).unwrap().entries.is_empty());
 
-        // The good commit: the product is in place, the entry follows, `.tmp` no longer holds the file.
-        let built = frame(&tmp, "measure.json", b"{}");
+        // The good commit: the product is in place, the entry follows, the staged file is gone.
+        let built = frame(dest.parent().unwrap(), &display_name(&part_path(&dest)), b"{}");
         commit_stage(work, &[(built.clone(), dest.clone())], e.clone()).unwrap();
         assert!(dest.exists() && !built.exists());
         assert_eq!(Manifest::load(work).unwrap().entry(Stage::Measure), Some(&e));
 
-        // Starting the next writing command clears what a killed one left.
+        // Starting the next writing command clears what a killed one left in the scratch folder.
+        let tmp = work.join(TMP_DIR);
         frame(&tmp, "half.part", b"x");
         begin_writing(work).unwrap();
         assert!(!tmp.join("half.part").exists() && tmp.is_dir());
+    }
+
+    /// I6: a product is staged in its destination's folder, so an output folder outside the working folder (on any
+    /// volume) is committed by a rename inside that folder; a product staged anywhere else is refused.
+    #[test]
+    fn a_product_outside_the_work_folder_is_staged_and_renamed_in_its_own_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let out = dir.path().join("elsewhere").join("masters");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let tmp = begin_writing(&work).unwrap();
+        let dest = out.join("master light.fits");
+        let staged = part_path(&dest);
+        assert_eq!(staged.parent(), dest.parent());
+        std::fs::write(&staged, b"pixels").unwrap();
+        let e = Entry::new(Stage::Stack, &cfg(), Vec::new(), vec![dest.clone()]);
+        commit_stage(&work, &[(staged.clone(), dest.clone())], e.clone()).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"pixels");
+        assert!(!staged.exists());
+
+        let in_tmp = frame(&tmp, "master light.fits", b"pixels");
+        let err = commit_stage(&work, &[(in_tmp, dest.clone())], e).unwrap_err().to_string();
+        assert!(err.contains("must be built beside its destination"), "{err}");
+        assert!(Manifest::load(&work).unwrap().entry(Stage::Stack).is_some(), "a refused commit touches nothing");
     }
 
     #[test]
     fn a_commit_replaces_the_stage_entry_and_keeps_stage_order() {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path();
-        let cfg = algorithm_preset(StackingPreset::Default);
         for (stage, name) in [(Stage::Register, "t.json"), (Stage::Measure, "m.json"), (Stage::Measure, "m2.json")] {
-            let tmp = begin_writing(work).unwrap();
-            let built = frame(&tmp, name, b"{}");
+            begin_writing(work).unwrap();
             let dest = work.join(name);
-            commit_stage(work, &[(built, dest.clone())], entry(stage, &cfg, Vec::new(), vec![dest])).unwrap();
+            let built = frame(work, &display_name(&part_path(&dest)), b"{}");
+            commit_stage(work, &[(built, dest.clone())], Entry::new(stage, &cfg(), Vec::new(), vec![dest])).unwrap();
         }
         let m = Manifest::load(work).unwrap();
         let stages: Vec<Stage> = m.entries.iter().map(|e| e.stage).collect();
@@ -555,30 +483,13 @@ mod tests {
         assert!(err.contains("made by another starloom: starloom-work version 2, this build reads 1"), "{err}");
     }
 
-    #[test]
-    fn file_ids_follow_the_content_and_not_the_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = frame(dir.path(), "a.fit", b"same bytes");
-        let a = FileId::of(&p).unwrap();
-        assert!(a.path.is_absolute());
-        // Rewriting the same bytes later is the same input.
-        std::fs::write(&p, b"same bytes").unwrap();
-        assert_eq!(FileId::of(&p).unwrap(), a);
-        std::fs::write(&p, b"other bytes").unwrap();
-        assert_ne!(FileId::of(&p).unwrap(), a);
-        assert!(FileId::of(&dir.path().join("absent.fit")).is_err());
-    }
-
     /// A drive-letter path with spaces is stored as the text it is and read back as the same path, on every platform.
     #[test]
     fn windows_style_paths_round_trip_through_the_manifest_text() {
-        let id = FileId {
-            path: PathBuf::from(r"C:\Users\me\My Frames\Light 0001.FIT"),
-            size: 7,
-            sampled_hash: "0123456789abcdef".to_string(),
-        };
-        let text = serde_json::to_string(&id).unwrap();
+        let mut e = Entry::new(Stage::Measure, &cfg(), vec![PathBuf::from(r"C:\Users\me\My Frames\Light 0001.FIT")], Vec::new());
+        e.sources.insert(PathBuf::from(r"D:\cal\Light 0001.fits"), FrameFacts::default());
+        let text = serde_json::to_string(&e).unwrap();
         assert!(text.contains(r"C:\\Users\\me"), "{text}");
-        assert_eq!(serde_json::from_str::<FileId>(&text).unwrap(), id);
+        assert_eq!(serde_json::from_str::<Entry>(&text).unwrap(), e);
     }
 }

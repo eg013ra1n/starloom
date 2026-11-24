@@ -2,7 +2,7 @@
 //! (starloom's own FITS, XISF and LN-grid writers, and the application's archive, zip, export and header-patch writes).
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::Path;
 
 /// True when `e` says the file system does not implement the sync that was asked for (some SMB/NFS/FUSE
@@ -74,50 +74,6 @@ fn sync_with(
 /// other error (EIO, ENOSPC, ...) is returned.
 pub fn sync_best_effort(file: &File, path: &Path) -> io::Result<()> {
     sync_with(|| file.sync_all(), || plain_fsync(file), path)
-}
-
-/// The sampled content hash of a file: xxh3-64 over its first 512 KiB, the 512 KiB around its middle and its last
-/// 512 KiB (a file of at most 512 KiB is hashed whole), as 16 lowercase hex digits. It is the content hash Athenaeum's
-/// catalog stores for duplicate detection, verbatim, so a file has one value in both. Fast on a multi-gigabyte frame
-/// and blind to a change outside the sampled bytes; a caller that needs byte equality compares the files.
-pub fn sampled_xxh3(path: &Path) -> io::Result<String> {
-    const BUFFER_SIZE: usize = 64 * 1024;
-    const CHUNK_SIZE: usize = 512 * 1024;
-
-    let mut file = File::open(path)?;
-    let file_size = file.metadata()?.len() as usize;
-    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-    let mut buffer = vec![0; BUFFER_SIZE];
-
-    let mut read_and_hash = |file: &mut File, start_pos: u64, chunk_size: usize| -> io::Result<()> {
-        file.seek(SeekFrom::Start(start_pos))?;
-        let mut remaining = chunk_size;
-        while remaining > 0 {
-            let to_read = remaining.min(BUFFER_SIZE);
-            let bytes_read = file.read(&mut buffer[..to_read])?;
-            if bytes_read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..bytes_read]);
-            remaining -= bytes_read;
-        }
-        Ok(())
-    };
-
-    // The beginning.
-    read_and_hash(&mut file, 0, CHUNK_SIZE.min(file_size))?;
-    // The middle, centred on the midpoint.
-    if file_size > CHUNK_SIZE {
-        let middle_start = (file_size / 2).saturating_sub(CHUNK_SIZE / 2);
-        read_and_hash(&mut file, middle_start as u64, CHUNK_SIZE.min(file_size - middle_start))?;
-    }
-    // The end.
-    if file_size > CHUNK_SIZE * 2 {
-        let end_start = file_size.saturating_sub(CHUNK_SIZE);
-        read_and_hash(&mut file, end_start as u64, CHUNK_SIZE)?;
-    }
-
-    Ok(format!("{:016x}", hasher.digest()))
 }
 
 #[cfg(test)]
@@ -233,45 +189,5 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::EIO));
-    }
-
-    /// Bytes with no repeating period, so a wrong sample position changes the hash.
-    fn pattern(n: usize) -> Vec<u8> {
-        (0..n).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect()
-    }
-
-    fn hash_of(bytes: &[u8]) -> String {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("f.bin");
-        std::fs::write(&p, bytes).unwrap();
-        sampled_xxh3(&p).unwrap()
-    }
-
-    #[test]
-    fn sampled_xxh3_of_a_small_file_is_the_whole_file_hash() {
-        let bytes = pattern(300_000);
-        assert_eq!(hash_of(&bytes), format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes)));
-        assert_eq!(hash_of(&[]), format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&[])));
-    }
-
-    #[test]
-    fn sampled_xxh3_reads_the_beginning_the_middle_and_the_end() {
-        const CHUNK: usize = 512 * 1024;
-        let bytes = pattern(CHUNK * 3 + 12_345);
-        let size = bytes.len();
-        let mid = size / 2 - CHUNK / 2;
-        let mut sampled = Vec::new();
-        sampled.extend_from_slice(&bytes[..CHUNK]);
-        sampled.extend_from_slice(&bytes[mid..mid + CHUNK]);
-        sampled.extend_from_slice(&bytes[size - CHUNK..]);
-        let expected = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&sampled));
-        assert_eq!(hash_of(&bytes), expected);
-        // A byte inside a sample moves the hash, one outside every sample does not.
-        let mut inside = bytes.clone();
-        inside[CHUNK / 2] ^= 0xff;
-        assert_ne!(hash_of(&inside), expected);
-        let mut outside = bytes.clone();
-        outside[CHUNK + 10] ^= 0xff;
-        assert_eq!(hash_of(&outside), expected);
     }
 }

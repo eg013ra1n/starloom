@@ -128,6 +128,17 @@ fn expand_one(arg: &OsStr, kind: InputKind) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Refuses a file given twice.
+fn check_given_once(files: &[PathBuf]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for f in files {
+        if !seen.insert(f) {
+            bail!("{} is given twice", f.display());
+        }
+    }
+    Ok(())
+}
+
 /// Refuses two frames with the same stem (compared case-insensitively, as a Windows or macOS volume compares): the
 /// products of both would be written to one name, and the second would silently replace the first.
 fn check_unique_stems(files: &[PathBuf]) -> Result<()> {
@@ -153,20 +164,35 @@ fn check_unique_stems(files: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-/// Expands the frame arguments of a command: each is a file, a folder (its frame files, not recursive) or a glob
-/// pattern the shell did not expand. The result is absolute, in argument order, and sorted by file name within a
-/// folder or a glob (P2-R10).
+fn expand_all(args: &[OsString], kind: InputKind) -> Result<Vec<PathBuf>> {
+    let mut all = Vec::new();
+    for arg in args {
+        all.extend(expand_one(arg, kind)?);
+    }
+    tracing::debug!(arguments = args.len(), files = all.len(), "inputs expanded");
+    Ok(all)
+}
+
+/// Expands the frame arguments of a command whose frames each get products of their own (the lights of `calibrate`,
+/// the frames of `measure`, `register`, `normalize` and `stack`): each argument is a file, a folder (its frame files,
+/// not recursive) or a glob pattern the shell did not expand. The result is absolute, in argument order, and sorted by
+/// file name within a folder or a glob (P2-R10).
 ///
 /// It refuses: an argument that names nothing, a file without a frame suffix for `kind`, a folder or a glob without
 /// a frame file, and two frames with the same stem ([`frame_stem`]), such as two nights' `Light_0001.fit` or
 /// `Light_0001.fit` next to `Light_0001.fits.gz`; the message names both paths.
 pub fn expand_inputs(args: &[OsString], kind: InputKind) -> Result<Vec<PathBuf>> {
-    let mut all = Vec::new();
-    for arg in args {
-        all.extend(expand_one(arg, kind)?);
-    }
+    let all = expand_all(args, kind)?;
     check_unique_stems(&all)?;
-    tracing::debug!(arguments = args.len(), files = all.len(), "inputs expanded");
+    Ok(all)
+}
+
+/// Expands raw calibration frames (darks, flats, biases) as [`expand_inputs`] expands raw frames, without the stem
+/// rule: they are integrated into a master and leave no product of their own, so two sessions' `Dark_0001.fit` are
+/// two frames. Only the same file given twice is refused.
+pub fn expand_calibration_frames(args: &[OsString]) -> Result<Vec<PathBuf>> {
+    let all = expand_all(args, InputKind::Raw)?;
+    check_given_once(&all)?;
     Ok(all)
 }
 
@@ -205,14 +231,16 @@ pub fn parse_date_obs(date_obs: &str, time_obs: Option<&str>) -> Option<DateTime
 /// The order a stack takes its lights in (P2-R10): by `DATE-OBS` as the facts reader gives it (parsed with
 /// [`parse_date_obs`]), then by input position, which stands in for the catalog id Athenaeum breaks ties with. A light
 /// without a parsable date goes after the dated ones, in input order. Returns indices into `lights`; `facts[i]` is
-/// `lights[i]`'s.
-pub fn order_lights(lights: &[PathBuf], facts: &[FrameFacts]) -> Vec<usize> {
-    debug_assert_eq!(lights.len(), facts.len(), "one facts record per light");
+/// `lights[i]`'s, and a count that differs is an error.
+pub fn order_lights(lights: &[PathBuf], facts: &[FrameFacts]) -> Result<Vec<usize>> {
+    if lights.len() != facts.len() {
+        bail!("{} lights but {} facts records; each light needs its own", lights.len(), facts.len());
+    }
     let dates: Vec<Option<DateTime<Utc>>> = facts
         .iter()
         .map(|f| f.date_obs.as_deref().and_then(|d| parse_date_obs(d, f.time_obs.as_deref())))
         .collect();
-    let mut order: Vec<usize> = (0..lights.len().min(facts.len())).collect();
+    let mut order: Vec<usize> = (0..lights.len()).collect();
     // `sort_by_key` is stable, so equal keys keep their input position.
     order.sort_by_key(|&i| (dates[i].is_none(), dates[i]));
     let undated = dates.iter().filter(|d| d.is_none()).count();
@@ -220,7 +248,7 @@ pub fn order_lights(lights: &[PathBuf], facts: &[FrameFacts]) -> Vec<usize> {
         let first = order.iter().copied().find(|&i| dates[i].is_none()).map(|i| lights[i].display().to_string());
         tracing::warn!(undated, first = first.as_deref().unwrap_or(""), "lights without a DATE-OBS go last, in input order");
     }
-    order
+    Ok(order)
 }
 
 /// Where a calibration frame comes from.
@@ -298,9 +326,23 @@ struct RawPlan {
     group: Vec<RawGroup>,
 }
 
+/// A plan's path or glob, resolved against the plan's own folder when it is relative. The folder part of a glob is
+/// escaped, so a folder name holding `[`, `*` or `?` matches as itself.
+fn plan_relative(base: &Path, value: &str) -> String {
+    let p = Path::new(value);
+    if p.is_absolute() {
+        return value.to_string();
+    }
+    if is_glob(value) {
+        let base = glob::Pattern::escape(&base.to_string_lossy());
+        return Path::new(&base).join(value).to_string_lossy().into_owned();
+    }
+    base.join(p).to_string_lossy().into_owned()
+}
+
 /// A dark, flat or bias value: one existing file is a master; a folder, a glob or several entries are raw frames.
-fn cal_source(values: OneOrMany, what: &str) -> Result<CalSource> {
-    let values = values.into_vec();
+fn cal_source(base: &Path, values: OneOrMany, what: &str) -> Result<CalSource> {
+    let values: Vec<String> = values.into_vec().iter().map(|v| plan_relative(base, v)).collect();
     if let [one] = values.as_slice() {
         let p = Path::new(one);
         if p.is_file() {
@@ -308,16 +350,16 @@ fn cal_source(values: OneOrMany, what: &str) -> Result<CalSource> {
         }
     }
     let args: Vec<OsString> = values.into_iter().map(OsString::from).collect();
-    Ok(CalSource::Raw(expand_inputs(&args, InputKind::Raw).with_context(|| format!("the {what} of a plan group"))?))
+    Ok(CalSource::Raw(expand_calibration_frames(&args).with_context(|| format!("the {what} of a plan group"))?))
 }
 
 /// Reads a calibration plan: a TOML or JSON file (by its extension) with a `[[group]]` array. Each group has
 /// `lights` (files, folders or globs), and optionally `dark`, `flat` and `bias` (one master file, or a folder or glob
 /// of raw frames, or a list of those) and `flat_precal` (a master file, or a number of DN). Relative paths and globs
-/// resolve against the current directory, as command-line arguments do.
+/// resolve against the plan's own folder, so a plan kept beside its frames works from any current directory.
 ///
 /// It refuses a plan without a group, a group without a light, an unknown key, and a light stem that appears twice
-/// anywhere in the plan.
+/// anywhere in the plan (calibration frames may share stems: they leave no product of their own).
 pub fn read_plan(path: &Path) -> Result<Vec<CalGroup>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("cannot read plan {}", path.display()))?;
     let ext = path.extension().and_then(OsStr::to_str).map(str::to_ascii_lowercase);
@@ -331,10 +373,12 @@ pub fn read_plan(path: &Path) -> Result<Vec<CalGroup>> {
     if plan.group.is_empty() {
         bail!("plan {} has no [[group]]", path.display());
     }
+    let plan_dir = absolute(path)?.parent().map(Path::to_path_buf).unwrap_or_default();
     let mut groups = Vec::new();
     for (i, g) in plan.group.into_iter().enumerate() {
         let n = i + 1;
-        let args: Vec<OsString> = g.lights.into_vec().into_iter().map(OsString::from).collect();
+        let args: Vec<OsString> =
+            g.lights.into_vec().iter().map(|v| OsString::from(plan_relative(&plan_dir, v))).collect();
         if args.is_empty() {
             bail!("plan {}: group {n} has no lights", path.display());
         }
@@ -342,6 +386,7 @@ pub fn read_plan(path: &Path) -> Result<Vec<CalGroup>> {
         let flat_precal = match g.flat_precal {
             None => None,
             Some(RawPrecal::Path(p)) => {
+                let p = plan_relative(&plan_dir, &p);
                 let p = Path::new(&p);
                 if !p.is_file() {
                     bail!("plan group {n}: flat_precal {} is not a file", p.display());
@@ -357,9 +402,9 @@ pub fn read_plan(path: &Path) -> Result<Vec<CalGroup>> {
         };
         groups.push(CalGroup {
             lights,
-            dark: g.dark.map(|v| cal_source(v, "dark")).transpose().with_context(|| format!("plan group {n}"))?,
-            flat: g.flat.map(|v| cal_source(v, "flat")).transpose().with_context(|| format!("plan group {n}"))?,
-            bias: g.bias.map(|v| cal_source(v, "bias")).transpose().with_context(|| format!("plan group {n}"))?,
+            dark: g.dark.map(|v| cal_source(&plan_dir, v, "dark")).transpose().with_context(|| format!("plan group {n}"))?,
+            flat: g.flat.map(|v| cal_source(&plan_dir, v, "flat")).transpose().with_context(|| format!("plan group {n}"))?,
+            bias: g.bias.map(|v| cal_source(&plan_dir, v, "bias")).transpose().with_context(|| format!("plan group {n}"))?,
             flat_precal,
         });
     }
@@ -461,6 +506,61 @@ mod tests {
         assert!(err.contains("given twice"), "{err}");
     }
 
+    /// M1: calibration frames leave no product of their own, so two sessions' `Dark_0001.fit` are two darks; the
+    /// same file twice is still refused.
+    #[test]
+    fn calibration_frames_may_share_a_stem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (s1, s2) = (tmp.path().join("session 1"), tmp.path().join("session 2"));
+        std::fs::create_dir(&s1).unwrap();
+        std::fs::create_dir(&s2).unwrap();
+        let a = touch(&s1, "Dark_0001.fit");
+        touch(&s2, "Dark_0001.fit");
+        touch(&s2, "Dark_0001.fits.gz");
+        let darks = expand_calibration_frames(&[s1.clone().into_os_string(), s2.clone().into_os_string()]).unwrap();
+        assert_eq!(names(&darks), ["Dark_0001.fit", "Dark_0001.fit", "Dark_0001.fits.gz"]);
+        assert!(expand_inputs(&[s1.into_os_string(), s2.into_os_string()], InputKind::Raw).is_err(), "lights may not");
+        let err = expand_calibration_frames(&[a.clone().into_os_string(), a.into_os_string()]).unwrap_err().to_string();
+        assert!(err.contains("given twice"), "{err}");
+    }
+
+    /// M6: a plan's relative paths and globs resolve against the plan's folder, whatever the current directory.
+    #[test]
+    fn a_plan_s_relative_paths_resolve_against_its_own_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("my [target]");
+        for d in ["lights", "darks 1", "darks 2"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let l1 = touch(&root.join("lights"), "L1.fit");
+        touch(&root.join("lights"), "L2.fit");
+        touch(&root.join("darks 1"), "Dark_0001.fit");
+        touch(&root.join("darks 2"), "Dark_0001.fit");
+        let flat = touch(&root, "master flat.fits");
+        let precal = touch(&root, "dark flat.fits");
+        let plan = root.join("plan.toml");
+        std::fs::write(
+            &plan,
+            "[[group]]\nlights = \"lights/*.fit\"\ndark = [\"darks 1\", \"darks 2\"]\nflat = \"master flat.fits\"\n\
+             flat_precal = \"dark flat.fits\"\n",
+        )
+        .unwrap();
+        let groups = read_plan(&plan).unwrap();
+        assert_eq!(groups[0].lights, [l1.clone(), root.join("lights").join("L2.fit")]);
+        assert!(groups[0].lights.iter().all(|p| p.is_absolute()));
+        match groups[0].dark.as_ref().unwrap() {
+            CalSource::Raw(frames) => assert_eq!(frames.len(), 2, "two sessions' darks of one stem"),
+            other => panic!("two folders are raw frames: {other:?}"),
+        }
+        assert_eq!(groups[0].flat, Some(CalSource::Master(flat)));
+        assert_eq!(groups[0].flat_precal, Some(FlatPrecalSource::Master(precal)));
+        // An absolute path stays as it is.
+        let other = tempfile::tempdir().unwrap();
+        let plan2 = other.path().join("plan.json");
+        std::fs::write(&plan2, format!("{{\"group\":[{{\"lights\":[{:?}]}}]}}", l1.to_str().unwrap())).unwrap();
+        assert_eq!(read_plan(&plan2).unwrap()[0].lights, [l1]);
+    }
+
     fn facts(date: Option<&str>, time: Option<&str>) -> FrameFacts {
         let mut f = FrameFacts::default();
         f.date_obs = date.map(str::to_string);
@@ -479,7 +579,10 @@ mod tests {
             facts(Some("not a date"), None),
             facts(Some("2023-12-31T23:59:59.5Z"), None),
         ];
-        assert_eq!(order_lights(&lights, &f), [5, 2, 3, 0, 1, 4]);
+        assert_eq!(order_lights(&lights, &f).unwrap(), [5, 2, 3, 0, 1, 4]);
+        // M4: a facts list of another length is an error in every build, never a silent drop.
+        let err = order_lights(&lights, &f[..5]).unwrap_err().to_string();
+        assert!(err.contains("6 lights but 5 facts"), "{err}");
     }
 
     #[test]
@@ -497,7 +600,7 @@ mod tests {
         // Dateless frames go last, in input order.
         let lights: Vec<PathBuf> = (0..3).map(|i| PathBuf::from(format!("l{i}.fit"))).collect();
         let f = vec![facts(None, None), facts(Some("2024-01-15"), None), facts(None, Some("20:30:45"))];
-        assert_eq!(order_lights(&lights, &f), [1, 0, 2]);
+        assert_eq!(order_lights(&lights, &f).unwrap(), [1, 0, 2]);
     }
 
     #[test]

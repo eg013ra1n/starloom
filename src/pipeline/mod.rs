@@ -8,35 +8,51 @@
 //!   or stderr: logs are `tracing`, and the caller's [`Progress`] carries what a person should see.
 //! - [`inputs`]: file, folder and glob arguments expanded the same way on every platform, the frame order a stack
 //!   uses, the calibration plan file.
-//! - [`config`]: the effective [`AlgorithmConfig`](crate::stacking::config::AlgorithmConfig) (preset, file, `--set`),
-//!   the stage hashes and the whole-config hash.
+//! - [`config`]: the effective [`AlgorithmConfig`](crate::stacking::config::AlgorithmConfig) (preset, file, `--set`,
+//!   then Athenaeum's resolution), the keys a file held that it does not read, the stage hashes, the whole-config hash
+//!   and [`ln_runs`].
+//! - [`versions`]: every version constant by one name, as entries and reports record them.
 //! - [`cards`]: the `SLM_*` cards every file the pipeline writes carries.
 //! - [`formats`]: the manifest (`starloom.json`, with the command history) and the measure, transforms and weights
 //!   reports, each tagged and versioned, plus the rules that keep a half-written stage from looking done.
 //!
+//! # Manual mode
+//!
+//! The stages are not linked (P2-R24). The CLI never compares one stage's products with another's and never refuses a
+//! product as stale: the user decides what to re-run and what to clean between stages. A later command uses the
+//! products it is given, or else those it finds in the working folder (a command given no frames takes the previous
+//! stage's from the manifest, P2-R20). A missing input (a frame with no measurement, transform or `.athln`) is an
+//! ordinary error that names the frame and the command that makes it. The manifest is a journal of what each command
+//! did (products, sources, config hash, versions, history) for the user to read; nothing checks it.
+//!
 //! # The working folder
 //!
-//! A stage writes its products into `<work>/.tmp/` and renames them into place, then writes its manifest entry: an
-//! entry exists only for products that are complete. Every command that writes clears `<work>/.tmp/` when it
-//! starts ([`formats::begin_writing`]), so a killed process leaves nothing that looks finished.
+//! A stage builds each product beside its destination ([`formats::part_path`]) and renames it into place, so an
+//! output folder on another volume works; then it writes its manifest entry ([`formats::commit_stage`]), so an
+//! interrupted stage leaves no entry and nothing named like a finished product. Every command that writes clears the
+//! scratch folder `<work>/.tmp/` when it starts ([`formats::begin_writing`]). One command runs in a working folder at
+//! a time: nothing locks the folder, and two at once would interleave their manifest writes.
 
 pub mod cards;
 pub mod config;
 pub mod formats;
 pub mod inputs;
+pub mod versions;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub use cards::{common_cards, SLM_CFG, SLM_PLV, SLM_VER};
-pub use config::{config_hash, effective_config, stage_hash};
+pub use config::{config_hash, effective_config, ln_runs, stage_hash};
 pub use formats::{
-    append_history, begin_writing, check_upstream, commit_stage, frames_or_upstream, Entry, FileId, HistoryRow, Manifest,
+    append_history, begin_writing, commit_stage, frames_or_upstream, part_path, source_facts, Entry, HistoryRow, Manifest,
 };
 pub use inputs::{
-    expand_inputs, frame_stem, order_lights, parse_date_obs, read_plan, CalGroup, CalSource, FlatPrecalSource, InputKind,
+    expand_calibration_frames, expand_inputs, frame_stem, order_lights, parse_date_obs, read_plan, CalGroup, CalSource,
+    FlatPrecalSource, InputKind,
 };
+pub use versions::{all_versions, recorded_versions, VERSION_CARDS};
 
 /// The version of the pipeline as a whole: what the cards `SLM_PLV` records, and what a golden row of the whole
 /// chain is keyed on. A change to the pipeline's own glue that moves a product's bytes without moving a stage version
@@ -61,25 +77,13 @@ pub enum Stage {
 }
 
 impl Stage {
-    /// The stage's command name, as the manifest and the "re-run `starloom <stage>`" messages spell it.
+    /// The stage's command name, as the manifest and the "run `starloom <stage>`" messages spell it.
     pub fn name(self) -> &'static str {
         match self {
             Stage::Calibrate => "calibrate",
             Stage::Measure => "measure",
             Stage::Register => "register",
             Stage::Normalize => "normalize",
-            Stage::Stack => "stack",
-        }
-    }
-
-    /// The name of the config subtree the stage's hash is made of, as a message names it ("another measurement
-    /// config").
-    pub fn subtree_name(self) -> &'static str {
-        match self {
-            Stage::Calibrate => "calibration",
-            Stage::Measure => "measurement",
-            Stage::Register => "registration",
-            Stage::Normalize => "normalization",
             Stage::Stack => "stack",
         }
     }

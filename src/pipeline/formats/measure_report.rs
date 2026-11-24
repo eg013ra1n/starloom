@@ -22,6 +22,27 @@ pub const MEASURE_REPORT_FILE: &str = "measure.json";
 pub const MEASURE_REPORT_FORMAT: &str = "starloom-measure";
 /// The version. Another version is refused.
 pub const MEASURE_REPORT_VERSION: u32 = 1;
+/// The columns of `measure.csv`, in order: one row per frame and channel, with the folded values.
+pub const MEASURE_CSV_COLUMNS: [&str; 18] = [
+    "file",
+    "channel",
+    "fwhm_px",
+    "fwhm_arcsec",
+    "eccentricity",
+    "stars_detected",
+    "stars_fitted",
+    "snr_weight",
+    "psf_signal_weight",
+    "psf_snr",
+    "noise",
+    "median",
+    "mad",
+    "location",
+    "scale",
+    "weight",
+    "included",
+    "reason",
+];
 
 /// One colour channel's aperture-correction inputs over the group, the numbers the group's fold reads
 /// ([`channel_c_summary`](crate::stacking::measure::channel_c_summary)).
@@ -70,7 +91,8 @@ pub struct MeasureReport {
     pub version: u32,
     /// The effective config the stage ran with.
     pub config: AlgorithmConfig,
-    /// The versions the numbers were made at, by name.
+    /// Every version of the build that made the report, by constant name
+    /// ([`all_versions`](crate::pipeline::versions::all_versions)).
     pub versions: BTreeMap<String, u32>,
     /// The group's Moffat β under the two-pass `auto` model; `None` for a fixed profile.
     pub group_beta: Option<f64>,
@@ -99,8 +121,22 @@ impl MeasureReport {
         read_versioned(path, MEASURE_REPORT_FORMAT, MEASURE_REPORT_VERSION)
     }
 
-    /// Writes the report atomically to `path` (staged in `<work_dir>/.tmp/`).
-    pub fn write(&self, work_dir: &Path, path: &Path) -> Result<()> {
-        write_json_atomic(work_dir, path, self)
+    /// Writes the report atomically to `path` (staged beside it, then renamed).
+    pub fn write(&self, path: &Path) -> Result<()> {
+        write_json_atomic(path, self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The plan's column list (Task 8, `measure.csv`), spelled out.
+    #[test]
+    fn measure_csv_has_the_plan_s_eighteen_columns() {
+        let plan = "file, channel, fwhm_px, fwhm_arcsec, eccentricity, stars_detected, stars_fitted, snr_weight, \
+                    psf_signal_weight, psf_snr, noise, median, mad, location, scale, weight, included, reason";
+        let listed: Vec<&str> = plan.split(',').map(str::trim).collect();
+        assert_eq!(MEASURE_CSV_COLUMNS.as_slice(), listed.as_slice());
     }
 }

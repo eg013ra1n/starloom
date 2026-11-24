@@ -9,6 +9,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::{read_versioned, write_json_atomic};
+use crate::stacking::measure::FrameMeasurement;
 use crate::stacking::weights::{FormulaWeights, FrameWeight, SelectionConfig, WeightMode};
 
 /// The file name.
@@ -39,6 +40,10 @@ pub struct WeightSettings {
 pub struct WeightFrame {
     /// The calibrated frame, absolute.
     pub file: PathBuf,
+    /// The frame's measurement after the group's fold and reweigh: what Athenaeum stores in
+    /// `stacking_run_frames.metrics_json`, with the same keys (per channel `commonTflux`, `commonTmeanFlux`,
+    /// `commonStars` and `apertureCorrectionGroup`, each present only where it was set).
+    pub measurement: FrameMeasurement,
     /// The reweighed weight.
     pub weight: FrameWeight,
     /// Whether the selection keeps the frame.
@@ -81,8 +86,8 @@ impl WeightsReport {
         read_versioned(path, WEIGHTS_FORMAT, WEIGHTS_VERSION)
     }
 
-    /// Writes the report atomically to `path` (staged in `<work_dir>/.tmp/`).
-    pub fn write(&self, work_dir: &Path, path: &Path) -> Result<()> {
-        write_json_atomic(work_dir, path, self)
+    /// Writes the report atomically to `path` (staged beside it, then renamed).
+    pub fn write(&self, path: &Path) -> Result<()> {
+        write_json_atomic(path, self)
     }
 }

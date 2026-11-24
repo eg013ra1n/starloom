@@ -27,11 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stages hang on, and the `cli` feature (adds `clap` and `tracing-subscriber`; the binary follows). `pipeline` holds
   `Ctx` and `Progress` (the caller's pool, a cancel flag, a progress sink, a memory budget, the working folder; no
   thread pool is built); `expand_inputs` (files, folders and globs, by file name, refusing two frames with one stem),
-  `parse_date_obs`, `order_lights` and `read_plan`; `effective_config` (preset, then file, then `--set`), `stage_hash`
-  and `config_hash`; and the versioned working-folder formats: the manifest `starloom.json` (entries, `FileId`s, the
-  per-light facts and the command history) and the `measure`, `transforms` and `weights` reports, each tagged and
-  refused when made by another version, with `check_upstream` and `frames_or_upstream` and the rule that a stage's
-  entry is written only after its products are in place. `fs_util::sampled_xxh3` is Athenaeum's sampled content hash.
+  `expand_calibration_frames` (no stem rule), `parse_date_obs`, `order_lights` and `read_plan` (relative paths resolve
+  against the plan's folder); `effective_config` (preset, then file, then `--set` on the whole config, then
+  `resolve_algorithm`; it names every key of the file it does not read, as a dotted path), `stage_hash`, `config_hash`
+  (Athenaeum's canonical key order) and `ln_runs`; `versions` (`all_versions`, every version constant by its own name,
+  and `VERSION_CARDS`); and the versioned working-folder formats: the manifest `starloom.json` (per stage its hashes,
+  versions, inputs, products and the per-light facts, and the command history) and the `measure`, `transforms` and
+  `weights` reports, each tagged and refused when made by another version, with `frames_or_upstream`, `source_facts`
+  and the rule that a stage's entry is written only after its products are renamed into place beside their
+  destination. Manual mode: the stages are not linked, and nothing compares one stage's products with another's. A
+  non-finite float is stored as `null`, as Athenaeum's metrics payloads store it, and reads back as NaN.
 - `[profile.release]` is `lto = "thin"`, `codegen-units = 4`, Athenaeum's release profile, for a standalone build.
 
 ## [0.1.2] — 2026-11-23
