@@ -1,8 +1,9 @@
 //! The cards every file the pipeline writes carries (P2-R6). A stage adds its own on top of these.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 use crate::fits_writer::{Card, CardValue};
+use crate::pipeline::versions::{all_versions, VERSION_CARDS};
 use crate::pipeline::PIPELINE_VERSION;
 
 /// The starloom version that wrote the file.
@@ -11,6 +12,29 @@ pub const SLM_VER: &str = "SLM_VER";
 pub const SLM_CFG: &str = "SLM_CFG";
 /// The pipeline version ([`PIPELINE_VERSION`]) that wrote the file.
 pub const SLM_PLV: &str = "SLM_PLV";
+
+/// The recipe a master calibration frame was integrated with, spelled for a person (`average winsorized 3 3`).
+pub const SLM_REC: &str = "SLM_REC";
+/// The number of frames a master calibration frame integrates.
+pub const SLM_N: &str = "SLM_N";
+/// The lowest member `CCD-TEMP` of a master calibration frame, in degrees Celsius.
+pub const SLM_TMIN: &str = "SLM_TMIN";
+/// The highest member `CCD-TEMP` of a master calibration frame, in degrees Celsius.
+pub const SLM_TMAX: &str = "SLM_TMAX";
+/// The number of hot pixels the cosmetic pass replaced in a calibrated light (present when the pass ran).
+pub const SLM_CHPX: &str = "SLM_CHPX";
+/// The debayer a calibrated light went through (`VNG`; present only after a debayer).
+pub const SLM_CDBM: &str = "SLM_CDBM";
+
+/// The version card named `card` (one of [`VERSION_CARDS`], e.g. `SLM_LCV`) holding the version constant it stands for.
+pub fn version_card(card: &str) -> Result<Card> {
+    let (_, key) = VERSION_CARDS
+        .iter()
+        .find(|(name, _)| *name == card)
+        .ok_or_else(|| anyhow!("{card} is not a version card"))?;
+    let value = all_versions().get(key).copied().ok_or_else(|| anyhow!("{card} names an unknown version {key}"))?;
+    Ok(Card::new(card, CardValue::Integer(i64::from(value)))?.with_comment(key))
+}
 
 /// The three cards of every pipeline file: [`SLM_VER`] (this crate's version), [`SLM_CFG`] (`cfg_hash`, from
 /// [`config_hash`](crate::pipeline::config_hash)) and [`SLM_PLV`] ([`PIPELINE_VERSION`]), in that order.
@@ -25,6 +49,13 @@ pub fn common_cards(cfg_hash: &str) -> Result<Vec<Card>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_version_card_holds_the_constant_it_names() {
+        let card = version_card("SLM_LCV").unwrap();
+        assert!(matches!(card.value, Some(CardValue::Integer(v)) if v == i64::from(crate::calibration_library::LIGHT_CAL_VERSION)));
+        assert!(version_card("SLM_XXX").is_err());
+    }
 
     #[test]
     fn every_file_carries_the_version_the_config_hash_and_the_pipeline_version() {

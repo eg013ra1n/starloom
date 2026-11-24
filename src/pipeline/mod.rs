@@ -13,6 +13,9 @@
 //!   and [`ln_runs`].
 //! - [`versions`]: every version constant by one name, as entries and reports record them.
 //! - [`cards`]: the `SLM_*` cards every file the pipeline writes carries.
+//! - [`master`] and [`calibrate`](mod@calibrate): the first two stages. [`build_master`] integrates raw bias, dark or
+//!   flat frames into a master; [`calibrate()`](calibrate::calibrate) turns raw lights into calibrated frames, refusing
+//!   a mismatch from the headers before any pixel is read ([`preflight`]). Raw frames may be compressed.
 //! - [`formats`]: the manifest (`starloom.json`, with the command history) and the measure, transforms and weights
 //!   reports, each tagged and versioned, plus the rules that keep a half-written stage from looking done.
 //!
@@ -33,16 +36,19 @@
 //! scratch folder `<work>/.tmp/` when it starts ([`formats::begin_writing`]). One command runs in a working folder at
 //! a time: nothing locks the folder, and two at once would interleave their manifest writes.
 
+pub mod calibrate;
 pub mod cards;
 pub mod config;
 pub mod formats;
 pub mod inputs;
+pub mod master;
 pub mod versions;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+pub use calibrate::{calibrate, preflight, CalibrateReport, CalibratedFrameReport};
 pub use cards::{common_cards, SLM_CFG, SLM_PLV, SLM_VER};
 pub use config::{config_hash, effective_config, ln_runs, stage_hash};
 pub use formats::{
@@ -52,6 +58,7 @@ pub use inputs::{
     expand_calibration_frames, expand_inputs, frame_stem, order_lights, parse_date_obs, read_plan, CalGroup, CalSource,
     FlatPrecalSource, InputKind,
 };
+pub use master::{build_master, MasterKind, MasterReport};
 pub use versions::{all_versions, recorded_versions, VERSION_CARDS};
 
 /// The version of the pipeline as a whole: what the cards `SLM_PLV` records, and what a golden row of the whole

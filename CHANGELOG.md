@@ -37,6 +37,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the rule that a stage's entry is written only after its products are renamed into place beside their
   destination. Manual mode: the stages are not linked, and nothing compares one stage's products with another's. A
   non-finite float is stored as `null`, as Athenaeum's metrics payloads store it, and reads back as NaN.
+- The `master` and `calibrate` stages of `pipeline`: `build_master` (a bias, dark or flat from raw frames, Athenaeum's
+  master build without the catalog; the automatic recipe, the flat's `SLM_FNRM` and per-channel `SLM_FNR`/`SLM_FNG`/
+  `SLM_FNB`, `SLM_REC`, `SLM_N`, the common `SLM_*` cards and no `ATH_*` card), `calibrate` (a group's lights to
+  calibrated frames: dark else bias, flat, hot pixels from the master dark, the VNG debayer of an OSC light, copy-through
+  cards, `SLM_CSCL`, `SLM_LCV`, `SLM_CHPX`, `SLM_CDBM`; the manifest entry records each raw light's facts) and `preflight`
+  (every mismatch found from headers alone before any pixel is read: a calibration frame of another size and a frame
+  with more than one plane are refused, another sub-frame origin and a flat of another CFA phase are warned about).
+  Raw frames may be compressed (`.fz`, `.fits.gz`, an extension HDU), and the products are plain FITS. `SlmFlatCards`
+  (`calibration_library::flat_cards`, engine layer) reads a master flat's stamped constants as Athenaeum's reader of
+  its own cards does, CFA phase check included.
 - `[profile.release]` is `lto = "thin"`, `codegen-units = 4`, Athenaeum's release profile, for a standalone build.
 
 ## [0.1.2] — 2026-11-23

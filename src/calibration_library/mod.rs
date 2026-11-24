@@ -44,4 +44,6 @@ pub mod cosmetic;
 #[cfg(feature = "engine")]
 pub mod debayer;
 #[cfg(feature = "engine")]
+pub mod flat_cards;
+#[cfg(feature = "engine")]
 pub mod light_cal;
