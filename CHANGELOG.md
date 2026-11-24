@@ -98,6 +98,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   normalization drives the output and keeps the global one otherwise. Not asked for, or fewer than three frames to build
   the reference from, the stage warns or says so and leaves nothing. The versions it records gain
   `NORMALIZE_REPORT_VERSION`.
+- The `stack` stage of `pipeline`: `stack` mirrors Athenaeum's output stage for one group up to the master write. It
+  re-weighs from the stored measurements and transforms under its own config (`current_weights`, and says so when the
+  weight settings are not the ones `measure` ran with), refuses fewer than three included frames, reads each member's
+  `.athln` by the status `ln/normalize.json` gives it (an excluded frame is left out, a frame kept on the global
+  normalization stacks without grids, an `off` report stacks the group on the global normalization), picks the
+  normalization anchor over the members left, and integrates with rejection, the frame-common star set, the
+  rejection-bitmap set large-scale rejection needs and, when `integration.writeRejectionMaps` is set and they fit, the
+  rejection maps. It writes `master.fits` (or `.xisf`) with the standard cards of Athenaeum's master-light header (the
+  anchor's copy-through cards, `NCOMBINE`, the weighted `EXPTIME`, `DATE-OBS`/`DATE-END`), the registration reference's
+  world-coordinate cards and `SLM_VER`, `SLM_CFG`, `SLM_PLV`, `SLM_REF`, `SLM_MSV`, `SLM_MV`, `SLM_ALV`, `SLM_LNV`,
+  `SLM_INV` (no `ATH_*` card), the maps `master_rejlow.fits`/`master_rejhigh.fits`, and `stack/weights.json`. A
+  missing transform, `.athln` or normalize report is an error naming the frames and the command that makes it, before
+  any pixel is read.
 - `[profile.release]` is `lto = "thin"`, `codegen-units = 4`, Athenaeum's release profile, for a standalone build.
 
 ## [0.1.2] — 2026-11-23

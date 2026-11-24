@@ -180,7 +180,7 @@ fn header_keywords(text: &str) -> Vec<String> {
 }
 
 /// The header's cards in header order, typed as `card_from_kv` types them. Long and unwritable cards are dropped.
-fn header_cards(path: &Path) -> Result<Vec<Card>> {
+pub(crate) fn header_cards(path: &Path) -> Result<Vec<Card>> {
     let (format, text) = header_text(path).with_context(|| format!("cannot read the header of {}", path.display()))?;
     let map = header_key_map(format, &text).into_legacy_map();
     Ok(header_keywords(&text).iter().filter_map(|k| map.get(k).and_then(|v| card_from_kv(k, v))).collect())
@@ -198,7 +198,7 @@ fn is_structural(key: &str) -> bool {
 
 /// A world-coordinate keyword: the axes' `CTYPEn`, `CRVALn`, `CRPIXn`, `CDELTn`, `CROTAn`, `CUNITn`, the `CDi_j`,
 /// `PCi_j` and `PVi_m` matrices, the SIP terms and the pole and system cards.
-fn is_wcs(key: &str) -> bool {
+pub(crate) fn is_wcs(key: &str) -> bool {
     const AXIS: [&str; 8] = ["CTYPE", "CRVAL", "CRPIX", "CDELT", "CROTA", "CUNIT", "CRDER", "CSYER"];
     const MATRIX: [&str; 3] = ["CD", "PC", "PV"];
     if matches!(key, "WCSAXES" | "LONPOLE" | "LATPOLE" | "RADESYS" | "EQUINOX" | "EPOCH" | "WCSNAME") {

@@ -22,6 +22,11 @@
 //! - [`register`](mod@register): the fourth stage. [`register()`](register::register) aligns every included frame onto one
 //!   reference (a file, or the best-weighted frame), writes `transforms.json`, then reweighs ([`current_weights`]) and
 //!   writes `weights.json`; with a flag it also writes each frame resampled into the reference's grid.
+//! - [`normalize`](mod@normalize): the fifth stage. [`normalize()`](normalize::normalize) builds the LN reference and
+//!   writes one `.athln` per frame under `<work>/ln/`, when local normalization is asked for ([`ln_runs`]).
+//! - [`stack`](mod@stack): the sixth stage. [`stack()`](stack::stack) re-weighs from the stored measurements and
+//!   transforms, integrates the included frames with rejection, their weights and their local normalization, and
+//!   writes the master light (and its rejection maps) with starloom's own cards.
 //! - [`formats`]: the manifest (`starloom.json`, with the command history) and the measure, transforms and weights
 //!   reports, each tagged and versioned, plus the rules that keep a half-written stage from looking done.
 //!
@@ -51,6 +56,7 @@ pub mod master;
 pub mod measure;
 pub mod normalize;
 pub mod register;
+pub mod stack;
 pub mod versions;
 pub mod weights;
 
@@ -72,6 +78,7 @@ pub use inputs::{
 pub use master::{build_master, MasterKind, MasterReport};
 pub use register::{register, register_dir, registered_path, ReferenceChoice, RegisterReport, REGISTER_DIR, REGISTERED_DIR, SLM_REF};
 pub use normalize::{athln_path, ln_dir, normalize, LN_REFERENCE_FILE, LN_REFERENCE_SATURATION_FILE, NORMALIZE_DIR};
+pub use stack::{master_path, stack, stack_dir, StackReport, MASTER_STEM, MASTER_VERSION_CARDS, STACK_DIR};
 pub use weights::{current_weights, subset_measure};
 pub use measure::{athf_path, finish, measure, measure_dir, pass1_path, MEASURE_CSV_FILE, MEASURE_DIR};
 pub use versions::{all_versions, recorded_versions, VERSION_CARDS};

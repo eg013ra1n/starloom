@@ -1,4 +1,4 @@
-//! SL-9: every step of `master`, `calibrate`, `measure`, `register` and `normalize` that decodes a pixel or fits a star runs on the caller's pool.
+//! SL-9: every step of `master`, `calibrate`, `measure`, `register`, `normalize` and `stack` that decodes a pixel or fits a star runs on the caller's pool.
 //!
 //! A compressed raw frame, a compressed pre-calibration master and a compressed light all go through the image
 //! reader's spill, which decodes with rayon iterators on whatever pool is current. Outside the caller's pool that is
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use starloom::calibration_library::options::CalibratedLightOptions;
 use starloom::fits_writer::{write_fits_f32, OutputFormat};
 use starloom::pipeline::{
-    build_master, calibrate, measure, normalize, register, CalGroup, CalSource, Ctx, FlatPrecalSource, MasterKind, NoProgress, ReferenceChoice,
+    build_master, calibrate, measure, normalize, register, stack, CalGroup, CalSource, Ctx, FlatPrecalSource, MasterKind, NoProgress, ReferenceChoice,
 };
 use starloom::stacking::config::{algorithm_preset, StackingPreset};
 
@@ -132,6 +132,11 @@ fn compressed_frames_decode_on_the_callers_pool_and_never_on_rayons_global_one()
         "{:?}",
         normalized.frames.iter().map(|f| f.reason.clone()).collect::<Vec<_>>()
     );
+
+    // `stack` reweighs, reads the `.athln` grids, warps every frame on the fly, integrates with rejection and measures
+    // the master, all on the caller's pool.
+    let stacked = stack(&ctx, &cfg, &frames, &report, &in_stack, Some(&normalized), &tmp.path().join("masters"), OutputFormat::Fits).unwrap();
+    assert_eq!(stacked.stats.included, 3);
 
     // Nothing built rayon's global pool: asking for it now succeeds (it fails once a pool has been built).
     rayon::ThreadPoolBuilder::new().num_threads(1).build_global().expect("rayon's global pool was built by a stage that ran outside the caller's pool");

@@ -2489,3 +2489,349 @@ fn normalize_with_too_few_reference_frames_is_off_and_leaves_nothing_and_under_t
     let err = format!("{:#}", normalize(&env.ctx(&work), &frames[..2], &measured, &registered, &cfg()).unwrap_err());
     assert!(err.contains("at least 3"), "{err}");
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// stack
+// ---------------------------------------------------------------------------------------------------------------
+
+use starloom::integration::plane_reader::PlaneReader;
+use starloom::pipeline::formats::NormalizeFrame;
+use starloom::pipeline::{master_path, stack, stack_dir, StackReport, MASTER_VERSION_CARDS};
+
+/// `c` with local normalization off for both the output and rejection, so `stack` needs no `normalize`.
+fn ln_off(mut c: AlgorithmConfig) -> AlgorithmConfig {
+    c.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
+    c.normalization.local.enabled = false;
+    c
+}
+
+/// Cuts a frame's file in half, keeping its header: any read of its pixels fails, a header read does not.
+fn cut_pixels(path: &Path) {
+    let len = std::fs::metadata(path).unwrap().len();
+    std::fs::OpenOptions::new().write(true).open(path).unwrap().set_len(len / 2).unwrap();
+}
+
+/// A robust σ (1.4826 x MAD) of `data` (a `w`-wide plane) over the pixels at least `border` from the edges and more
+/// than 8 px from every star of [`grid_stars`] (the reference frame's positions).
+fn background_sigma(data: &[f32], w: usize, h: usize, border: usize) -> f64 {
+    let stars = grid_stars();
+    let mut values: Vec<f64> = Vec::new();
+    for y in border..h - border {
+        for x in border..w - border {
+            if stars.iter().all(|&(sx, sy, _)| (x as f64 - sx).hypot(y as f64 - sy) > 8.0) {
+                values.push(f64::from(data[y * w + x]));
+            }
+        }
+    }
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let m = median(&mut values);
+    let mut dev: Vec<f64> = values.iter().map(|v| (v - m).abs()).collect();
+    1.4826 * median(&mut dev)
+}
+
+fn plane0(path: &Path) -> (usize, usize, Vec<f32>) {
+    let reader = PlaneReader::open(path).unwrap();
+    (reader.width(), reader.height(), reader.read_plane(0).unwrap())
+}
+
+/// The error text of a stack that must fail.
+fn stack_error(env: &Env, work: &Path, c: &AlgorithmConfig, frames: &[PathBuf], m: &MeasureReport, r: &RegisterReport, n: Option<&NormalizeReport>, out: &Path) -> String {
+    format!("{:#}", stack(&env.ctx(work), c, frames, m, r, n, out, OutputFormat::Fits).unwrap_err())
+}
+
+/// No stack product was left: no master in `out`, no `weights.json` and no Stack entry.
+fn no_stack_products(work: &Path, out: &Path) {
+    assert!(!master_path(out, OutputFormat::Fits).exists());
+    assert!(!stack_dir(work).join("weights.json").exists());
+    assert!(Manifest::load(work).unwrap().entry(Stage::Stack).is_none());
+}
+
+#[test]
+fn stack_on_a_synthetic_field_beats_single_frame_noise() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let out = tmp.path().join("out");
+    // Whole-pixel shifts: the warp then copies pixels instead of smoothing them, so the master's noise is the √8 the
+    // stack earns and not an interpolation's.
+    let shifts = [(0.0, 0.0), (3.0, -2.0), (-4.0, 5.0), (1.0, 2.0), (-2.0, -3.0), (5.0, 0.0), (-1.0, 4.0), (2.0, -5.0)];
+    let frames: Vec<PathBuf> = shifts
+        .iter()
+        .enumerate()
+        .map(|(k, &(dx, dy))| field_frame(&tmp.path().join("cal").join(format!("c_Light_{k:04}.fits")), &grid_stars(), dx, dy, 1.0, 80 + k as u64, &[]))
+        .collect();
+    // The default config: local normalization drives the rejection.
+    let c = cfg();
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    // The registered copies are the warp the stack applies: a single frame's noise as the master sees it.
+    let registered = register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::File(frames[0].clone()), &c, true).unwrap();
+    let normalized = normalize(&env.ctx(&work), &frames, &measured, &registered, &c).unwrap();
+    assert_eq!(normalized.status, NormalizeStatus::Ran);
+    let report: StackReport = stack(&env.ctx(&work), &c, &frames, &measured, &registered, Some(&normalized), &out, OutputFormat::Fits).unwrap();
+
+    assert!(report.weights.frames.iter().all(|f| f.included));
+    assert_eq!(report.stats.included, 8);
+    assert_eq!(report.frames.len(), 8);
+    assert_eq!(report.stats.ln_frames, 8);
+    assert_eq!(report.master, master_path(&out, OutputFormat::Fits));
+    let (w, h, master) = plane0(&report.master);
+    assert_eq!((w, h), (768, 512));
+    // σ₁ is one frame warped into the master's grid (the default kernel, a B-spline, smooths even at whole pixels, so
+    // the raw frame's noise would make the bound too loose to tell 8 frames from 3).
+    let (_, _, raw) = plane0(&frames[0]);
+    let (_, _, single) = plane0(&registered.registered[0]);
+    let (s1, sm) = (background_sigma(&single, w, h, 24), background_sigma(&master, w, h, 24));
+    assert!(s1 < background_sigma(&raw, w, h, 24));
+    let bound = 1.2 * s1 / 8f64.sqrt();
+    assert!(sm <= bound, "master background sigma {sm} against {bound} (single warped frame {s1})");
+
+    // The products are in place with the entry; the scratch the bitmaps would use is gone.
+    let manifest = Manifest::load(&work).unwrap();
+    let entry = manifest.entry(Stage::Stack).unwrap();
+    assert_eq!(entry.inputs, frames);
+    assert_eq!(entry.products, [report.master.clone(), stack_dir(&work).join("weights.json")]);
+    assert!(!out.join("master.fits.part").exists() && !work.join(".tmp").join("stack-rej").exists());
+    let back = starloom::pipeline::formats::WeightsReport::read(&report.weights_file).unwrap();
+    assert_eq!(serde_json::to_string(&back).unwrap(), serde_json::to_string(&report.weights).unwrap());
+}
+
+#[test]
+fn stack_fails_naming_a_frame_that_has_no_transform() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let work = tmp.path().join("work");
+    let out = tmp.path().join("out");
+    let frames = shifted_frames(&tmp.path().join("cal"));
+    let c = cfg();
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    // The sixth frame was never registered.
+    let registered = register(&env.ctx(&work), &frames[..5], &measured, &ReferenceChoice::File(frames[0].clone()), &c, false).unwrap();
+    // Any read of a frame's pixels now fails: the refusal must come before one.
+    cut_pixels(&frames[1]);
+    let err = stack_error(&env, &work, &c, &frames, &measured, &registered, None, &out);
+    assert!(err.contains(&frames[5].display().to_string()) && err.contains("starloom register"), "{err}");
+    no_stack_products(&work, &out);
+}
+
+#[test]
+fn stack_fails_naming_a_frame_that_has_no_athln_when_ln_is_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let c = cfg();
+    let out = tmp.path().join("out");
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+    let normalized = normalize(&env.ctx(&work), &frames, &measured, &registered, &c).unwrap();
+    std::fs::remove_file(athln_path(&work, &frames[3])).unwrap();
+    cut_pixels(&frames[1]);
+
+    // From the report given, and from `ln/normalize.json` when none is given: the frame and the command are named.
+    for given in [Some(&normalized), None] {
+        let err = stack_error(&env, &work, &c, &frames, &measured, &registered, given, &out);
+        assert!(err.contains(&frames[3].display().to_string()) && err.contains("starloom normalize"), "{err}");
+        assert!(!err.contains(&frames[2].display().to_string()), "only the frame without its .athln is named: {err}");
+    }
+    // No normalize report at all is the same missing input.
+    std::fs::remove_file(ln_dir(&work).join("normalize.json")).unwrap();
+    let err = stack_error(&env, &work, &c, &frames, &measured, &registered, None, &out);
+    assert!(err.contains("normalize.json") && err.contains("starloom normalize"), "{err}");
+    no_stack_products(&work, &out);
+}
+
+#[test]
+fn stack_with_another_weight_mode_re_weighs_without_re_measuring() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let c = ln_off(cfg());
+    let out = tmp.path().join("out");
+    let gains = [1.0, 0.7, 1.3, 1.0, 0.85, 1.15];
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &gains, &no_cards());
+    let stored: Vec<PathBuf> = std::iter::once(measure_dir(&work).join("measure.json"))
+        .chain(frames.iter().map(|f| athf_path(&work, f, 0)))
+        .collect();
+    let bytes = |paths: &[PathBuf]| -> Vec<Vec<u8>> { paths.iter().map(|p| std::fs::read(p).unwrap()).collect() };
+    let before = bytes(&stored);
+
+    let first = stack(&env.ctx(&work), &c, &frames, &measured, &registered, None, &out, OutputFormat::Fits).unwrap();
+    assert_eq!(first.reweighed, None, "the weights are made under the settings measure ran with");
+    let weights_a = std::fs::read(stack_dir(&work).join("weights.json")).unwrap();
+
+    let mut snr = c.clone();
+    snr.measurement.weight_mode = WeightMode::PsfSnr;
+    let second = stack(&env.ctx(&work), &snr, &frames, &measured, &registered, None, &out, OutputFormat::Fits).unwrap();
+    let note = second.reweighed.as_deref().expect("the report says it re-weighed");
+    assert!(note.contains("psfSnr") && note.contains("psfSignalWeight"), "{note}");
+    assert_eq!(second.weights.settings.weight_mode, WeightMode::PsfSnr);
+    let weights_b = std::fs::read(stack_dir(&work).join("weights.json")).unwrap();
+    assert_ne!(weights_a, weights_b);
+    let mean = |r: &StackReport, k: usize| r.weights.frames[k].weight.as_ref().unwrap().normalized_mean;
+    assert!((0..6).any(|k| (mean(&first, k) - mean(&second, k)).abs() > 1e-6));
+    // Nothing was measured again: the stored measurements and star fits are byte-equal.
+    assert_eq!(bytes(&stored), before);
+}
+
+#[test]
+fn stack_refuses_fewer_than_three_included_frames() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let c = ln_off(cfg());
+    let out = tmp.path().join("out");
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+    let err = stack_error(&env, &work, &c, &frames[..2], &measured, &registered, None, &out);
+    assert!(err.contains("fewer than 3 included frames"), "{err}");
+    no_stack_products(&work, &out);
+}
+
+/// A `normalize` report as `normalize` writes it, with `doctor` applied to its rows and the `.athln` of every row left
+/// without one removed; written to `ln/normalize.json`.
+fn doctored_normalize(work: &Path, report: &NormalizeReport, doctor: impl Fn(usize, &mut NormalizeFrame)) -> NormalizeReport {
+    let mut out = report.clone();
+    for (k, row) in out.frames.iter_mut().enumerate() {
+        doctor(k, row);
+        if row.status != FrameStatus::Normalized {
+            row.athln = None;
+            let _ = std::fs::remove_file(athln_path(work, &row.file));
+        }
+    }
+    out.write(&ln_dir(work).join("normalize.json")).unwrap();
+    out
+}
+
+#[test]
+fn stack_drops_a_frame_normalize_excluded_and_stacks_the_kept_global_ones_without_grids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let c = cfg();
+    let out = tmp.path().join("out");
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+    let normalized = normalize(&env.ctx(&work), &frames, &measured, &registered, &c).unwrap();
+    let doctored = doctored_normalize(&work, &normalized, |k, row| match k {
+        2 => {
+            row.status = FrameStatus::Excluded;
+            row.reason = Some("too few star matches".to_string());
+        }
+        3 => row.status = FrameStatus::KeptGlobal,
+        4 => row.status = FrameStatus::GlobalLowOverlap,
+        _ => {}
+    });
+
+    // Read from `ln/normalize.json`, and from the report given: the same stack.
+    for given in [None, Some(&doctored)] {
+        let report = stack(&env.ctx(&work), &c, &frames, &measured, &registered, given, &out, OutputFormat::Fits).unwrap();
+        assert_eq!(report.stats.included, 5);
+        assert!(!report.frames.contains(&frames[2]), "the excluded frame is left out");
+        assert!(report.frames.contains(&frames[3]) && report.frames.contains(&frames[4]));
+        // Frames 0, 1 and 5 stack with their grids; 3 and 4 on the global normalization.
+        assert_eq!(report.stats.ln_frames, 3);
+        assert!(report.warnings.iter().any(|w| w.contains(&frames[2].display().to_string()) && w.contains("excluded")), "{:?}", report.warnings);
+    }
+}
+
+#[test]
+fn a_normalize_report_that_is_off_stacks_the_whole_group_on_the_global_normalization() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let c = cfg();
+    let out = tmp.path().join("out");
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+    normalize(&env.ctx(&work), &frames, &measured, &registered, &c).unwrap();
+    // What a `normalize` that fell back leaves: an `off` report and no sidecar.
+    let off = NormalizeReport::idle(NormalizeStatus::Off, "the LN reference's background model is refused".to_string(), c.clone(), std::collections::BTreeMap::new());
+    for f in &frames {
+        let _ = std::fs::remove_file(athln_path(&work, f));
+    }
+    off.write(&ln_dir(&work).join("normalize.json")).unwrap();
+
+    for given in [None, Some(&off)] {
+        let report = stack(&env.ctx(&work), &c, &frames, &measured, &registered, given, &out, OutputFormat::Fits).unwrap();
+        assert_eq!(report.stats.included, 6);
+        assert_eq!(report.stats.ln_frames, 0);
+        assert!(report.warnings.iter().any(|w| w.contains("global normalization") && w.contains("background model")), "{:?}", report.warnings);
+    }
+}
+
+#[test]
+fn the_master_light_carries_athenaeums_standard_cards_and_no_ath_card() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let mut c = ln_off(cfg());
+    c.integration.write_rejection_maps = true;
+    let out = tmp.path().join("out");
+    let dates = ["2024-01-15T20:30:45.5", "2024-01-15T20:20:00", "2024-01-15T21:00:00", "2024-01-15T20:40:00", "2024-01-15T20:50:00", "2024-01-15T20:45:00"];
+    let cards: Vec<Vec<Card>> = (0..6)
+        .map(|k| {
+            let mut v = vec![
+                str_card("OBJECT", "M42"),
+                str_card("FILTER", "Ha"),
+                real_card("EXPTIME", 300.0),
+                str_card("DATE-OBS", dates[k]),
+                str_card("INSTRUME", "Cam"),
+                str_card("CALSTAT", "BDF"),
+                str_card("ATH_CSRC", "abc"),
+                str_card("ATH_CDRK", "dark-uuid"),
+                str_card("SLM_CDRK", "master_dark.fits"),
+            ];
+            if k == 0 {
+                v.extend([str_card("CTYPE1", "RA---TAN"), str_card("CTYPE2", "DEC--TAN"), real_card("CRVAL1", 83.82), real_card("CRVAL2", -5.39)]);
+            }
+            v
+        })
+        .collect();
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &cards);
+    let report = stack(&env.ctx(&work), &c, &frames, &measured, &registered, None, &out, OutputFormat::Fits).unwrap();
+
+    let order = card_order(&report.master);
+    let mut expected: Vec<&str> = vec!["IMAGETYP", "SWCREATE", "FILTER", "INSTRUME", "OBJECT", "NCOMBINE", "EXPTIME", "DATE-OBS", "DATE-END"];
+    expected.extend(["CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2", "SLM_VER", "SLM_CFG", "SLM_PLV", "SLM_REF"]);
+    expected.extend(MASTER_VERSION_CARDS);
+    assert_eq!(order, expected);
+    let k = keys(&report.master);
+    assert_eq!(k["IMAGETYP"], "Master Light");
+    assert_eq!(k["NCOMBINE"], "6");
+    let exptime = k["EXPTIME"].parse::<f64>().unwrap();
+    assert!((exptime - report.stats.weighted_exposure_s).abs() <= 1e-9 * exptime, "{exptime} against {}", report.stats.weighted_exposure_s);
+    assert_eq!(k["DATE-OBS"], "2024-01-15T20:20:00+00:00");
+    assert_eq!(k["DATE-END"], "2024-01-15T21:00:00+00:00");
+    assert_eq!(k["SLM_REF"], "c_Light_0000.fits");
+    assert_eq!(k["SLM_CFG"], starloom::pipeline::config_hash(&c));
+    let versions = starloom::pipeline::all_versions();
+    for (card, name) in [("SLM_MSV", "MEASURE_STAGE_VERSION"), ("SLM_MV", "MEASURE_VERSION"), ("SLM_ALV", "ALIGN_VERSION"), ("SLM_LNV", "LN_MODEL_VERSION"), ("SLM_INV", "INTEGRATE_VERSION")] {
+        assert_eq!(k[card], versions[name].to_string(), "{card}");
+    }
+    no_ath_cards(&report.master);
+
+    // The rejection maps: FITS beside the master, with the master's trace cards and none of Athenaeum's.
+    let (low, high) = (report.rejection_low.clone().unwrap(), report.rejection_high.clone().unwrap());
+    assert_eq!(low, out.join("master_rejlow.fits"));
+    assert_eq!(high, out.join("master_rejhigh.fits"));
+    assert_eq!(card_order(&low), ["IMAGETYP", "BUNIT", "SLM_VER", "SLM_CFG", "SLM_PLV", "SLM_REF"]);
+    assert_eq!(keys(&high)["IMAGETYP"], "Rejection Map High");
+    no_ath_cards(&low);
+    no_ath_cards(&high);
+    let entry = Manifest::load(&work).unwrap().entry(Stage::Stack).unwrap().clone();
+    assert_eq!(entry.products, [report.master.clone(), low.clone(), high.clone(), stack_dir(&work).join("weights.json")]);
+
+    // A stack without the maps removes an earlier stack's, which describe another master.
+    let no_maps = ln_off(cfg());
+    let again = stack(&env.ctx(&work), &no_maps, &frames, &measured, &registered, None, &out, OutputFormat::Fits).unwrap();
+    assert!(again.rejection_low.is_none() && !low.exists() && !high.exists(), "{:?} {} {} {:?}", again.rejection_low, low.exists(), high.exists(), again.warnings);
+}
+
+#[test]
+fn stack_with_large_scale_rejection_runs_the_second_pass_and_leaves_no_bitmaps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let mut c = ln_off(cfg());
+    c.integration.large_scale.enabled = true;
+    let out = tmp.path().join("out");
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+    let report = stack(&env.ctx(&work), &c, &frames, &measured, &registered, None, &out, OutputFormat::Fits).unwrap();
+    // The rejection-bitmap set was made for the integration, so the second pass ran on its structures.
+    assert!(report.stats.large_scale_rejected_fraction.is_some(), "{:?}", report.warnings);
+    assert!(report.warnings.iter().all(|w| !w.contains("large-scale")), "{:?}", report.warnings);
+    assert_eq!(report.stats.included, 6);
+    // The bitmaps were scratch: nothing is left of them.
+    assert!(!work.join(".tmp").join("stack-rej").exists());
+}

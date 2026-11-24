@@ -106,8 +106,9 @@ fn beta_of(model: PsfModel) -> Option<f64> {
     }
 }
 
-/// A member's measurements, as the anchor pick and the reference ranking read them.
-struct Ranking {
+/// A member's measurements, as the anchor pick and the reference ranking read them (`stack` picks its anchor with it
+/// too).
+pub(crate) struct Ranking {
     weights: Vec<FrameWeight>,
     star_counts: Vec<usize>,
     sky: Vec<f64>,
@@ -115,7 +116,7 @@ struct Ranking {
 }
 
 impl Ranking {
-    fn of(members: &[&StackFrame], ref_w: usize, ref_h: usize) -> Ranking {
+    pub(crate) fn of(members: &[&StackFrame], ref_w: usize, ref_h: usize) -> Ranking {
         Ranking {
             weights: members.iter().map(|m| m.weight.clone()).collect(),
             star_counts: members.iter().map(|m| m.measurement.min_stars()).collect(),
@@ -129,7 +130,7 @@ impl Ranking {
 
     /// The anchor over these members (`pick_reference_idx` of Athenaeum's run), with the two relaxations the pick made
     /// reported through `ctx` and the log.
-    fn anchor(&self, ctx: &Ctx<'_>) -> Option<usize> {
+    pub(crate) fn anchor(&self, ctx: &Ctx<'_>) -> Option<usize> {
         let (pick, coverage_dropped) = pick_ln_anchor(&self.weights, &self.star_counts, &self.sky, &self.coverage);
         if let Some(count) = coverage_dropped {
             tracing::warn!(count, min_coverage = MIN_REFERENCE_COVERAGE, "reference-coverage filter dropped for the anchor: fewer than 3 members pass");
