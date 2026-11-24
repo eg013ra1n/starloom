@@ -22,6 +22,10 @@
 //!    `SLM_PLV`, `SLM_REF` (the registration reference's file name) and the versions `SLM_MSV`, `SLM_MV`, `SLM_ALV`,
 //!    `SLM_LNV`, `SLM_INV`.
 //!
+//! 6. with `drizzle.enabled`, the drizzle runs on the integrated frames while the rejection bitmaps exist and writes
+//!    the drizzled master (and its weight map); see [`drizzle`]. It never fails the stack: a skip or a failure is a
+//!    warning and the master stands. A Bayer drizzle with no frame's mosaic is refused before any pixel is read.
+//!
 //! Products: the master light `<out>/master.fits` (or `.xisf`), the rejection maps `<out>/master_rejlow.fits` and
 //! `<out>/master_rejhigh.fits` (always FITS, as Athenaeum writes them), and `<work>/stack/weights.json`, the weights the
 //! stage stacked with (a frame local normalization excluded is marked excluded there, with `normalize`'s reason, as
@@ -49,6 +53,7 @@ use crate::integration::plane_reader::PlaneReader;
 use crate::integration::IntegrationError;
 use crate::pipeline::calibrate::{card_from_kv, encode_ident, file_name_of};
 use crate::pipeline::cards::version_card;
+use crate::pipeline::drizzle::{self, DrizzleReport};
 use crate::pipeline::formats::{
     commit_stage, part_path, Entry, FrameStatus, MeasureReport, NormalizeFrame, NormalizeReport, NormalizeStatus,
     TransformFrame, WeightSettings, WeightsReport, NORMALIZE_FILE, WEIGHTS_FILE,
@@ -128,6 +133,9 @@ pub struct StackReport {
     pub reference: PathBuf,
     /// The integration's summary: counts, rejection fractions, the master's noise and star figures, the SNR gain.
     pub stats: GroupStats,
+    /// The drizzled master, when `drizzle.enabled` was set and the drizzle ran; `None` when it is off, was skipped
+    /// (the rejection bitmaps were unavailable) or failed (a warning says which): the master stands either way.
+    pub drizzle: Option<DrizzleReport>,
     /// Set when the weights were made under other weight settings (mode, formula, keyword, selection) than the ones
     /// `measure` ran with: the stage re-weighed from the stored measurements and says so (P2-R21).
     pub reweighed: Option<String>,
@@ -360,6 +368,22 @@ fn run(
     };
     let channels = members[anchor].measurement.channels.len();
 
+    // The drizzle's run-wide checks, before any pixel is read: its scale, and for a Bayer drizzle the mosaics.
+    let drizzle_settings = if cfg.drizzle.enabled { Some(drizzle::settings(ctx, &cfg.drizzle)?) } else { None };
+    let mosaics = if drizzle_settings.is_some() && drizzle::bayer_wanted(cfg, channels) {
+        let sources = drizzle::mosaic_sources(&members);
+        if sources.iter().all(Option::is_none) {
+            bail!(
+                "Bayer drizzle needs each frame's calibrated CFA mosaic, and none of the {} frames has one beside it; \
+                 run `starloom calibrate --keep-mosaic` on the raw lights (with the debayer on), or turn drizzle.bayer off",
+                members.len()
+            );
+        }
+        Some(sources)
+    } else {
+        None
+    };
+
     // The rejection maps, off for this group with a warning when they would not fit a quarter of the memory.
     let mut integration = cfg.integration.clone();
     if integration.write_rejection_maps {
@@ -452,6 +476,19 @@ fn run(
         );
     }
 
+    // The large-scale second pass ran and left no bitmap set of its own: nothing describes this master's rejected
+    // samples, so drizzle is skipped rather than pointed at the first pass's bits.
+    if drizzle::second_pass_unavailable(
+        bitmaps_for_drizzle,
+        output.stats.large_scale_rejected_fraction.is_some(),
+        output.second_pass_rej_ok,
+        rej_set_failure.as_deref(),
+    ) {
+        let msg = "the second pass's rejection bitmaps are unavailable".to_string();
+        warn(ctx, format!("drizzle skipped: {msg}"));
+        rej_set_failure = Some(msg);
+    }
+
     // The master and its maps, built beside their destinations; then `weights.json` and the entry.
     let cards = master_cards(cfg, &members, anchor, &reference, &output)?;
     // XISF has no row order: the master's rows are its frames' order, and a viewer shows a bottom-up (or unstated) set
@@ -491,18 +528,60 @@ fn run(
         remove_built(&moves);
         return Err(e);
     }
+
+    // The drizzle, while the bitmaps exist. It never fails the stack: a skip or a failure is a warning and the master
+    // stays; a cancel is an error.
+    let mut drizzle_report: Option<DrizzleReport> = None;
+    if let Some(settings) = drizzle_settings {
+        if let Some(reason) = &rej_set_failure {
+            tracing::warn!(error = %reason, "drizzle skipped for this stack; the master is unaffected");
+            if !bitmaps_for_drizzle {
+                warn(ctx, format!("drizzle skipped: rejection bitmaps unavailable ({reason}); the master is unaffected"));
+            }
+        } else {
+            let attempt = drizzle::Inputs {
+                cfg,
+                settings,
+                members: &members,
+                output: &output,
+                ln: ln_by_member.as_deref(),
+                rej: rej_set.as_ref(),
+                mosaics: mosaics.as_deref(),
+                width,
+                height,
+                channels,
+                master_cards: &cards,
+                out_dir: &out_dir,
+                format,
+            };
+            match drizzle::drizzle(ctx, &attempt) {
+                Ok(built) => {
+                    moves.extend(built.moves);
+                    drizzle_report = Some(built.report);
+                }
+                Err(drizzle::Failure::Cancelled) => {
+                    remove_built(&moves);
+                    bail!("cancelled");
+                }
+                Err(drizzle::Failure::Other(msg)) => {
+                    tracing::warn!(error = %msg, "drizzle failed; the master is unaffected");
+                    warn(ctx, format!("drizzle failed: {msg}; the master is unaffected"));
+                }
+            }
+        }
+    }
     let products: Vec<PathBuf> = moves.iter().map(|(_, dest)| dest.clone()).collect();
     let entry = Entry::new(Stage::Stack, cfg, files, products.clone());
     if let Err(e) = commit_stage(ctx.work_dir, &moves, entry) {
         remove_built(&moves);
         return Err(e);
     }
-    // Maps an earlier stack left beside the master describe another master.
-    for suffix in ["rejlow", "rejhigh"] {
-        let stale = rejection_map_path(out_dir, suffix);
+    // Maps and drizzled outputs an earlier stack left beside the master describe another master.
+    let earlier = ["rejlow", "rejhigh"].map(|suffix| rejection_map_path(out_dir, suffix)).into_iter().chain(drizzle::possible_products(out_dir, format));
+    for stale in earlier {
         if !products.contains(&stale) && stale.is_file() {
             if let Err(e) = std::fs::remove_file(&stale) {
-                tracing::warn!(path = %stale.display(), error = %e, "cannot remove an earlier stack's rejection map");
+                tracing::warn!(path = %stale.display(), error = %e, "cannot remove an earlier stack's output");
             }
         }
     }
@@ -527,6 +606,7 @@ fn run(
         anchor: members[anchor].path.clone(),
         reference,
         stats: output.stats,
+        drizzle: drizzle_report,
         reweighed,
         warnings: Vec::new(),
     })

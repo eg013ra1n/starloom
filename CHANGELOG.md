@@ -120,6 +120,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bottom-up (or unstated) frames is warned about, as Athenaeum warns once per group. `orientation::row_order_is_bottom_up`
   (the row-order rule over a `ROWORDER` value) moved here from Athenaeum's core, which re-exports it.
 - `[profile.release]` is `lto = "thin"`, `codegen-units = 4`, Athenaeum's release profile, for a standalone build.
+- Drizzle inside `stack` and the `run` function (`pipeline::drizzle`, `pipeline::run`). With `drizzle.enabled`, `stack`
+  drizzles the integrated frames while the rejection bitmaps exist and writes `master_drizzle<s>x.fits` (and, with
+  `drizzle.writeWeightMap`, `master_drizzle<s>x_weight.fits`; `.xisf` for an XISF master) beside the master, as
+  Athenaeum's Output stage does: the same frames, normalized weights, output normalization pairs and rejection bitmaps
+  (the second pass's own set under large-scale rejection), local normalization only when it drives the output, a scale
+  outside 1 to 3 refused before any pixel is read, a drop shrink clamped to `[0.5, 1.0]` with a warning, the drizzle
+  skipped when the bitmaps are unavailable, and a drizzle that fails a warning that keeps the master and its entry. The
+  drizzled files carry the master's cards with the world-coordinate block scaled by the factor and `SLM_DRZ`,
+  `SLM_DRZP`, `SLM_DRZK` and `SLM_DZV`; `StackReport::drizzle` reports them. A Bayer drizzle reads each frame's
+  calibrated CFA mosaic (`c_<stem>.fits` beside `c_<stem>_d.fits`) and is refused, naming `calibrate --keep-mosaic`,
+  when no frame has one. A drizzle coverage map is not written. `run` is calibrate (which builds the raw masters),
+  measure, register, normalize (when `ln_runs`) and stack over all the groups' lights, with `keep_mosaic` set where
+  Athenaeum's calibration sets it. The stage goldens gain a `pipeline` row (a `run` with the drizzle, keyed on
+  `PIPELINE_VERSION` and every stage version it goes through). No stage version moves and no existing row changes.
 
 ## [0.1.2] — 2026-11-23
 

@@ -29,6 +29,8 @@
 //! - [`stack`](mod@stack): the sixth stage. [`stack()`](stack::stack) re-weighs from the stored measurements and
 //!   transforms, integrates the included frames with rejection, their weights and their local normalization, and
 //!   writes the master light (and its rejection maps) with starloom's own cards.
+//! - [`run`](mod@run): the stages in a row over all the groups' lights, into one working folder; and drizzle, which
+//!   [`stack`](mod@stack) runs when asked ([`drizzle`](mod@drizzle)).
 //! - [`formats`]: the manifest (`starloom.json`, with the command history) and the measure, transforms, weights and
 //!   normalize reports, each tagged and versioned, plus the rules that keep a half-written stage from looking done.
 //!
@@ -52,12 +54,14 @@
 pub mod calibrate;
 pub mod cards;
 pub mod config;
+pub mod drizzle;
 pub mod formats;
 pub mod inputs;
 pub mod master;
 pub mod measure;
 pub mod normalize;
 pub mod register;
+pub mod run;
 pub mod stack;
 pub mod versions;
 pub mod weights;
@@ -80,6 +84,8 @@ pub use inputs::{
 pub use master::{build_master, MasterKind, MasterReport};
 pub use register::{register, register_dir, registered_path, ReferenceChoice, RegisterReport, REGISTER_DIR, REGISTERED_DIR, SLM_REF};
 pub use normalize::{athln_path, ln_dir, normalize, LN_REFERENCE_FILE, LN_REFERENCE_SATURATION_FILE, NORMALIZE_DIR};
+pub use drizzle::DrizzleReport;
+pub use run::{calibrated_dir, run, RunReport, CALIBRATED_DIR};
 pub use stack::{master_path, stack, stack_dir, StackReport, MASTER_STEM, MASTER_VERSION_CARDS, STACK_DIR};
 pub use weights::{current_weights, subset_measure};
 pub use measure::{athf_path, finish, measure, measure_dir, pass1_path, MEASURE_CSV_FILE, MEASURE_DIR};

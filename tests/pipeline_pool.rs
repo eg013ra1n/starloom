@@ -15,7 +15,7 @@ use std::sync::Arc;
 use starloom::calibration_library::options::CalibratedLightOptions;
 use starloom::fits_writer::{write_fits_f32, OutputFormat};
 use starloom::pipeline::{
-    build_master, calibrate, measure, normalize, register, stack, CalGroup, CalSource, Ctx, FlatPrecalSource, MasterKind, NoProgress, ReferenceChoice,
+    build_master, calibrate, measure, normalize, register, run, stack, CalGroup, CalSource, Ctx, FlatPrecalSource, MasterKind, NoProgress, ReferenceChoice,
 };
 use starloom::stacking::config::{algorithm_preset, StackingPreset};
 
@@ -50,6 +50,32 @@ fn gz_frames(dir: &Path, prefix: &str, n: usize, base: f32, hot: bool) -> Vec<Pa
             gz
         })
         .collect()
+}
+
+/// A gzipped BITPIX 16 FITS (BZERO 32768) of `values`, the way a camera writes it.
+fn gz_u16(dest: &Path, w: usize, h: usize, values: &[u16]) -> PathBuf {
+    let mut bytes = Vec::new();
+    for c in [
+        format!("{:<8}= {:>20}", "SIMPLE", "T"),
+        format!("{:<8}= {:>20}", "BITPIX", 16),
+        format!("{:<8}= {:>20}", "NAXIS", 2),
+        format!("{:<8}= {:>20}", "NAXIS1", w),
+        format!("{:<8}= {:>20}", "NAXIS2", h),
+        format!("{:<8}= {:>20}", "BZERO", 32768),
+        format!("{:<8}= {:>20}", "BSCALE", 1),
+        "END".to_string(),
+    ] {
+        bytes.extend_from_slice(format!("{c:<80}").as_bytes());
+    }
+    bytes.resize(bytes.len().div_ceil(2880) * 2880, b' ');
+    for &v in values {
+        bytes.extend_from_slice(&((i32::from(v) - 32768) as i16).to_be_bytes());
+    }
+    bytes.resize(bytes.len().div_ceil(2880) * 2880, 0);
+    let mut enc = flate2::write::GzEncoder::new(std::fs::File::create(dest).unwrap(), flate2::Compression::fast());
+    enc.write_all(&bytes).unwrap();
+    enc.finish().unwrap();
+    dest.to_path_buf()
 }
 
 #[test]
@@ -135,8 +161,35 @@ fn compressed_frames_decode_on_the_callers_pool_and_never_on_rayons_global_one()
 
     // `stack` reweighs, reads the `.athln` grids, warps every frame on the fly, integrates with rejection and measures
     // the master, all on the caller's pool.
-    let stacked = stack(&ctx, &cfg, &frames, &report, &in_stack, Some(&normalized), &tmp.path().join("masters"), OutputFormat::Fits).unwrap();
+    // The drizzle runs inside it, while the rejection bitmaps exist: its deposit, its rejection reads and its writes too.
+    let mut drizzling = cfg.clone();
+    drizzling.drizzle.enabled = true;
+    let stacked = stack(&ctx, &drizzling, &frames, &report, &in_stack, Some(&normalized), &tmp.path().join("masters"), OutputFormat::Fits).unwrap();
     assert_eq!(stacked.stats.included, 3);
+    assert!(stacked.drizzle.as_ref().is_some_and(|d| d.stats.frames == 3 && d.stats.used_rejection), "{:?}", stacked.warnings);
+
+    // `run` on compressed raw star lights: every stage in a row, the drizzle among them.
+    let raw = tmp.path().join("raw");
+    std::fs::create_dir_all(&raw).unwrap();
+    let raw_lights: Vec<PathBuf> = [(0.0, 0.0), (2.5, -1.5), (-3.25, 2.0)]
+        .iter()
+        .enumerate()
+        .map(|(k, &(dx, dy))| {
+            let moved: Vec<(f64, f64, f64)> = layout.iter().map(|&(x, y, a)| (x + dx, y + dy, a)).collect();
+            let mut data = starloom::test_support::gaussian_field(768, 512, &moved, 1.8, 0.08);
+            starloom::test_support::add_noise(&mut data, 0.002, 200 + k as u64);
+            let dn: Vec<u16> = data.iter().map(|&v| (100.0 + f64::from(v.clamp(0.0, 1.0)) * 50_000.0).round() as u16).collect();
+            gz_u16(&raw.join(format!("Light_{k:04}.fits.gz")), 768, 512, &dn)
+        })
+        .collect();
+    let dark = raw.join("dark.fits");
+    write_fits_f32(&dark, 768, 512, 1, &vec![100.0f32; 768 * 512], &[]).unwrap();
+    let groups = [CalGroup { lights: raw_lights, dark: Some(CalSource::Master(dark)), flat: None, bias: None, flat_precal: None }];
+    let run_work = tmp.path().join("run-work");
+    let run_ctx = Ctx { pool: ctx.pool.clone(), cancel: &cancel, progress: &NoProgress, memory_budget_bytes: 1 << 30, work_dir: &run_work };
+    let ran = run(&run_ctx, &groups, &drizzling, &ReferenceChoice::Auto, &tmp.path().join("run-out"), OutputFormat::Fits).unwrap();
+    assert_eq!(ran.stack.stats.included, 3);
+    assert!(ran.stack.drizzle.is_some(), "{:?}", ran.stack.warnings);
 
     // Nothing built rayon's global pool: asking for it now succeeds (it fails once a pool has been built).
     rayon::ThreadPoolBuilder::new().num_threads(1).build_global().expect("rayon's global pool was built by a stage that ran outside the caller's pool");

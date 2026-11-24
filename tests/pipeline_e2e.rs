@@ -3174,3 +3174,331 @@ fn a_stack_normalize_leaves_under_three_frames_is_refused_and_leaves_no_product(
     assert!(err.contains("local normalization left 2 frames") && err.contains("at least 3"), "{err}");
     no_stack_products(&work, &out);
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// drizzle (inside stack) and run
+// ---------------------------------------------------------------------------------------------------------------
+
+use starloom::pipeline::{calibrated_dir, part_path, run, RunReport};
+use starloom::stacking::config::DrizzleKernel;
+
+/// `c` with the drizzle on at scale 2 and its weight map asked for.
+fn drizzle_on(mut c: AlgorithmConfig) -> AlgorithmConfig {
+    c.drizzle.enabled = true;
+    c.drizzle.write_weight_map = true;
+    c
+}
+
+/// The world-coordinate cards of a 768 x 512 frame, with SIP terms.
+fn wcs_cards() -> Vec<Card> {
+    vec![
+        str_card("CTYPE1", "RA---TAN-SIP"),
+        str_card("CTYPE2", "DEC--TAN-SIP"),
+        real_card("CRVAL1", 83.82),
+        real_card("CRVAL2", -5.39),
+        real_card("CRPIX1", 384.5),
+        real_card("CRPIX2", 256.5),
+        real_card("CD1_1", -1.0e-3),
+        real_card("CD1_2", 0.0),
+        real_card("CD2_1", 0.0),
+        real_card("CD2_2", 1.0e-3),
+        int_card("A_ORDER", 2),
+        real_card("A_2_0", 1.0e-6),
+        real_card("A_1_1", 2.0e-6),
+    ]
+}
+
+fn median(v: &[f32]) -> f32 {
+    let mut s = v.to_vec();
+    s.sort_by(f32::total_cmp);
+    s[s.len() / 2]
+}
+
+fn number_of(path: &Path, key: &str) -> f64 {
+    keys(path)[key].parse::<f64>().unwrap()
+}
+
+#[test]
+fn drizzle_writes_the_drizzled_master_and_its_weight_map_with_the_scaled_wcs_and_the_slm_cards() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let c = drizzle_on(ln_off(cfg()));
+    let out = tmp.path().join("out");
+    let cards = vec![wcs_cards(); 6];
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &cards);
+    let report = stack(&env.ctx(&work), &c, &frames, &measured, &registered, None, &out, OutputFormat::Fits).unwrap();
+
+    let d = report.drizzle.as_ref().expect("the drizzle ran");
+    assert_eq!(d.master, out.join("master_drizzle2x.fits"));
+    assert_eq!(d.weight_map, Some(out.join("master_drizzle2x_weight.fits")));
+    assert_eq!((d.stats.out_width, d.stats.out_height, d.stats.frames), (1536, 1024, 6));
+    assert!(d.stats.used_weights && d.stats.used_rejection, "weights and the rejection bitmaps are applied");
+    assert_eq!(d.stats.ln_frames, 0);
+    let (w, h, drizzled) = plane0(&d.master);
+    assert_eq!((w, h), (1536, 1024));
+    // The deposit is level preserving: the drizzled sky is the master's.
+    let (_, _, master) = plane0(&report.master);
+    let (m, z) = (median(&master), median(&drizzled));
+    assert!((m - z).abs() < 0.005, "master sky {m}, drizzled sky {z}");
+
+    // The cards: the master's, the world-coordinate block scaled by 2, and the SLM drizzle cards, no ATH card.
+    no_ath_cards(&d.master);
+    let k = keys(&d.master);
+    assert_eq!(k["IMAGETYP"], "Master Light");
+    assert_eq!(k["SLM_REF"], "c_Light_0000.fits");
+    assert_eq!((k["SLM_DRZ"].as_str(), k["SLM_DRZK"].as_str()), ("2", "square"));
+    assert_eq!(k["SLM_DRZP"].parse::<f64>().unwrap(), 0.9);
+    assert_eq!(k["SLM_DZV"], starloom::pipeline::all_versions()["DRIZZLE_KERNEL_VERSION"].to_string());
+    // CRPIX' = s * CRPIX - (s - 1) / 2; CD' = CD / s; A_pq' = A_pq * s^(1 - p - q).
+    assert_eq!(number_of(&d.master, "CRPIX1"), 768.5);
+    assert_eq!(number_of(&d.master, "CRPIX2"), 512.5);
+    assert_eq!(number_of(&d.master, "CD1_1"), -5.0e-4);
+    assert_eq!(number_of(&d.master, "CD2_2"), 5.0e-4);
+    assert_eq!(number_of(&d.master, "A_2_0"), 5.0e-7);
+    assert_eq!(number_of(&d.master, "A_1_1"), 1.0e-6);
+    assert_eq!(number_of(&d.master, "CRVAL1"), 83.82);
+    // The master itself keeps its own, unscaled block.
+    assert_eq!(number_of(&report.master, "CRPIX1"), 384.5);
+    let order = card_order(&d.master);
+    assert_eq!(order[order.len() - 4..], ["SLM_DRZ", "SLM_DRZP", "SLM_DRZK", "SLM_DZV"]);
+
+    // The weight map is the drizzled grid, W / max(W), with the same world-coordinate block.
+    let weight = d.weight_map.as_ref().unwrap();
+    no_ath_cards(weight);
+    let wk = keys(weight);
+    assert_eq!((wk["IMAGETYP"].as_str(), wk["BUNIT"].as_str()), ("Drizzle Weight", "relative weight"));
+    assert_eq!(number_of(weight, "CRPIX1"), 768.5);
+    let (ww, wh, wdata) = plane0(weight);
+    assert_eq!((ww, wh), (1536, 1024));
+    assert_eq!(wdata.iter().copied().fold(0.0f32, f32::max), 1.0);
+
+    // The bitmaps the drizzle read are gone, the products are in the entry.
+    assert!(!work.join(".tmp").join("stack-rej").exists());
+    let entry = Manifest::load(&work).unwrap().entry(Stage::Stack).cloned().unwrap();
+    for p in [&report.master, &d.master, weight] {
+        assert!(entry.products.contains(p), "{} is not in the entry", p.display());
+    }
+}
+
+#[test]
+fn drizzle_follows_local_normalization_only_when_it_drives_the_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    // The shipped default: local normalization drives the rejection only.
+    let mut c = cfg();
+    c.drizzle.enabled = true;
+    assert!(!c.normalization.local.enabled);
+    let out = tmp.path().join("out");
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+    let normalized = normalize(&env.ctx(&work), &frames, &measured, &registered, &c).unwrap();
+    assert_eq!(normalized.status, NormalizeStatus::Ran);
+    let rejection_only = stack(&env.ctx(&work), &c, &frames, &measured, &registered, Some(&normalized), &out, OutputFormat::Fits).unwrap();
+    assert_eq!(rejection_only.stats.ln_frames, 6, "the grids were read for the rejection");
+    assert_eq!(rejection_only.drizzle.as_ref().unwrap().stats.ln_frames, 0, "and never normalize the drizzled master");
+
+    let mut driving = c.clone();
+    driving.normalization.local.enabled = true;
+    let driven = stack(&env.ctx(&work), &driving, &frames, &measured, &registered, Some(&normalized), &out, OutputFormat::Fits).unwrap();
+    assert_eq!(driven.drizzle.as_ref().unwrap().stats.ln_frames, 6);
+}
+
+#[test]
+fn a_drizzle_that_fails_keeps_the_master_and_its_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let c = drizzle_on(ln_off(cfg()));
+    let out = tmp.path().join("out");
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+    // A folder where the drizzled master is built: its write fails after the master is already built.
+    std::fs::create_dir_all(part_path(&out.join("master_drizzle2x.fits"))).unwrap();
+    let report = stack(&env.ctx(&work), &c, &frames, &measured, &registered, None, &out, OutputFormat::Fits).unwrap();
+    assert!(report.drizzle.is_none());
+    assert!(report.warnings.iter().any(|w| w.contains("drizzle failed") && w.contains("master is unaffected")), "{:?}", report.warnings);
+    assert!(report.master.is_file());
+    assert!(!out.join("master_drizzle2x.fits").exists() && !out.join("master_drizzle2x_weight.fits").exists());
+    let entry = Manifest::load(&work).unwrap().entry(Stage::Stack).cloned().unwrap();
+    assert!(entry.products.contains(&report.master) && entry.products.iter().all(|p| !p.to_string_lossy().contains("drizzle")));
+}
+
+#[test]
+fn a_drizzle_scale_out_of_range_is_refused_before_any_pixel_and_a_drop_shrink_is_clamped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let c = drizzle_on(ln_off(cfg()));
+    let out = tmp.path().join("out");
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+    let mut four = c.clone();
+    four.drizzle.scale = 4;
+    let err = stack_error(&env, &work, &four, &frames, &measured, &registered, None, &out);
+    assert!(err.contains("drizzle scale must be 1, 2 or 3"), "{err}");
+    no_stack_products(&work, &out);
+
+    let mut shrunk = c.clone();
+    shrunk.drizzle.drop_shrink = 0.3;
+    shrunk.drizzle.kernel = DrizzleKernel::Circle;
+    let report = stack(&env.ctx(&work), &shrunk, &frames, &measured, &registered, None, &out, OutputFormat::Fits).unwrap();
+    assert!(report.warnings.iter().any(|w| w.contains("clamped to 0.5")), "{:?}", report.warnings);
+    let d = report.drizzle.unwrap();
+    assert_eq!(d.stats.drop_shrink, 0.5);
+    assert_eq!(number_of(&d.master, "SLM_DRZP"), 0.5);
+    assert_eq!(keys(&d.master)["SLM_DRZK"], "circle");
+}
+
+#[test]
+fn a_stack_without_the_drizzle_removes_the_drizzled_outputs_of_an_earlier_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let c = drizzle_on(ln_off(cfg()));
+    let out = tmp.path().join("out");
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+    let first = stack(&env.ctx(&work), &c, &frames, &measured, &registered, None, &out, OutputFormat::Fits).unwrap();
+    let drizzled = first.drizzle.unwrap();
+    assert!(drizzled.master.is_file() && drizzled.weight_map.as_ref().unwrap().is_file());
+    let mut off = c.clone();
+    off.drizzle.enabled = false;
+    let second = stack(&env.ctx(&work), &off, &frames, &measured, &registered, None, &out, OutputFormat::Fits).unwrap();
+    assert!(second.drizzle.is_none());
+    assert!(!drizzled.master.exists() && !drizzled.weight_map.unwrap().exists(), "they describe another master");
+}
+
+/// A raw 16-bit light of the 150-star field moved by `(dx, dy)`: a mono frame, or an RGGB mosaic of it when `osc`.
+fn raw_star_light(dir: &Path, k: usize, dx: f64, dy: f64, osc: bool) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let stars: Vec<(f64, f64, f64)> = grid_stars().iter().map(|&(x, y, a)| (x + dx, y + dy, a)).collect();
+    let mut field = starloom::test_support::gaussian_field(768, 512, &stars, 1.8, 0.08);
+    starloom::test_support::add_noise(&mut field, 0.002, 300 + k as u64);
+    let values: Vec<u16> = field
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let (x, y) = (i % 768, i / 768);
+            let factor = if !osc {
+                1.0
+            } else {
+                match (x % 2, y % 2) {
+                    (0, 0) => 0.9,
+                    (1, 1) => 0.6,
+                    _ => 1.0,
+                }
+            };
+            (100.0 + f64::from(v.clamp(0.0, 1.0)) * factor * 50_000.0).round() as u16
+        })
+        .collect();
+    let mut extra = vec![("EXPTIME", "300.0".to_string()), ("DATE-OBS", format!("'2024-01-15T20:{:02}:00'", 10 + k))];
+    if osc {
+        extra.extend([("BAYERPAT", "'RGGB'".to_string()), ("XBAYROFF", "0".to_string()), ("YBAYROFF", "0".to_string())]);
+    }
+    write_u16(&dir.join(format!("Light_{k:04}.fits")), 768, 512, &values, &extra)
+}
+
+/// `n` raw lights and one group: a master dark built from eight raw dark frames.
+fn raw_group(dir: &Path, n: usize, osc: bool) -> CalGroup {
+    let shifts = [(0.0, 0.0), (3.0, -2.0), (-4.0, 5.0), (1.0, 2.0), (-2.0, -3.0), (5.0, 0.0)];
+    let lights: Vec<PathBuf> = (0..n).map(|k| raw_star_light(&dir.join("lights"), k, shifts[k].0, shifts[k].1, osc)).collect();
+    std::fs::create_dir_all(dir.join("darks")).unwrap();
+    let darks: Vec<PathBuf> = (0..8)
+        .map(|k| {
+            let v: Vec<u16> = (0..768 * 512).map(|i| 100 + (6.0 * noise(k as u64 + 1, i)) as u16).collect();
+            write_u16(&dir.join("darks").join(format!("Dark_{k:04}.fits")), 768, 512, &v, &[("EXPTIME", "300.0".to_string())])
+        })
+        .collect();
+    group(lights, Some(CalSource::Raw(darks)), None, None)
+}
+
+fn all_planes_bits(path: &Path) -> Vec<u32> {
+    let r = PlaneReader::open(path).unwrap();
+    (0..r.channels()).flat_map(|c| bits(&r.read_plane(c).unwrap())).collect()
+}
+
+#[test]
+fn stacking_the_stages_one_by_one_equals_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    // Local normalization drives the rejection (the default), and the drizzle is on: every stage runs.
+    let mut c = cfg();
+    c.drizzle.enabled = true;
+    let g = [raw_group(&tmp.path().join("raw"), 6, false)];
+    let reference = ReferenceChoice::Auto;
+
+    let work_run = tmp.path().join("work-run");
+    let out_run = tmp.path().join("out-run");
+    let ran: RunReport = run(&env.ctx(&work_run), &g, &c, &reference, &out_run, OutputFormat::Fits).unwrap();
+    assert_eq!(ran.calibrate.frames.len(), 6);
+    assert_eq!(ran.calibrate.masters.len(), 1, "the raw darks were built into a master first");
+    assert!(ran.normalize.as_ref().is_some_and(|n| n.status == NormalizeStatus::Ran));
+    assert!(calibrated_dir(&work_run).join("c_Light_0000.fits").is_file());
+
+    // The same stages, called one by one on the same inputs.
+    let work = tmp.path().join("work-stages");
+    let out = tmp.path().join("out-stages");
+    let ctx = env.ctx(&work);
+    let calibrated = calibrate(&ctx, &c, &g, &c.calibration, &work.join("calibrated"), OutputFormat::Fits).unwrap();
+    let frames: Vec<PathBuf> = calibrated.frames.iter().map(|f| f.output.clone()).collect();
+    let measured = measure(&ctx, &c, &frames, None, false).unwrap();
+    let registered = register(&ctx, &frames, &measured, &reference, &c, false).unwrap();
+    let normalized = normalize(&ctx, &frames, &measured, &registered, &c).unwrap();
+    let stacked = stack(&ctx, &c, &frames, &measured, &registered, Some(&normalized), &out, OutputFormat::Fits).unwrap();
+
+    assert_eq!(ran.stack.stats.included, stacked.stats.included);
+    assert_eq!(all_planes_bits(&ran.stack.master), all_planes_bits(&stacked.master), "the masters' data differ");
+    let (a, b) = (ran.stack.drizzle.as_ref().unwrap(), stacked.drizzle.as_ref().unwrap());
+    assert_eq!(all_planes_bits(&a.master), all_planes_bits(&b.master), "the drizzled masters' data differ");
+    // `run` is the stages and no more: the same products and no extra entry.
+    let entries = |w: &Path| Manifest::load(w).unwrap().entry(Stage::Stack).unwrap().products.len();
+    assert_eq!(entries(&work_run), entries(&work));
+}
+
+/// An OSC run's config: the drizzle on with `bayer` as given, local rejection off to keep the chain short.
+fn osc_cfg(bayer: bool) -> AlgorithmConfig {
+    let mut c = ln_off(cfg());
+    c.drizzle.enabled = true;
+    c.drizzle.bayer = bayer;
+    c
+}
+
+#[test]
+fn bayer_drizzle_without_mosaics_is_refused_with_the_flag_to_use() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let g = [raw_group(&tmp.path().join("raw"), 4, true)];
+    // The run is made with no Bayer drizzle, so calibrate keeps no mosaic.
+    let work = tmp.path().join("work");
+    let ran = run(&env.ctx(&work), &g, &osc_cfg(false), &ReferenceChoice::Auto, &tmp.path().join("out"), OutputFormat::Fits).unwrap();
+    let names = dir_entries(&calibrated_dir(&work));
+    assert!(names.iter().all(|n| n.ends_with("_d.fits")), "no mosaic was kept: {names:?}");
+    assert_eq!(ran.stack.drizzle.as_ref().unwrap().stats.out_width, 1536, "the plain drizzle ran");
+
+    // A stack that asks for the Bayer drizzle is refused before it reads a pixel, and names the flag.
+    let frames: Vec<PathBuf> = ran.calibrate.frames.iter().map(|f| f.output.clone()).collect();
+    let out = tmp.path().join("bayer-out");
+    let err = stack_error(&env, &work, &osc_cfg(true), &frames, &ran.measure, &ran.register, None, &out);
+    assert!(err.contains("--keep-mosaic"), "{err}");
+    assert!(!master_path(&out, OutputFormat::Fits).exists() && !out.join("master_drizzle2x.fits").exists());
+    assert!(!work.join(".tmp").join("stack-rej").exists(), "no bitmap set was made");
+}
+
+#[test]
+fn run_keeps_the_mosaics_exactly_when_a_bayer_drizzle_wants_them_and_stacks_from_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let g = [raw_group(&tmp.path().join("raw"), 4, true)];
+    let work = tmp.path().join("work");
+    let ran = run(&env.ctx(&work), &g, &osc_cfg(true), &ReferenceChoice::Auto, &tmp.path().join("out"), OutputFormat::Fits).unwrap();
+    let mut names = dir_entries(&calibrated_dir(&work));
+    names.sort();
+    assert_eq!(names[..2], ["c_Light_0000.fits", "c_Light_0000_d.fits"], "{names:?}");
+    assert_eq!(names.len(), 8, "a mosaic beside each debayered frame");
+    let d = ran.stack.drizzle.as_ref().expect("the Bayer drizzle ran");
+    assert_eq!(d.stats.frames, 4);
+    assert!(ran.stack.warnings.iter().all(|w| !w.contains("debayered planes")), "every frame deposited from its mosaic: {:?}", ran.stack.warnings);
+
+    // The deposit is the mosaic's: another image than the plain drizzle of the same frames.
+    let frames: Vec<PathBuf> = ran.calibrate.frames.iter().map(|f| f.output.clone()).collect();
+    let plain = stack(&env.ctx(&work), &osc_cfg(false), &frames, &ran.measure, &ran.register, None, &tmp.path().join("plain"), OutputFormat::Fits).unwrap();
+    assert_ne!(all_planes_bits(&d.master), all_planes_bits(&plain.drizzle.unwrap().master));
+
+    // With the drizzle's Bayer option off no mosaic is kept.
+    let work2 = tmp.path().join("work2");
+    run(&env.ctx(&work2), &g, &osc_cfg(false), &ReferenceChoice::Auto, &tmp.path().join("out2"), OutputFormat::Fits).unwrap();
+    assert!(dir_entries(&calibrated_dir(&work2)).iter().all(|n| n.ends_with("_d.fits")));
+}
