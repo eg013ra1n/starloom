@@ -1,0 +1,1 @@
+Two 64 x 64 unsigned 16-bit fixtures from rustafits' PR #5 (`tests/fpack/`, Apache-2.0): `fpack_rice_u16.fz` is `u16_stars.fits` tile-compressed by the reference `fpack` (RICE_1, lossless), so a calibrated frame from either is the same data.

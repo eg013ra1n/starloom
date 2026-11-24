@@ -3,11 +3,13 @@
 //! This is Athenaeum's master build (`run_build`) without the catalog. The frames may be plain FITS, XISF, or
 //! compressed (`.fz`, `.fits.gz`, an extension HDU): the integration engine reads a plain 2-D FITS frame directly and
 //! spills every other file through the image reader (P2-R22). The master is raw sensor DN (`XisfBounds::Adu16`), the
-//! header is the standard card set of an Athenaeum master with `SLM_*` cards in place of its own provenance cards (P2-R6), and a flat carries
-//! its normalization constants (`SLM_FNRM`, and for a CFA flat `SLM_FNR`/`SLM_FNG`/`SLM_FNB`).
+//! header is the card set of an Athenaeum master (`build_master_cards`) with `SLM_*` cards in place of its own cards
+//! (P2-R6), carrying the values Athenaeum writes, and a flat carries its normalization constants (`SLM_FNRM`, and for
+//! a CFA flat `SLM_FNR`/`SLM_FNG`/`SLM_FNB`).
 //!
-//! Every mismatch a master can be refused for (a frame with more than one plane, frames of different sizes, a
-//! pre-calibration master of another size) is found from the headers, before any pixel is read.
+//! Every mismatch a master can be refused for (too few frames, a frame with more than one plane, frames of different
+//! sizes, a pre-calibration master of another size) is found from the headers, before any pixel is read. Every
+//! decoding step runs on the context's pool (SL-9).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +24,7 @@ use crate::fits_writer::{write_image_f32, Card, CardValue, OutputFormat, XisfBou
 use crate::integration::band_budget::{MAX_BUDGET_BYTES, MIN_BUDGET_BYTES};
 use crate::integration::banded::{BandPlanes, BandSource};
 use crate::integration::cfa::{flat_channel_norms, CfaGeometry};
-use crate::integration::combine::{Combination, IntegrationRecipe, Rejection};
+use crate::integration::combine::IntegrationRecipe;
 use crate::integration::engine::{integrate_bias_like, integrate_flat, EngineProgress, FlatPrecal};
 use crate::integration::io_policy::IoPolicy;
 use crate::integration::recipe::resolve_recipe;
@@ -36,6 +38,12 @@ use crate::storage_class::{read_concurrency, StorageClass};
 
 /// The fewest frames a master is built from (Athenaeum's `MIN_MASTER_FRAMES`).
 pub const MIN_MASTER_FRAMES: usize = 3;
+
+/// The refusal of a raw set with fewer than [`MIN_MASTER_FRAMES`] frames, in the words of Athenaeum's
+/// `validate_buildable_set`.
+pub(crate) fn too_few_frames(n: usize) -> String {
+    format!("calibration set has {n} frames \u{2014} at least {MIN_MASTER_FRAMES} are required to build a master")
+}
 
 /// Which calibration frame a master is built from. Dark flats are built as [`MasterKind::Dark`] or
 /// [`MasterKind::Bias`]: the stage only needs to know whether the frames are flats.
@@ -59,7 +67,8 @@ impl MasterKind {
         }
     }
 
-    /// The master's `IMAGETYP` card, spelled as Athenaeum's master builder spells it.
+    /// The master's `IMAGETYP` card, spelled as Athenaeum's master builder spells it. Dark frames that declare
+    /// themselves dark flats make a `Master Dark Flat` instead (this kind is also how dark flats are built).
     pub fn imagetyp(self) -> &'static str {
         match self {
             MasterKind::Bias => "Master Bias",
@@ -126,7 +135,7 @@ pub(crate) fn frame_facts(path: &Path) -> Result<FrameFacts> {
 /// The refusal of a frame with more than one plane, in the words the integration reader uses for the same frame.
 pub(crate) fn planes_refusal(path: &Path, planes: i64) -> String {
     format!(
-        "{}: {planes}-channel image; frames must be 1-channel for calibration (CFA mosaics stay 1-channel; debayered files cannot be calibrated)",
+        "{}: {planes}-channel image \u{2014} frames must be 1-channel for calibration (CFA mosaics stay 1-channel; debayered files cannot be calibrated)",
         path.display()
     )
 }
@@ -203,6 +212,7 @@ struct Consolidated {
     roworder: Option<String>,
     temp_mean: Option<f64>,
     temp_span: Option<(f64, f64)>,
+    dark_flat: bool,
     date_midpoint: Option<DateTime<Utc>>,
     origin: Option<(i64, i64)>,
 }
@@ -221,6 +231,9 @@ impl Consolidated {
                 tracing::warn!(field, "bayer metadata disagrees across the master's frames; using the majority");
             }
         }
+        // Frames that declare themselves dark flats (the catalog's `DarkFlat` type) make a master dark flat.
+        let (imagetyp, _) = majority(facts.iter().filter_map(|f| f.imagetyp.clone()));
+        let dark_flat = imagetyp.as_deref() == Some("DarkFlat");
         let temps: Vec<f64> = facts.iter().filter_map(|f| f.ccd_temp).filter(|t| t.is_finite()).collect();
         let temp_mean = (!temps.is_empty()).then(|| temps.iter().sum::<f64>() / temps.len() as f64);
         let temp_span = temps.iter().copied().reduce(f64::min).zip(temps.iter().copied().reduce(f64::max));
@@ -257,6 +270,7 @@ impl Consolidated {
             roworder,
             temp_mean,
             temp_span,
+            dark_flat,
             date_midpoint,
             origin,
         }
@@ -267,35 +281,20 @@ fn card(keyword: &str, value: CardValue, comment: &str) -> Result<Card> {
     Ok(Card::new(keyword, value)?.with_comment(comment))
 }
 
-/// The recipe as `SLM_REC` spells it: the combination, the rejection and its numbers, lower case and ASCII
-/// (`average winsorized 3 3`).
-pub fn recipe_text(recipe: &IntegrationRecipe) -> String {
-    let combination = match recipe.combination {
-        Combination::Average => "average",
-        Combination::Median => "median",
-    };
-    let rejection = match recipe.rejection {
-        Rejection::None => "none".to_string(),
-        Rejection::PercentileClip { low, high } => format!("percentile {low} {high}"),
-        Rejection::SigmaClip { sigma_low, sigma_high } => format!("sigma {sigma_low} {sigma_high}"),
-        Rejection::WinsorizedSigma { sigma_low, sigma_high } => format!("winsorized {sigma_low} {sigma_high}"),
-        Rejection::LinearFitClip { sigma_low, sigma_high } => format!("linearfit {sigma_low} {sigma_high}"),
-        Rejection::MinMax { low, high } => format!("minmax {low} {high}"),
-        Rejection::Esd { outliers_fraction, alpha, low_relaxation } => {
-            format!("esd {outliers_fraction} {alpha} {low_relaxation}")
-        }
-        Rejection::Rcr { limit } => format!("rcr {limit}"),
-    };
-    format!("{combination} {rejection}")
+/// The recipe as `SLM_REC` spells it: exactly what Athenaeum writes in its recipe card (`ATH_REJ`), the recipe's own
+/// description and the number of frames (`Average | Winsorized sigma (3.0/3.0) n=24`).
+pub fn recipe_text(recipe: &IntegrationRecipe, n: usize) -> String {
+    format!("{} n={n}", recipe.describe())
 }
 
-/// The standard cards of a master, in the order Athenaeum's master builder writes its own, with `SLM_*` cards in place of
-/// its provenance cards: the frame type, the creator, the acquisition facts the frames agree on, the CFA geometry, the
-/// sub-frame origin, then the build's own cards (`SLM_N`, `SLM_REC`, the three common cards, the temperature span) and,
-/// for a flat, the normalization constants. The two provenance cards that name catalog rows (the source set and the
-/// member hash) have no counterpart.
+/// The cards of a master, in the order Athenaeum's master builder (`build_master_cards`) writes its own, with `SLM_*`
+/// cards in place of its provenance cards: the frame type, the creator, the acquisition facts the frames agree on, the
+/// CFA geometry, the sub-frame origin, then the twins of `ATH_N` and `ATH_REJ` (`SLM_N`, `SLM_REC`, with Athenaeum's
+/// values), the three common cards (`SLM_VER` stands for `ATH_VER`), the temperature span and, for a flat, the
+/// normalization constants. The two provenance cards that name catalog rows (the source set and the member hash) have
+/// no counterpart.
 fn master_cards(
-    kind: MasterKind,
+    imagetyp: &str,
     c: &Consolidated,
     n: usize,
     recipe: &str,
@@ -304,7 +303,7 @@ fn master_cards(
     channel_norms: Option<[f64; 3]>,
 ) -> Result<Vec<Card>> {
     let mut cards = vec![
-        card("IMAGETYP", CardValue::Str(kind.imagetyp().to_string()), "type of image")?,
+        card("IMAGETYP", CardValue::Str(imagetyp.to_string()), "type of image")?,
         card(
             "SWCREATE",
             CardValue::Str(format!("starloom {}", env!("CARGO_PKG_VERSION"))),
@@ -381,7 +380,7 @@ fn master_cards(
         cards.push(card("YORGSUBF", CardValue::Integer(y), "Subframe Y position")?);
     }
     cards.push(card(SLM_N, CardValue::Integer(n as i64), "number of integrated frames")?);
-    cards.push(card(SLM_REC, CardValue::Str(recipe.to_string()), "integration recipe")?);
+    cards.push(card(SLM_REC, CardValue::Str(recipe.to_string()), "rejection algorithm")?);
     cards.extend(common_cards(cfg_hash)?);
     if let Some((min, max)) = c.temp_span {
         cards.push(card(SLM_TMIN, CardValue::Real(min), "[degC] min member CCD-TEMP")?);
@@ -430,7 +429,7 @@ fn load_precal_master(path: &Path, scratch: &Path) -> Result<FlatPrecal> {
 /// Returns their facts, in order.
 fn check_frames(frames: &[PathBuf]) -> Result<Vec<FrameFacts>> {
     if frames.len() < MIN_MASTER_FRAMES {
-        bail!("{} frame(s) given; at least {MIN_MASTER_FRAMES} are required to build a master", frames.len());
+        bail!("{}", too_few_frames(frames.len()));
     }
     let mut facts = Vec::with_capacity(frames.len());
     let mut first: Option<(&Path, (i64, i64))> = None;
@@ -469,6 +468,9 @@ fn check_frames(frames: &[PathBuf]) -> Result<Vec<FrameFacts>> {
 /// of different sizes and a pre-calibration master of another size, each naming the files. The raw frames may be
 /// compressed; the master is always plain DN.
 ///
+/// The frames are integrated in the order of their full paths (Athenaeum integrates a set `ORDER BY` the file path), so
+/// the sums do not depend on the order they were given in. Every step that decodes a pixel runs on the context's pool.
+///
 /// A master leaves no manifest entry: the caller decides where it goes and what to record. The scratch folder is
 /// `<work>/.tmp/`.
 pub fn build_master(
@@ -484,6 +486,9 @@ pub fn build_master(
     if precal.is_some() && kind != MasterKind::Flat {
         bail!("a pre-calibration applies to flats only, not to {} frames", kind.name());
     }
+    let mut sorted: Vec<PathBuf> = frames.to_vec();
+    sorted.sort_by_cached_key(|p| p.to_string_lossy().into_owned());
+    let frames = sorted.as_slice();
     let facts = check_frames(frames)?;
     if let (Some(FlatPrecalSource::Master(p)), Some(size)) = (precal, facts.iter().find_map(size_of)) {
         let pf = frame_facts(p)?;
@@ -506,24 +511,28 @@ pub fn build_master(
     let scratch = scratch_dir(ctx)?;
     let io = io_policy(ctx);
     let recipe = resolve_recipe(recipe, kind.frame_type(), frames.len() as i64);
-    let recipe_text = recipe_text(&recipe);
+    let recipe_text = recipe_text(&recipe, frames.len());
     tracing::info!(kind = kind.name(), frames = frames.len(), recipe = %recipe_text, "master build started");
 
     let on_band = |_band: usize, _bands: usize, done: u64, total: u64| {
         ctx.progress.step("master", usize::try_from(done).unwrap_or(usize::MAX), usize::try_from(total).unwrap_or(usize::MAX));
     };
     let progress = EngineProgress { on_band: &on_band, on_combine: &|_, _, _, _| {} };
-    let integrated = if kind == MasterKind::Flat {
-        let precal = match precal {
-            Some(FlatPrecalSource::Master(p)) => load_precal_master(p, &scratch)?,
-            Some(FlatPrecalSource::SyntheticBias(b)) => FlatPrecal::SyntheticBias(*b),
-            None => FlatPrecal::None,
-        };
-        integrate_flat(frames, &precal, recipe, &ctx.pool, &scratch, ctx.cancel, progress, io)
-    } else {
-        integrate_bias_like(frames, recipe, &ctx.pool, &scratch, ctx.cancel, progress, io)
-    }
-    .map_err(|e| anyhow::anyhow!("integrating the {} frames failed: {e}", kind.name()))?;
+    // Everything that decodes a pixel (the pre-calibration master, the engine's spill of a compressed frame) runs on the
+    // caller's pool: a decode outside it would make rayon build its global pool on every core (SL-9).
+    let integrated = ctx.pool.install(|| -> Result<_> {
+        if kind == MasterKind::Flat {
+            let precal = match precal {
+                Some(FlatPrecalSource::Master(p)) => load_precal_master(p, &scratch)?,
+                Some(FlatPrecalSource::SyntheticBias(b)) => FlatPrecal::SyntheticBias(*b),
+                None => FlatPrecal::None,
+            };
+            integrate_flat(frames, &precal, recipe, &ctx.pool, &scratch, ctx.cancel, progress, io)
+        } else {
+            integrate_bias_like(frames, recipe, &ctx.pool, &scratch, ctx.cancel, progress, io)
+        }
+        .map_err(|e| anyhow::anyhow!("integrating the {} frames failed: {e}", kind.name()))
+    })?;
     ctx.check_cancelled()?;
 
     // Undefined (non-finite) samples are dropped from the stack, never a failure; the person hears about the loss.
@@ -549,8 +558,9 @@ pub fn build_master(
     } else {
         None
     };
+    let imagetyp = if kind == MasterKind::Dark && consolidated.dark_flat { "Master Dark Flat" } else { kind.imagetyp() };
     let cards = master_cards(
-        kind,
+        imagetyp,
         &consolidated,
         frames.len(),
         &recipe_text,

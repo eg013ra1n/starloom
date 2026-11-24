@@ -13,7 +13,8 @@ pub const SLM_CFG: &str = "SLM_CFG";
 /// The pipeline version ([`PIPELINE_VERSION`]) that wrote the file.
 pub const SLM_PLV: &str = "SLM_PLV";
 
-/// The recipe a master calibration frame was integrated with, spelled for a person (`average winsorized 3 3`).
+/// The recipe a master calibration frame was integrated with, as Athenaeum writes it in `ATH_REJ`: the recipe's own
+/// description and the frame count (`Average | Winsorized sigma (3.0/3.0) n=24`).
 pub const SLM_REC: &str = "SLM_REC";
 /// The number of frames a master calibration frame integrates.
 pub const SLM_N: &str = "SLM_N";
@@ -21,6 +22,32 @@ pub const SLM_N: &str = "SLM_N";
 pub const SLM_TMIN: &str = "SLM_TMIN";
 /// The highest member `CCD-TEMP` of a master calibration frame, in degrees Celsius.
 pub const SLM_TMAX: &str = "SLM_TMAX";
+/// The file name of the light a calibrated light was made from, percent-encoded as Athenaeum encodes it (the twin of
+/// `ATH_CSRN`).
+pub const SLM_CSRN: &str = "SLM_CSRN";
+/// The file name of the master dark a calibrated light was made with (the twin of `ATH_CDRK`; no catalog id).
+pub const SLM_CDRK: &str = "SLM_CDRK";
+/// The file name of the master flat a calibrated light was made with (the twin of `ATH_CFLT`).
+pub const SLM_CFLT: &str = "SLM_CFLT";
+/// The file name of the master bias a calibrated light was made with, present only when no dark applied (the twin of
+/// `ATH_CBIA`).
+pub const SLM_CBIA: &str = "SLM_CBIA";
+/// The flat-normalization divisor a calibrated light was divided by, `1.0` when off; in per-channel mode the mosaic
+/// weighted blend of the three (the twin of `ATH_CFNM`).
+pub const SLM_CFNM: &str = "SLM_CFNM";
+/// The output pedestal, in DN, a calibrated light carries (always written; the twin of `ATH_CPED`).
+pub const SLM_CPED: &str = "SLM_CPED";
+/// Whether the flat was normalized per CFA channel (the twin of `ATH_CCFA`; written only when it was).
+pub const SLM_CCFA: &str = "SLM_CCFA";
+/// The red per-channel flat-normalization divisor (the twin of `ATH_CFNR`).
+pub const SLM_CFNR: &str = "SLM_CFNR";
+/// The green per-channel flat-normalization divisor (the twin of `ATH_CFNG`).
+pub const SLM_CFNG: &str = "SLM_CFNG";
+/// The blue per-channel flat-normalization divisor (the twin of `ATH_CFNB`).
+pub const SLM_CFNB: &str = "SLM_CFNB";
+/// The per-tail trim fraction of the whole-frame trimmed-mean flat normalization (the twin of `ATH_CTRM`; written only
+/// in that mode with a flat applied).
+pub const SLM_CTRM: &str = "SLM_CTRM";
 /// The number of hot pixels the cosmetic pass replaced in a calibrated light (present when the pass ran).
 pub const SLM_CHPX: &str = "SLM_CHPX";
 /// The debayer a calibrated light went through (`VNG`; present only after a debayer).

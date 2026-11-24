@@ -89,3 +89,8 @@ walkdir = "2"
 [[test]]
 name = "pipeline_e2e"
 required-features = ["pipeline"]
+
+# The pool test builds rayon's global pool on purpose to prove no stage built it, so it runs alone in its own process.
+[[test]]
+name = "pipeline_pool"
+required-features = ["pipeline"]

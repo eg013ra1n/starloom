@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use astroimage::header::{header_key_map, header_text, HeaderKeyMap};
+use astroimage::header::{header_key_map, header_text, HeaderFormat, HeaderKeyMap};
 
 use crate::calibration_library::light_cal::FlatCardReader;
 use crate::fits_writer::bayer::Bayer;
@@ -25,9 +25,23 @@ pub const SLM_FNB: &str = "SLM_FNB";
 /// The divisor a calibrated light was scaled by (`scale_divisor_for_bitpix` of the raw light's bit depth).
 pub const SLM_CSCL: &str = "SLM_CSCL";
 
-/// The header key map of a file, or `None` when it cannot be read (every caller treats that as "no card").
+/// Whether a file's name says its FITS is compressed (`.fz`, `.gz`): the shape Athenaeum's reader of its own cards does
+/// not read (it reads the plain FITS header text only).
+pub(crate) fn has_compressed_name(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("fz") || e.eq_ignore_ascii_case("gz"))
+}
+
+/// The header key map of a plain FITS file, or `None` when it cannot be read or is not plain FITS (every caller treats
+/// that as "no card"). An XISF flat and a compressed one are not read: Athenaeum's reader of its own flat cards takes
+/// the FITS header text only, so such a flat has its constants recomputed from its pixels there, and so here.
 fn key_map(path: &Path) -> Option<HeaderKeyMap> {
+    if has_compressed_name(path) {
+        return None;
+    }
     let (format, text) = header_text(path).ok()?;
+    if format != HeaderFormat::Fits {
+        return None;
+    }
     Some(header_key_map(format, &text))
 }
 

@@ -48,7 +48,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-pub use calibrate::{calibrate, preflight, CalibrateReport, CalibratedFrameReport};
+pub use calibrate::{calibrate, preflight, preflight_with, CalibrateReport, CalibratedFrameReport};
 pub use cards::{common_cards, SLM_CFG, SLM_PLV, SLM_VER};
 pub use config::{config_hash, effective_config, ln_runs, stage_hash};
 pub use formats::{

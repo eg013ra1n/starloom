@@ -386,6 +386,21 @@ pub fn calibrate_light_compute_with_cards(
     calibrate_light_compute_budgeted(inputs, preloaded, cancel, MIN_BUDGET_BYTES, cards)
 }
 
+/// [`calibrate_light_compute_with_cards`] with the flat-normalization divisor already resolved: `divisor` is what
+/// [`resolve_flat_norm_divisor_with`] returned for this flat, this light's mosaic phase and these options, so a batch
+/// of lights sharing a flat resolves it once instead of once per light (the plane of a flat without stamped constants
+/// is read once). The pixels are the same as when the call resolves it itself; the divisor is used only when a flat is
+/// applied with normalization on, as the resolved one would be.
+pub fn calibrate_light_compute_resolved(
+    inputs: &LightCalInputs,
+    preloaded: Option<&PreloadedMasters>,
+    cards: &dyn FlatCardReader,
+    divisor: FlatNormDivisor,
+    cancel: &AtomicBool,
+) -> Result<(CalibratedFrame, LightCalOutcome), IntegrationError> {
+    calibrate_light_compute_inner(inputs, preloaded, cancel, MIN_BUDGET_BYTES, cards, Some(divisor))
+}
+
 /// Calibrates one light frame like [`calibrate_light_compute_with_cards`], with the band-memory budget as a
 /// parameter (`band_budget_bytes`, in bytes), so a caller can force a multi-band run on a small fixture.
 ///
@@ -398,6 +413,18 @@ pub fn calibrate_light_compute_budgeted(
     cancel: &AtomicBool,
     band_budget_bytes: usize,
     cards: &dyn FlatCardReader,
+) -> Result<(CalibratedFrame, LightCalOutcome), IntegrationError> {
+    calibrate_light_compute_inner(inputs, preloaded, cancel, band_budget_bytes, cards, None)
+}
+
+/// The body of [`calibrate_light_compute_budgeted`]; `resolved` is a divisor the caller already resolved.
+fn calibrate_light_compute_inner(
+    inputs: &LightCalInputs,
+    preloaded: Option<&PreloadedMasters>,
+    cancel: &AtomicBool,
+    band_budget_bytes: usize,
+    cards: &dyn FlatCardReader,
+    resolved: Option<FlatNormDivisor>,
 ) -> Result<(CalibratedFrame, LightCalOutcome), IntegrationError> {
     // Subtrahend: dark preferred, else bias (spec §2 fallback order). The
     // calstat prefix records what was actually subtracted.
@@ -421,14 +448,17 @@ pub fn calibrate_light_compute_budgeted(
     // read so a missing flat or an unusable constant fails fast, before any
     // output work.
     let divisor = match (&inputs.flat_path, inputs.flat_norm) {
-        (Some(flat), true) => resolve_flat_norm_divisor_with(
-            flat,
-            &inputs.scratch_dir,
-            inputs.flat_norm_mode,
-            &inputs.params,
-            inputs.cfa_geometry,
-            cards,
-        )?,
+        (Some(flat), true) => match resolved {
+            Some(divisor) => divisor,
+            None => resolve_flat_norm_divisor_with(
+                flat,
+                &inputs.scratch_dir,
+                inputs.flat_norm_mode,
+                &inputs.params,
+                inputs.cfa_geometry,
+                cards,
+            )?,
+        },
         _ => FlatNormDivisor::Global(1.0),
     };
     let flat_norm_divisor = divisor.global_value();

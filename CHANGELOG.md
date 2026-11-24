@@ -38,15 +38,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destination. Manual mode: the stages are not linked, and nothing compares one stage's products with another's. A
   non-finite float is stored as `null`, as Athenaeum's metrics payloads store it, and reads back as NaN.
 - The `master` and `calibrate` stages of `pipeline`: `build_master` (a bias, dark or flat from raw frames, Athenaeum's
-  master build without the catalog; the automatic recipe, the flat's `SLM_FNRM` and per-channel `SLM_FNR`/`SLM_FNG`/
-  `SLM_FNB`, `SLM_REC`, `SLM_N`, the common `SLM_*` cards and no `ATH_*` card), `calibrate` (a group's lights to
-  calibrated frames: dark else bias, flat, hot pixels from the master dark, the VNG debayer of an OSC light, copy-through
-  cards, `SLM_CSCL`, `SLM_LCV`, `SLM_CHPX`, `SLM_CDBM`; the manifest entry records each raw light's facts) and `preflight`
-  (every mismatch found from headers alone before any pixel is read: a calibration frame of another size and a frame
-  with more than one plane are refused, another sub-frame origin and a flat of another CFA phase are warned about).
-  Raw frames may be compressed (`.fz`, `.fits.gz`, an extension HDU), and the products are plain FITS. `SlmFlatCards`
+  master build without the catalog: the automatic recipe, the frames integrated in the order of their full paths, the
+  cards of `build_master_cards` with `SLM_*` in place of its own: `SLM_REC` holds what `ATH_REJ` holds (`Average |
+  Winsorized sigma (3.0/3.0) n=24`), `SLM_N`, `SLM_TMIN`/`SLM_TMAX`, the flat's `SLM_FNRM` and per-channel `SLM_FNR`/
+  `SLM_FNG`/`SLM_FNB`, the common `SLM_*` cards, `Master Dark Flat` for dark-flat frames, and no `ATH_*` card),
+  `calibrate` (a group's lights to calibrated frames: dark else bias, flat, hot pixels from the master dark, the VNG
+  debayer of an OSC light, the CFA mosaic kept beside it with `keep_mosaic` as `execute_generation` writes it; the
+  header is Athenaeum's with an `SLM_*` twin of every `ATH_*` card but `ATH_CSRC`: `SLM_CSRN`, `SLM_CDRK`/`SLM_CFLT`/
+  `SLM_CBIA` (the master's file name), `SLM_CSCL`, `SLM_CFNM`, `SLM_CPED`, `SLM_LCV`, `SLM_CCFA`/`SLM_CFNR`/`SLM_CFNG`/
+  `SLM_CFNB`, `SLM_CTRM`, then `SLM_CDBM` and `SLM_CHPX`; a hot-pixel map per master dark and a flat divisor per (flat,
+  mosaic phase) for the run; the scale divisor 65535 where Athenaeum's probe reads no depth; a group with no master, or
+  a bias alone with the fallback off, has its lights excluded with Athenaeum's reasons; the dark guard's warning; the
+  manifest entry records each raw light's facts) and `preflight`/`preflight_with` (every mismatch found from headers
+  alone before any pixel is read: a calibration frame of another size, a frame with more than one plane, a raw set
+  with fewer than three frames and a flat pre-calibration of another size are refused, another sub-frame origin and a
+  flat of another CFA phase are warned about). Raw frames may be compressed (`.fz`, `.fits.gz`, an extension HDU), and
+  the products are plain FITS. Every step that decodes a pixel runs on the caller's pool (SL-9). `SlmFlatCards`
   (`calibration_library::flat_cards`, engine layer) reads a master flat's stamped constants as Athenaeum's reader of
-  its own cards does, CFA phase check included.
+  its own cards does (plain FITS only), CFA phase check included. `light_cal::calibrate_light_compute_resolved` takes a
+  flat divisor the caller resolved once for a batch.
 - `[profile.release]` is `lto = "thin"`, `codegen-units = 4`, Athenaeum's release profile, for a standalone build.
 
 ## [0.1.2] — 2026-11-23

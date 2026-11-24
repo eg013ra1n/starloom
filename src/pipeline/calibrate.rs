@@ -8,14 +8,22 @@
 //! output folder as plain FITS (or XISF when asked). The lights and the calibration frames may be compressed
 //! (P2-R22).
 //!
-//! The header of a calibrated light is the light's copy-through cards ([`COPY_THROUGH_KEYWORDS`]), `IMAGETYP`,
-//! `CALSTAT` and the `SLM_*` cards of P2-R6; no card of Athenaeum's own is read or written (SL-8).
+//! The header of a calibrated light is Athenaeum's (`build_light_cal_cards`, then the debayer and hot-pixel cards
+//! `execute_generation` appends) with `SLM_*` cards in place of every `ATH_*` card but `ATH_CSRC`: `IMAGETYP`,
+//! `CALSTAT`, the light's copy-through cards ([`COPY_THROUGH_KEYWORDS`]), the three common cards, then `SLM_CSRN`
+//! (the light's file name), `SLM_CDRK` / `SLM_CFLT` / `SLM_CBIA` (the file name of the master applied, no catalog
+//! id), `SLM_CSCL`, `SLM_CFNM`, `SLM_CPED`, `SLM_LCV`, the per-channel flat cards and `SLM_CTRM` when they apply, and
+//! last `SLM_CDBM` and `SLM_CHPX`. No card of Athenaeum's own is read or written (SL-8).
 //!
-//! [`preflight`] is the whole of the checking, from headers alone (SL-20): a size mismatch and a frame with more than
-//! one plane are refused, another sub-frame origin and a flat of another CFA phase are warned about. [`calibrate`]
-//! runs it first, so a mismatch fails before the first pixel and leaves nothing in the output folder.
+//! [`preflight`] is the whole of the checking, from headers alone (SL-20): a size mismatch, a frame with more than
+//! one plane and a raw calibration set too small for a master are refused, another sub-frame origin and a flat of
+//! another CFA phase are warned about, and a group whose lights cannot be calibrated at all (no master, or a bias
+//! alone with the fallback off) has them excluded with Athenaeum's reason, as its run excludes them. [`calibrate`]
+//! runs it first, so a mismatch fails before the first pixel and leaves nothing in the output folder. Every step that
+//! decodes a pixel runs on the context's pool (SL-9).
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -26,22 +34,30 @@ use rayon::prelude::*;
 
 use crate::calibration_library::cosmetic::{apply_hot_pixel_correction, hot_pixel_map_from_dark, HotPixelMapOutcome};
 use crate::calibration_library::debayer::{compute_calstat, debayer_plane, drop_mosaic_cards};
-use crate::calibration_library::flat_cards::{SlmFlatCards, SLM_CSCL};
+use crate::calibration_library::flat_cards::{has_compressed_name, SlmFlatCards, SLM_CSCL};
 use crate::calibration_library::light_cal::{
-    calibrate_light_compute_with_cards, preload_master_plane, scale_divisor_for_bitpix, BiasFallback, LightCalInputs,
+    calibrate_light_compute_resolved, calibrate_light_compute_with_cards, preload_master_plane,
+    resolve_flat_norm_divisor_with, scale_divisor_for_bitpix, BiasFallback, FlatNormDivisor, LightCalInputs,
     PreloadedMasters,
 };
 use crate::calibration_library::options::CalibratedLightOptions;
+use crate::calibration_library::params::FlatNormMode;
 use crate::calibration_library::COPY_THROUGH_KEYWORDS;
-use crate::fits_writer::{write_image_f32_with, Card, CardValue, Durability, OutputFormat, XisfBounds};
+use crate::fits_writer::{
+    write_fits_f32_with, write_image_f32_with, Card, CardValue, Durability, OutputFormat, XisfBounds,
+};
 use crate::integration::banded::probe_bitpix;
 use crate::integration::cfa::CfaGeometry;
-use crate::pipeline::cards::{common_cards, version_card, SLM_CDBM, SLM_CHPX};
+use crate::pipeline::cards::{
+    common_cards, version_card, SLM_CBIA, SLM_CCFA, SLM_CDBM, SLM_CDRK, SLM_CFLT, SLM_CFNB, SLM_CFNG, SLM_CFNM, SLM_CFNR,
+    SLM_CHPX, SLM_CPED, SLM_CSRN, SLM_CTRM,
+};
 use crate::pipeline::config::config_hash;
 use crate::pipeline::formats::{commit_stage, part_path, Entry};
 use crate::pipeline::inputs::{frame_stem, order_lights, CalGroup, CalSource, FlatPrecalSource};
 use crate::pipeline::master::{
-    build_master, cfa_of, frame_facts, planes_refusal, scratch_dir, size_of, MasterKind, MasterReport,
+    build_master, cfa_of, frame_facts, planes_refusal, scratch_dir, size_of, too_few_frames, MasterKind, MasterReport,
+    MIN_MASTER_FRAMES,
 };
 use crate::pipeline::{Ctx, Stage};
 use crate::stacking::config::AlgorithmConfig;
@@ -87,7 +103,14 @@ pub struct CalibrateReport {
 struct Checked {
     warnings: Vec<String>,
     facts: BTreeMap<PathBuf, FrameFacts>,
+    /// Per group: why its lights are excluded from the run (`None`: they are calibrated).
+    excluded: Vec<Option<&'static str>>,
 }
+
+/// The reason a light with no calibration frame at all is excluded (Athenaeum's `check_applicable`).
+const NO_MASTERS: &str = "no calibration masters available (dark/flat/bias unbuilt or unlinked)";
+/// The reason a light with a bias but no dark is excluded when the bias fallback is off (Athenaeum's `check_applicable`).
+const NO_DARK_MASTER: &str = "no dark master (bias fallback disabled)";
 
 fn facts_of<'a>(cache: &'a mut BTreeMap<PathBuf, FrameFacts>, path: &Path) -> Result<&'a FrameFacts> {
     if !cache.contains_key(path) {
@@ -131,9 +154,16 @@ fn source_paths(source: &CalSource) -> Vec<&Path> {
     }
 }
 
-fn check(groups: &[CalGroup]) -> Result<Checked> {
+/// Whether a flat is normalized per CFA channel for a light of this mosaic phase: the options ask for it, the light
+/// is a mosaic and the statistic is the central third (the whole-frame trimmed mean has no per-channel form).
+fn per_channel_applies(opts: &CalibratedLightOptions, light: Option<CfaGeometry>) -> bool {
+    opts.flat_norm && opts.params.cfa_flat_scaling && opts.flat_norm_mode != FlatNormMode::TrimmedMeanWhole && light.is_some()
+}
+
+fn check(groups: &[CalGroup], opts: &CalibratedLightOptions) -> Result<Checked> {
     let mut cache: BTreeMap<PathBuf, FrameFacts> = BTreeMap::new();
     let mut warnings = Vec::new();
+    let mut excluded: Vec<Option<&'static str>> = Vec::with_capacity(groups.len());
     if groups.is_empty() {
         bail!("no groups to calibrate");
     }
@@ -142,8 +172,38 @@ fn check(groups: &[CalGroup]) -> Result<Checked> {
         if group.lights.is_empty() {
             bail!("group {n} has no lights");
         }
-        if group.dark.is_none() && group.flat.is_none() && group.bias.is_none() {
-            bail!("group {n} has no calibration frames (give a dark, a flat or a bias)");
+        // Athenaeum's run excludes these lights (one reason each) and calibrates the rest, so nothing here is read.
+        let reason = if group.dark.is_none() && group.flat.is_none() && group.bias.is_none() {
+            Some(NO_MASTERS)
+        } else if group.dark.is_none() && group.bias.is_some() && opts.params.bias_fallback == BiasFallback::SkipFrame {
+            Some(NO_DARK_MASTER)
+        } else {
+            None
+        };
+        excluded.push(reason);
+        if let Some(reason) = reason {
+            for light in &group.lights {
+                warnings.push(format!("{}: {reason}", light.display()));
+            }
+            continue;
+        }
+        // The bias is read only when there is no dark (the raw-master-dark convention), so only then is it checked.
+        let bias = if group.dark.is_some() { None } else { group.bias.as_ref() };
+        let roles = [("dark", group.dark.as_ref()), ("flat", group.flat.as_ref()), ("bias", bias)];
+        // A raw set too small for a master is refused here, before group 1's lights are calibrated and group 2's
+        // build fails.
+        for (role, source) in roles {
+            if let Some(CalSource::Raw(frames)) = source {
+                if frames.len() < MIN_MASTER_FRAMES {
+                    bail!("group {n} {role}: {}", too_few_frames(frames.len()));
+                }
+            }
+        }
+        if let (Some(CalSource::Master(flat)), Some(_)) = (&group.flat, &group.flat_precal) {
+            warnings.push(format!(
+                "group {n}: the flat pre-calibration is ignored, the flat {} is already a master",
+                flat.display()
+            ));
         }
         let mut lights: Vec<(&Path, FrameFacts)> = Vec::with_capacity(group.lights.len());
         for light in &group.lights {
@@ -153,9 +213,7 @@ fn check(groups: &[CalGroup]) -> Result<Checked> {
             }
             lights.push((light.as_path(), facts));
         }
-        // The bias is read only when there is no dark (the raw-master-dark convention), so only then is it checked.
-        let bias = if group.dark.is_some() { None } else { group.bias.as_ref() };
-        for (role, source) in [("dark", group.dark.as_ref()), ("flat", group.flat.as_ref()), ("bias", bias)] {
+        for (role, source) in roles {
             let Some(source) = source else { continue };
             let mut origin_warned = false;
             let mut cfa_warned = false;
@@ -190,13 +248,18 @@ fn check(groups: &[CalGroup]) -> Result<Checked> {
                     }
                     if role == "flat" && !cfa_warned && !same_cfa(cfa_of(&cal), cfa_of(light)) {
                         cfa_warned = true;
+                        // The constants are measured again only where they are per channel.
+                        let again = if per_channel_applies(opts, cfa_of(light)) {
+                            "; its per-channel constants are measured again from its pixels"
+                        } else {
+                            ""
+                        };
                         warnings.push(format!(
-                            "Flat {} has another CFA pattern or phase than light {} ({} against {}); \
-                             its per-channel constants are measured again from its pixels",
+                            "Flat {} has another CFA pattern or phase than light {} ({} against {}){again}",
                             path.display(),
                             light_path.display(),
                             cfa_label(cfa_of(&cal)),
-                            cfa_label(cfa_of(light))
+                            cfa_label(cfa_of(light)),
                         ));
                     }
                 }
@@ -224,28 +287,41 @@ fn check(groups: &[CalGroup]) -> Result<Checked> {
             }
         }
     }
-    Ok(Checked { warnings, facts: cache })
+    Ok(Checked { warnings, facts: cache, excluded })
 }
 
 /// Checks every group's lights and calibration frames against each other from their headers alone, before any pixel is
-/// read (SL-20), and returns the warnings.
+/// read (SL-20), and returns the warnings; [`preflight_with`] with the default options.
+pub fn preflight(groups: &[CalGroup]) -> Result<Vec<String>> {
+    preflight_with(groups, &CalibratedLightOptions::default())
+}
+
+/// [`preflight`] under the options a run would use (the bias fallback, the flat normalization and its per-channel
+/// switch decide which lights are excluded and what a CFA mismatch means).
 ///
 /// Refused, naming the files:
 /// - a calibration frame whose size differs from a light's: "Calibration does not fit the frame size — dark `file` is
 ///   W×H, light `file` is W×H";
 /// - a light or a calibration frame with more than one plane (the reason the integration reader gives);
-/// - a group with no calibration frame at all, and a flat pre-calibration master of another size than its flats.
+/// - a raw calibration set with fewer than [`MIN_MASTER_FRAMES`] frames, naming the group and the role ("calibration
+///   set has 2 frames — at least 3 are required to build a master");
+/// - a flat pre-calibration master of another size than its flats.
 ///
 /// Warned about:
 /// - another sub-frame origin: "Calibration at another sub-frame origin — ...";
 /// - a flat whose CFA pattern or phase differs from the light's (its per-channel constants are then measured again
-///   from its pixels).
+///   from its pixels, where they are per channel);
+/// - a flat pre-calibration given with a master flat (it is ignored);
+/// - the lights of a group Athenaeum's run would exclude, one warning each with its reason: a group with no dark,
+///   flat or bias at all ("no calibration masters available (dark/flat/bias unbuilt or unlinked)"), and one with a bias
+///   alone when [`BiasFallback::SkipFrame`] is set ("no dark master (bias fallback disabled)"). Nothing of such a
+///   group is read.
 ///
 /// Exposure, temperature, filter and gain are not checked. Only the bias a light is calibrated with (none when there
 /// is a dark) is checked. A compressed frame is read for its logical header, so its size is the image's; a gzip file
 /// is inflated to find it, which takes seconds per frame (P2-R22), and a truncated one fails here, naming it.
-pub fn preflight(groups: &[CalGroup]) -> Result<Vec<String>> {
-    check(groups).map(|c| c.warnings)
+pub fn preflight_with(groups: &[CalGroup], opts: &CalibratedLightOptions) -> Result<Vec<String>> {
+    check(groups, opts).map(|c| c.warnings)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -291,6 +367,169 @@ fn source_cards(light: &Path, facts: &FrameFacts) -> Result<Vec<Card>> {
     Ok(cards)
 }
 
+/// A name as Athenaeum writes it into a header card (`encode_ident`): every byte outside printable ASCII, the space
+/// and `%` itself as `%XX`, so a non-ASCII file name survives the writer's ASCII-only rule and reads back unchanged.
+fn encode_ident(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if (0x21..=0x7E).contains(&b) && b != b'%' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The file name of a path, as the identity cards carry it.
+fn file_name_of(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// Whether the logical header of a light says what its depth is, not the physical one the direct reader probes: a
+/// compressed light (`.fz`, gzip by name or by its first bytes) or one whose image sits in an extension behind an empty
+/// primary (`NAXIS = 0`).
+fn depth_is_logical(path: &Path) -> bool {
+    if has_compressed_name(path) {
+        return true;
+    }
+    let mut block = [0u8; 2880];
+    let read = std::fs::File::open(path).and_then(|mut f| f.read(&mut block)).unwrap_or(0);
+    if read >= 2 && block[0] == 0x1f && block[1] == 0x8b {
+        return true;
+    }
+    block[..read].chunks(80).take_while(|card| !card.starts_with(b"END")).any(|card| {
+        card.starts_with(b"NAXIS   =")
+            && std::str::from_utf8(&card[9..]).ok().and_then(|v| v.split('/').next()).and_then(|v| v.trim().parse::<i64>().ok()) == Some(0)
+    })
+}
+
+/// The divisor a light's pixels are scaled by (`SLM_CSCL`). Athenaeum's rule (`light_bitpix`, then
+/// `scale_divisor_for_bitpix`): the depth `probe_bitpix` reads off a plain 2-D primary HDU, and the historic 65535 for
+/// everything it cannot read (a 3-D one-plane file, a header over 64 blocks, an XISF) whatever the real depth. A
+/// compressed or extension-HDU light is not a file Athenaeum catalogues and the direct reader cannot probe it; it
+/// takes the depth `probe_bitpix` would give the same image stored plain, its logical `BITPIX` (P2-R22).
+fn scale_divisor_of(light: &Path, facts: &FrameFacts) -> f64 {
+    let bitpix = probe_bitpix(light).or_else(|| {
+        (facts.format == HeaderFormat::Fits && depth_is_logical(light))
+            .then_some(facts.bitpix)
+            .flatten()
+            .and_then(|b| i32::try_from(b).ok())
+    });
+    scale_divisor_for_bitpix(bitpix)
+}
+
+/// What the header of one calibrated light says about how it was made.
+struct LightCardInputs<'a> {
+    light: &'a Path,
+    facts: &'a FrameFacts,
+    cfg_hash: &'a str,
+    calstat: &'a str,
+    /// The master applied, by file name: the dark; the bias only when no dark applies; the flat.
+    dark: Option<&'a Path>,
+    flat: Option<&'a Path>,
+    bias: Option<&'a Path>,
+    scale_divisor: f64,
+    flat_norm_divisor: f64,
+    flat_channel_divisors: Option<[f64; 3]>,
+    pedestal_dn: f64,
+    trim_fraction: Option<f64>,
+}
+
+/// The calibrated light's header before the debayer and hot-pixel cards: Athenaeum's `build_light_cal_cards` with
+/// `SLM_*` in place of every `ATH_*` card but `ATH_CSRC`, in its order (`IMAGETYP`, `CALSTAT`, the copy-through cards,
+/// the common cards, then the twins of `ATH_CSRN`, `ATH_CDRK`, `ATH_CFLT`, `ATH_CBIA`, `ATH_CSCL`, `ATH_CFNM`,
+/// `ATH_CPED`, `ATH_CVER`, `ATH_CCFA` / `ATH_CFNR` / `ATH_CFNG` / `ATH_CFNB`, `ATH_CTRM`). The master references hold
+/// the master's file name, with no catalog id; string cards carry no comment, as there.
+fn light_cards(i: &LightCardInputs<'_>) -> Result<Vec<Card>> {
+    let mut cards = vec![
+        Card::new("IMAGETYP", CardValue::Str("Light Frame".to_string()))?.with_comment("type of image"),
+        Card::new("CALSTAT", CardValue::Str(i.calstat.to_string()))?.with_comment("calibration state (B/D/F)"),
+    ];
+    cards.extend(source_cards(i.light, i.facts)?);
+    cards.extend(common_cards(i.cfg_hash)?);
+    cards.push(Card::new(SLM_CSRN, CardValue::Str(encode_ident(&file_name_of(i.light))))?);
+    for (keyword, master) in [(SLM_CDRK, i.dark), (SLM_CFLT, i.flat), (SLM_CBIA, i.bias)] {
+        if let Some(master) = master {
+            cards.push(Card::new(keyword, CardValue::Str(encode_ident(&file_name_of(master))))?);
+        }
+    }
+    cards.push(Card::new(SLM_CSCL, CardValue::Real(i.scale_divisor))?.with_comment("numeric-scale divisor applied"));
+    cards.push(Card::new(SLM_CFNM, CardValue::Real(i.flat_norm_divisor))?.with_comment("flat-norm divisor (1.0 = off)"));
+    cards.push(Card::new(SLM_CPED, CardValue::Real(i.pedestal_dn))?.with_comment("output pedestal (DN)"));
+    cards.push(version_card("SLM_LCV")?);
+    if let Some(ch) = i.flat_channel_divisors {
+        cards.push(Card::new(SLM_CCFA, CardValue::Logical(true))?.with_comment("flat normalized per CFA channel"));
+        for (keyword, v) in [(SLM_CFNR, ch[0]), (SLM_CFNG, ch[1]), (SLM_CFNB, ch[2])] {
+            cards.push(Card::new(keyword, CardValue::Real(v))?.with_comment("per-channel flat-norm divisor"));
+        }
+    }
+    if let Some(trim) = i.trim_fraction {
+        cards.push(Card::new(SLM_CTRM, CardValue::Real(trim))?.with_comment("flat-norm trim fraction per tail"));
+    }
+    Ok(cards)
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The dark guard's sentence
+// ---------------------------------------------------------------------------------------------------------------
+
+/// The share of a frame's pixels at or below zero right after the dark or bias was subtracted from which Athenaeum's
+/// dark guard calls the subtraction lost (`DARK_SUBTRACTION_LOST_BAR`).
+const DARK_SUBTRACTION_LOST_BAR: f64 = 0.9;
+
+/// One header number as a warning shows it (Athenaeum's `card_number`).
+fn card_number(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        let s = format!("{v:.2}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+/// A header card's values as text for a warning: one value, a range, or "not recorded" (Athenaeum's `card_text`).
+fn card_text(name: &str, values: &[Option<f64>]) -> String {
+    let mut recorded: Vec<f64> = values.iter().flatten().copied().filter(|v| v.is_finite()).collect();
+    recorded.sort_by(f64::total_cmp);
+    recorded.dedup();
+    let partial = if values.iter().any(Option::is_none) { " (not recorded on some)" } else { "" };
+    match recorded.as_slice() {
+        [] => format!("{name} not recorded"),
+        [v] => format!("{name} {}{partial}", card_number(*v)),
+        [lo, .., hi] => format!("{name} {}\u{2013}{}{partial}", card_number(*lo), card_number(*hi)),
+    }
+}
+
+/// The warning for a group whose dark or bias left most pixels at or below zero in `lost` of the `counted` frames that
+/// had one subtracted, in Athenaeum's words (`subtraction_run_sentence`); `None` when no frame is lost.
+fn subtraction_lost_warning(group: usize, counted: usize, lost: &[(&FrameFacts, &str)]) -> Option<String> {
+    if lost.is_empty() {
+        return None;
+    }
+    let (mut lost_dark, mut lost_bias) = (false, false);
+    for (_, calstat) in lost {
+        if calstat.starts_with("BD") {
+            lost_dark = true;
+        } else if calstat.starts_with('B') {
+            lost_bias = true;
+        }
+    }
+    let subtrahend = match (lost_dark, lost_bias) {
+        (true, false) => "dark",
+        (false, true) => "bias",
+        _ => "dark or bias",
+    };
+    let offsets: Vec<Option<f64>> = lost.iter().map(|(f, _)| f.offset).collect();
+    let gains: Vec<Option<f64>> = lost.iter().map(|(f, _)| f.gain).collect();
+    Some(format!(
+        "group {group}: dark subtraction left most pixels at or below zero in {} of {counted} frames ({}, {}) \u{2014} the {subtrahend} is brighter than the lights; check that its gain and offset match those of the lights",
+        lost.len(),
+        card_text("OFFSET", &offsets),
+        card_text("GAIN", &gains),
+    ))
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // The stage
 // ---------------------------------------------------------------------------------------------------------------
@@ -303,6 +542,11 @@ struct Job<'a> {
     debayer: bool,
     part: PathBuf,
     dest: PathBuf,
+    /// Where the calibrated CFA mosaic is kept (`keep_mosaic`, a frame being debayered): its part file and destination.
+    mosaic: Option<(PathBuf, PathBuf)>,
+    /// The flat-normalization divisor, resolved once per (flat, mosaic phase) for the run; `Some` when a flat is
+    /// applied with normalization on.
+    divisor: Option<FlatNormDivisor>,
 }
 
 /// The masters a group's lights are calibrated with, as files.
@@ -317,6 +561,16 @@ struct Done {
     report: CalibratedFrameReport,
     part: PathBuf,
     dest: PathBuf,
+    mosaic: Option<(PathBuf, PathBuf)>,
+}
+
+/// The key a flat-normalization divisor is memoized under: the flat and the light's mosaic phase folded as
+/// [`CfaGeometry::same_phase`] folds it (pattern, offsets modulo 2), the only part of the geometry the divisor depends
+/// on (Athenaeum's `DivisorKey`).
+type DivisorKey = (PathBuf, Option<(&'static str, i64, i64)>);
+
+fn divisor_key(flat: &Path, cfa: Option<CfaGeometry>) -> DivisorKey {
+    (flat.to_path_buf(), cfa.map(|g| (g.pattern.as_str(), g.xoff.rem_euclid(2), g.yoff.rem_euclid(2))))
 }
 
 /// A calibration source as one master file: a master is used as it is, raw frames are built into `masters_dir`.
@@ -343,7 +597,8 @@ fn resolve_master(
     }
 }
 
-/// Calibrates one light and writes it to its part file.
+/// Calibrates one light and writes it (and, when asked, its CFA mosaic) to its part files.
+#[allow(clippy::too_many_arguments)]
 fn calibrate_one(
     ctx: &Ctx<'_>,
     cfg_hash: &str,
@@ -356,10 +611,7 @@ fn calibrate_one(
     hot_maps: &HashMap<PathBuf, Arc<HotPixelMapOutcome>>,
 ) -> Result<Done> {
     let name = |e: &dyn std::fmt::Display| anyhow!("{}: {e}", job.light.display());
-    // The scale divisor of the light's own bit depth. A compressed frame's depth is its logical one, from its header.
-    let bitpix = probe_bitpix(job.light)
-        .or_else(|| (job.facts.format == HeaderFormat::Fits).then_some(job.facts.bitpix).flatten().and_then(|b| i32::try_from(b).ok()));
-    let scale_divisor = scale_divisor_for_bitpix(bitpix);
+    let scale_divisor = scale_divisor_of(job.light, job.facts);
 
     let dark_applied = masters.dark.is_some();
     let bias_applied = !dark_applied && masters.bias.is_some();
@@ -380,8 +632,11 @@ fn calibrate_one(
         cards: Vec::new(),
         scratch_dir: scratch.to_path_buf(),
     };
-    let (mut frame, outcome) =
-        calibrate_light_compute_with_cards(&inputs, Some(preloaded), &SlmFlatCards, ctx.cancel).map_err(|e| name(&e))?;
+    let (mut frame, outcome) = match job.divisor {
+        Some(divisor) => calibrate_light_compute_resolved(&inputs, Some(preloaded), &SlmFlatCards, divisor, ctx.cancel),
+        None => calibrate_light_compute_with_cards(&inputs, Some(preloaded), &SlmFlatCards, ctx.cancel),
+    }
+    .map_err(|e| name(&e))?;
 
     // The cosmetic pass: only a master dark can say which pixels are defective.
     let mut hot_pixels_replaced = None;
@@ -394,28 +649,48 @@ fn calibrate_one(
     }
     ctx.check_cancelled()?;
 
+    // The header up to the debayer: the same cards head the mosaic and the debayered frame.
+    let base = light_cards(&LightCardInputs {
+        light: job.light,
+        facts: job.facts,
+        cfg_hash,
+        calstat: &calstat,
+        dark: if dark_applied { masters.dark.as_deref() } else { None },
+        flat: masters.flat.as_deref(),
+        bias: if bias_applied { masters.bias.as_deref() } else { None },
+        scale_divisor,
+        flat_norm_divisor: outcome.flat_norm_divisor,
+        flat_channel_divisors: outcome.flat_channel_divisors,
+        pedestal_dn: opts.params.pedestal_dn,
+        trim_fraction: (masters.flat.is_some() && opts.flat_norm && opts.flat_norm_mode == FlatNormMode::TrimmedMeanWhole)
+            .then_some(opts.params.trim_fraction),
+    })?;
+    let hot_card = match hot_pixels_replaced {
+        Some(n) => Some(Card::new(SLM_CHPX, CardValue::Integer(n as i64))?.with_comment("hot pixels replaced")),
+        None => None,
+    };
+    let durability = if opts.skip_fsync { Durability::Volatile } else { Durability::Durable };
+
+    // The calibrated CFA mosaic, a second output of this generation: written before the debayer, from the buffer the
+    // debayer is about to read. Its header keeps the mosaic cards and carries no `SLM_CDBM`; it is always plain FITS.
+    if let Some((part, _)) = &job.mosaic {
+        let mut mosaic_cards = base.clone();
+        mosaic_cards.extend(hot_card.clone());
+        write_fits_f32_with(part, frame.width, frame.height, 1, &frame.data, &mosaic_cards, durability)
+            .map_err(|e| anyhow!("writing {}: {e}", part.display()))?;
+    }
+
     let (data, channels) = match (job.debayer, job.cfa) {
         (true, Some(geom)) => (debayer_plane(&frame.data, frame.width, frame.height, geom, Some(&ctx.pool)), 3usize),
         _ => (std::mem::take(&mut frame.data), 1usize),
     };
-
-    let mut cards = vec![
-        Card::new("IMAGETYP", CardValue::Str("Light Frame".to_string()))?.with_comment("type of image"),
-        Card::new("CALSTAT", CardValue::Str(calstat.clone()))?.with_comment("calibration state (B/D/F)"),
-    ];
-    cards.extend(source_cards(job.light, job.facts)?);
-    cards.extend(common_cards(cfg_hash)?);
-    cards.push(Card::new(SLM_CSCL, CardValue::Real(scale_divisor))?.with_comment("numeric-scale divisor applied"));
-    cards.push(version_card("SLM_LCV")?);
+    let mut cards = base;
     if channels == 3 {
         drop_mosaic_cards(&mut cards);
         cards.push(Card::new(SLM_CDBM, CardValue::Str("VNG".to_string()))?);
     }
-    if let Some(n) = hot_pixels_replaced {
-        cards.push(Card::new(SLM_CHPX, CardValue::Integer(n as i64))?.with_comment("hot pixels replaced"));
-    }
+    cards.extend(hot_card);
 
-    let durability = if opts.skip_fsync { Durability::Volatile } else { Durability::Durable };
     write_image_f32_with(&job.part, frame.width, frame.height, channels, &data, &cards, format, XisfBounds::Unit, durability)
         .map_err(|e| anyhow!("writing {}: {e}", job.dest.display()))?;
     tracing::debug!(
@@ -439,6 +714,7 @@ fn calibrate_one(
         },
         part: job.part.clone(),
         dest: job.dest.clone(),
+        mosaic: job.mosaic.clone(),
     })
 }
 
@@ -460,15 +736,23 @@ fn remove_parts(parts: impl IntoIterator<Item = PathBuf>) {
 /// config whose hash every product and the manifest entry record. Raw calibration frames are first built into masters
 /// under `<work>/masters/` ([`build_master`], automatic recipe, plain FITS).
 ///
-/// [`preflight`] runs first and its warnings go to the context's progress sink and the report; a refusal fails the
-/// run before the output folder is created. The products are built beside their destinations and moved into place
-/// together with the entry ([`commit_stage`]), so a failure (a truncated gzip light, a cancel) leaves no product and no
-/// entry. The entry's products are the calibrated frames in the frame order of P2-R10 (`DATE-OBS`, then input
-/// position, across all groups), and its `sources` hold each raw light's facts, keyed by the product.
+/// [`preflight_with`] runs first and its warnings go to the context's progress sink and the report; a refusal fails
+/// the run before the output folder is created. The lights of a group Athenaeum's run would exclude (no dark, flat or
+/// bias; a bias alone with [`BiasFallback::SkipFrame`]) are excluded with its reason as a warning each and nothing is
+/// written for them; when no light is left the run fails. The products are built beside their destinations and moved
+/// into place together with the entry ([`commit_stage`]), so a failure (a truncated gzip light, a cancel) leaves no
+/// product and no entry. The entry's products are the calibrated frames in the frame order of P2-R10 (`DATE-OBS`, then
+/// input position, across the calibrated lights of all groups), and its `sources` hold each raw light's facts, keyed by
+/// the product.
 ///
-/// Lights are calibrated on the context's pool, as many at once as its memory budget allows. The command clears the
-/// scratch folder (`<work>/.tmp/`) when it starts ([`begin_writing`](crate::pipeline::begin_writing)). `keep_mosaic` is
-/// not honoured here: no mosaic is written beside a debayered frame.
+/// With `opts.keep_mosaic`, an OSC light that is debayered also leaves its calibrated, hot-pixel-corrected CFA mosaic
+/// beside it as `c_<name>.fits` (the mono spelling of the same name, always plain FITS, the mosaic's cards, no
+/// `SLM_CDBM`), as Athenaeum's `execute_generation` does for a Bayer drizzle; the mosaic is no product of the entry.
+///
+/// Lights are calibrated on the context's pool, as many at once as its memory budget allows; everything that decodes
+/// a pixel runs there (SL-9). A hot-pixel map is measured once per master dark and a flat-normalization divisor
+/// resolved once per (flat, mosaic phase) for the whole run. The command clears the scratch folder (`<work>/.tmp/`)
+/// when it starts ([`begin_writing`](crate::pipeline::begin_writing)).
 pub fn calibrate(
     ctx: &Ctx<'_>,
     cfg: &AlgorithmConfig,
@@ -477,38 +761,55 @@ pub fn calibrate(
     out_dir: &Path,
     format: OutputFormat,
 ) -> Result<CalibrateReport> {
-    let checked = check(groups)?;
+    let checked = check(groups, opts)?;
     let mut report = CalibrateReport { warnings: checked.warnings.clone(), ..CalibrateReport::default() };
     for w in &checked.warnings {
         ctx.progress.warn(w);
     }
     for (gi, g) in groups.iter().enumerate() {
-        if g.dark.is_none() && g.bias.is_some() && opts.params.bias_fallback == BiasFallback::SkipFrame {
-            bail!("group {}: no dark master (bias fallback disabled)", gi + 1);
+        if let Some(reason) = checked.excluded[gi] {
+            for light in &g.lights {
+                tracing::warn!(src = %light.display(), error = %reason, "calibration failed; frame excluded");
+            }
         }
     }
     let out_dir = std::path::absolute(out_dir).with_context(|| format!("cannot make {} absolute", out_dir.display()))?;
     ctx.check_cancelled()?;
 
-    // The frame order every stage keeps, across all groups; and the names the products will have.
-    let all: Vec<(usize, &PathBuf)> = groups.iter().enumerate().flat_map(|(gi, g)| g.lights.iter().map(move |l| (gi, l))).collect();
+    // The frame order every stage keeps, across the calibrated groups; and the names the products will have.
+    let all: Vec<(usize, &PathBuf)> = groups
+        .iter()
+        .enumerate()
+        .filter(|(gi, _)| checked.excluded[*gi].is_none())
+        .flat_map(|(gi, g)| g.lights.iter().map(move |l| (gi, l)))
+        .collect();
+    if all.is_empty() {
+        bail!("no light could be calibrated: every light was excluded ({})", checked.excluded.iter().flatten().next().copied().unwrap_or(NO_MASTERS));
+    }
     let all_paths: Vec<PathBuf> = all.iter().map(|(_, l)| (*l).clone()).collect();
     let all_facts: Vec<FrameFacts> = all.iter().map(|(_, l)| checked.facts[*l].clone()).collect();
     let order = order_lights(&all_paths, &all_facts)?;
     let ext = format.extension();
     let mut dests: Vec<PathBuf> = Vec::with_capacity(all.len());
+    let mut mosaics: Vec<Option<PathBuf>> = Vec::with_capacity(all.len());
     let mut seen: HashMap<String, usize> = HashMap::new();
     for (i, light) in all_paths.iter().enumerate() {
         let debayer = opts.debayer_osc && cfa_of(&all_facts[i]).is_some();
-        let file = format!("c_{}{}.{ext}", frame_stem(light), if debayer { "_d" } else { "" });
-        if let Some(first) = seen.insert(file.to_lowercase(), i) {
-            bail!(
-                "{} and {} would both become {file}; give lights with distinct names",
-                all_paths[first].display(),
-                light.display()
-            );
+        let stem = frame_stem(light);
+        let file = format!("c_{stem}{}.{ext}", if debayer { "_d" } else { "" });
+        // The mosaic is the same stem under the mono spelling, always FITS; no other product may take its name.
+        let mosaic = (opts.keep_mosaic && debayer).then(|| format!("c_{stem}.{}", OutputFormat::Fits.extension()));
+        for name in std::iter::once(&file).chain(mosaic.as_ref()) {
+            if let Some(first) = seen.insert(name.to_lowercase(), i) {
+                bail!(
+                    "{} and {} would both become {name}; give lights with distinct names",
+                    all_paths[first].display(),
+                    light.display()
+                );
+            }
         }
         dests.push(out_dir.join(file));
+        mosaics.push(mosaic.map(|m| out_dir.join(m)));
     }
 
     std::fs::create_dir_all(&out_dir).with_context(|| format!("cannot create {}", out_dir.display()))?;
@@ -521,9 +822,16 @@ pub fn calibrate(
     let budget = usize::try_from(ctx.memory_budget_bytes).unwrap_or(usize::MAX);
 
     let mut finished: Vec<(usize, Done)> = Vec::with_capacity(total);
-    let run = |finished: &mut Vec<(usize, Done)>, report: &mut CalibrateReport| -> Result<()> {
+    // Per run, as Athenaeum caches them: a hot-pixel map per master dark (a dark shared by two groups is measured and
+    // warned about once) and a flat-normalization divisor per (flat, mosaic phase).
+    let mut hot_maps: HashMap<PathBuf, Arc<HotPixelMapOutcome>> = HashMap::new();
+    let mut divisors: HashMap<DivisorKey, FlatNormDivisor> = HashMap::new();
+    let mut run = |finished: &mut Vec<(usize, Done)>, report: &mut CalibrateReport| -> Result<()> {
         let mut index = 0usize;
         for (gi, group) in groups.iter().enumerate() {
+            if checked.excluded[gi].is_some() {
+                continue;
+            }
             let n = gi + 1;
             let first_index = index;
             index += group.lights.len();
@@ -539,19 +847,21 @@ pub fn calibrate(
             }
             ctx.check_cancelled()?;
 
-            // The master dark's hot pixels, measured once for the group; only the dark can say which pixels are defective.
-            let mut hot_maps: HashMap<PathBuf, Arc<HotPixelMapOutcome>> = HashMap::new();
+            // The master dark's hot pixels, measured once per dark for the run; only the dark can say which pixels are
+            // defective.
             if let (true, Some(dark)) = (opts.hot_pixel_correction, &masters.dark) {
-                let measured = hot_pixel_map_from_dark(dark, &scratch).unwrap_or_else(|e| {
-                    tracing::warn!(path = %dark.display(), error = %format!("{e:#}"), "measuring the master dark failed; hot-pixel correction refused");
-                    HotPixelMapOutcome::Refused(format!("measuring it failed: {e:#}"))
-                });
-                if let HotPixelMapOutcome::Refused(reason) = &measured {
-                    let message = format!("Hot-pixel correction skipped for {}: {reason}", dark.display());
-                    ctx.progress.warn(&message);
-                    report.warnings.push(message);
+                if !hot_maps.contains_key(dark) {
+                    let measured = hot_pixel_map_from_dark(dark, &scratch).unwrap_or_else(|e| {
+                        tracing::warn!(path = %dark.display(), error = %format!("{e:#}"), "measuring the master dark failed; hot-pixel correction refused");
+                        HotPixelMapOutcome::Refused(format!("measuring it failed: {e:#}"))
+                    });
+                    if let HotPixelMapOutcome::Refused(reason) = &measured {
+                        let message = format!("Hot-pixel correction skipped for {}: {reason}", dark.display());
+                        ctx.progress.warn(&message);
+                        report.warnings.push(message);
+                    }
+                    hot_maps.insert(dark.clone(), Arc::new(measured));
                 }
-                hot_maps.insert(dark.clone(), Arc::new(measured));
             }
 
             // The group's masters decoded once, shared by every light (a failure is not fatal: the engine reads the
@@ -567,20 +877,41 @@ pub fn calibrate(
                 }
             }
 
-            let jobs: Vec<Job<'_>> = (0..group.lights.len())
+            let mut jobs: Vec<Job<'_>> = (0..group.lights.len())
                 .map(|k| {
                     let i = first_index + k;
                     let cfa = cfa_of(&all_facts[i]);
+                    let debayer = opts.debayer_osc && cfa.is_some();
                     Job {
                         light: group.lights[k].as_path(),
                         facts: &all_facts[i],
                         cfa,
-                        debayer: opts.debayer_osc && cfa.is_some(),
+                        debayer,
                         part: part_path(&dests[i]),
                         dest: dests[i].clone(),
+                        mosaic: mosaics[i].as_ref().map(|m| (part_path(m), m.clone())),
+                        divisor: None,
                     }
                 })
                 .collect();
+
+            // The flat's normalization divisor, resolved once per (flat, mosaic phase): a flat without stamped
+            // constants is read once, not once per light.
+            if let (Some(flat), true) = (&masters.flat, opts.flat_norm) {
+                for job in &mut jobs {
+                    let key = divisor_key(flat, job.cfa);
+                    let divisor = match divisors.get(&key) {
+                        Some(d) => *d,
+                        None => {
+                            let d = resolve_flat_norm_divisor_with(flat, &scratch, opts.flat_norm_mode, &opts.params, job.cfa, &SlmFlatCards)
+                                .map_err(|e| anyhow!("{}: {e}", flat.display()))?;
+                            divisors.insert(key, d);
+                            d
+                        }
+                    };
+                    job.divisor = Some(divisor);
+                }
+            }
 
             // How many lights at once: what the budget holds after the resident masters, one frame's planes each.
             let px = all_facts[first_index..index].iter().filter_map(|f| size_of(f).map(|(w, h)| (w * h) as usize)).max().unwrap_or(0);
@@ -589,6 +920,7 @@ pub fn calibrate(
             let resident = preloaded.planes.len().saturating_mul(px).saturating_mul(4);
             let concurrency = (budget.saturating_sub(resident) / per_frame).clamp(1, threads);
 
+            let group_start = finished.len();
             for (chunk_no, chunk) in jobs.chunks(concurrency).enumerate() {
                 ctx.check_cancelled()?;
                 let results: Vec<Result<Done>> = ctx.pool.install(|| {
@@ -614,11 +946,31 @@ pub fn calibrate(
                     return Err(e);
                 }
             }
+
+            // The dark guard: a group whose dark or bias left most pixels at or below zero says so once.
+            let counted: Vec<&(usize, Done)> = finished[group_start..].iter().filter(|(_, d)| d.report.pixels > 0).collect();
+            let lost: Vec<(&FrameFacts, &str)> = counted
+                .iter()
+                .filter(|(_, d)| d.report.non_positive_pixels as f64 / d.report.pixels as f64 >= DARK_SUBTRACTION_LOST_BAR)
+                .map(|(i, d)| (&all_facts[*i], d.report.calstat.as_str()))
+                .collect();
+            if let Some(message) = subtraction_lost_warning(n, counted.len(), &lost) {
+                tracing::warn!(group = n, count = lost.len(), "dark subtraction left most pixels at or below zero");
+                ctx.progress.warn(&message);
+                report.warnings.push(message);
+            }
         }
         Ok(())
     };
-    if let Err(e) = run(&mut finished, &mut report) {
-        remove_parts(finished.iter().map(|(_, d)| d.part.clone()).chain(dests.iter().map(|d| part_path(d))));
+    // Everything below decodes on the caller's pool, never rayon's global one (SL-9).
+    if let Err(e) = ctx.pool.install(|| run(&mut finished, &mut report)) {
+        remove_parts(
+            finished
+                .iter()
+                .flat_map(|(_, d)| std::iter::once(d.part.clone()).chain(d.mosaic.as_ref().map(|(p, _)| p.clone())))
+                .chain(dests.iter().map(|d| part_path(d)))
+                .chain(mosaics.iter().flatten().map(|m| part_path(m))),
+        );
         return Err(e);
     }
 
@@ -628,6 +980,7 @@ pub fn calibrate(
         by_index[i] = Some(done);
     }
     let mut moves = Vec::with_capacity(total);
+    let mut mosaic_moves = Vec::new();
     let mut entry = Entry::new(
         Stage::Calibrate,
         cfg,
@@ -637,9 +990,11 @@ pub fn calibrate(
     for &i in &order {
         let done = by_index[i].take().ok_or_else(|| anyhow!("{} was not calibrated", all_paths[i].display()))?;
         moves.push((done.part, done.dest.clone()));
+        mosaic_moves.extend(done.mosaic);
         entry.sources.insert(done.dest, all_facts[i].clone());
         report.frames.push(done.report);
     }
+    moves.extend(mosaic_moves);
     if let Err(e) = commit_stage(ctx.work_dir, &moves, entry) {
         remove_parts(moves.iter().map(|(part, _)| part.clone()));
         return Err(e);
