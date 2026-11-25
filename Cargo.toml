@@ -1,6 +1,6 @@
 [package]
 name = "starloom"
-version = "0.2.0-dev"
+version = "0.2.0"
 description = "The astrophotography stacking kernel: geometry, resampling, FITS/XISF writing, calibration, registration, integration and drizzle"
 edition = "2021"
 license = "Apache-2.0"
