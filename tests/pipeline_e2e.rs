@@ -3502,3 +3502,114 @@ fn run_keeps_the_mosaics_exactly_when_a_bayer_drizzle_wants_them_and_stacks_from
     run(&env.ctx(&work2), &g, &osc_cfg(false), &ReferenceChoice::Auto, &tmp.path().join("out2"), OutputFormat::Fits).unwrap();
     assert!(dir_entries(&calibrated_dir(&work2)).iter().all(|n| n.ends_with("_d.fits")));
 }
+
+#[test]
+fn a_plain_calibrate_removes_the_mosaics_an_earlier_one_kept_and_a_bayer_stack_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let g = [raw_group(&tmp.path().join("raw"), 4, true)];
+    let work = tmp.path().join("work");
+    let cal = work.join("calibrated");
+    let c = osc_cfg(true);
+    let keep = CalibratedLightOptions { keep_mosaic: true, ..CalibratedLightOptions::default() };
+    calibrate(&env.ctx(&work), &c, &g, &keep, &cal, OutputFormat::Fits).unwrap();
+    assert_eq!(dir_entries(&cal).len(), 8, "a mosaic beside each debayered frame: {:?}", dir_entries(&cal));
+
+    // The same lights calibrated again with another dark and no mosaic: the old calibration's mosaics are gone.
+    let dark = write_f32(&tmp.path().join("dark-other.fits"), 768, 512, &(0..768 * 512).map(|i| 150.0 + 6.0 * noise(77, i)).collect::<Vec<_>>(), &[]);
+    let again = [group(g[0].lights.clone(), Some(CalSource::Master(dark)), None, None)];
+    let r = calibrate(&env.ctx(&work), &c, &again, &CalibratedLightOptions::default(), &cal, OutputFormat::Fits).unwrap();
+    let mut names = dir_entries(&cal);
+    names.sort();
+    assert_eq!(names, ["c_Light_0000_d.fits", "c_Light_0001_d.fits", "c_Light_0002_d.fits", "c_Light_0003_d.fits"], "{names:?}");
+    assert!(r.warnings.iter().all(|w| !w.contains("mosaic")), "{:?}", r.warnings);
+
+    // A Bayer stack finds no mosaic for any frame (not another calibration's), and is refused naming the flag.
+    let frames: Vec<PathBuf> = r.frames.iter().map(|f| f.output.clone()).collect();
+    let measured = measure(&env.ctx(&work), &c, &frames, None, false).unwrap();
+    let registered = register(&env.ctx(&work), &frames, &measured, &ReferenceChoice::Auto, &c, false).unwrap();
+    let out = tmp.path().join("out");
+    let err = stack_error(&env, &work, &c, &frames, &measured, &registered, None, &out);
+    assert!(err.contains("--keep-mosaic"), "{err}");
+    assert!(!out.join("master_drizzle2x.fits").exists());
+}
+
+#[test]
+fn a_calibrate_that_keeps_mosaics_replaces_them_and_leaves_a_mosaic_of_another_name_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let g = [raw_group(&tmp.path().join("raw"), 2, true)];
+    let work = tmp.path().join("work");
+    let cal = tmp.path().join("cal");
+    std::fs::create_dir_all(&cal).unwrap();
+    // A file of the folder that is no mosaic of a frame this run writes stays.
+    let other = write_f32(&cal.join("c_Other_0000.fits"), W, H, &vec![1.0; W * H], &[]);
+    let keep = CalibratedLightOptions { keep_mosaic: true, ..CalibratedLightOptions::default() };
+    let c = osc_cfg(true);
+    calibrate(&env.ctx(&work), &c, &g, &keep, &cal, OutputFormat::Fits).unwrap();
+    let first = bits(&read_plane(&cal.join("c_Light_0000.fits"), tmp.path()).2);
+    let dark = write_f32(&tmp.path().join("dark-other.fits"), 768, 512, &(0..768 * 512).map(|i| 150.0 + 6.0 * noise(77, i)).collect::<Vec<_>>(), &[]);
+    let again = [group(g[0].lights.clone(), Some(CalSource::Master(dark)), None, None)];
+    calibrate(&env.ctx(&work), &c, &again, &keep, &cal, OutputFormat::Fits).unwrap();
+    let second = bits(&read_plane(&cal.join("c_Light_0000.fits"), tmp.path()).2);
+    assert_ne!(first, second, "the mosaic is the second calibration's");
+    assert!(other.is_file(), "a file that is no mosaic of this run's frames is not touched");
+}
+
+#[test]
+fn drizzle_with_large_scale_rejection_reads_the_second_pass_bitmaps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let mut c = drizzle_on(ln_off(cfg()));
+    c.integration.large_scale.enabled = true;
+    let out = tmp.path().join("out");
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+    let report = stack(&env.ctx(&work), &c, &frames, &measured, &registered, None, &out, OutputFormat::Fits).unwrap();
+    // The second pass ran, and the drizzle read the bits it left (its own set), instead of being skipped.
+    assert!(report.stats.large_scale_rejected_fraction.is_some(), "{:?}", report.warnings);
+    assert!(report.warnings.iter().all(|w| !w.contains("drizzle skipped")), "{:?}", report.warnings);
+    let d = report.drizzle.as_ref().expect("the drizzle ran after the second pass");
+    assert!(d.stats.used_rejection, "the drizzle applied the second pass's rejection bitmaps");
+    assert_eq!(d.stats.frames, 6);
+    assert!(d.master.is_file() && d.weight_map.as_ref().is_some_and(|w| w.is_file()));
+    assert!(!work.join(".tmp").join("stack-rej").exists(), "the bitmaps are scratch");
+}
+
+/// A [`Progress`] that keeps every step in the order it was reported.
+#[derive(Default)]
+struct Steps {
+    steps: Mutex<Vec<(String, usize, usize)>>,
+}
+
+impl Progress for Steps {
+    fn step(&self, stage: &str, done: usize, total: usize) {
+        self.steps.lock().unwrap().push((stage.to_string(), done, total));
+    }
+    fn warn(&self, _message: &str) {}
+}
+
+#[test]
+fn the_drizzle_reports_under_its_own_label_with_its_own_counter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env::new();
+    let c = drizzle_on(ln_off(cfg()));
+    let out = tmp.path().join("out");
+    let (work, frames, measured, registered) = registered_field(tmp.path(), &env, &c, &[1.0; 6], &no_cards());
+    let steps = Steps::default();
+    let ctx = Ctx { pool: env.pool.clone(), cancel: &env.cancel, progress: &steps, memory_budget_bytes: 1 << 30, work_dir: &work };
+    let report = stack(&ctx, &c, &frames, &measured, &registered, None, &out, OutputFormat::Fits).unwrap();
+    assert!(report.drizzle.is_some());
+
+    let seen = steps.steps.lock().unwrap().clone();
+    let first_drizzle = seen.iter().position(|(label, _, _)| label == "drizzle").expect("the drizzle reported under `drizzle`");
+    // The integration's steps come first, under `stack`, and end complete; nothing under `stack` follows.
+    assert!(first_drizzle > 0 && seen[..first_drizzle].iter().all(|(label, _, _)| label == "stack"), "{seen:?}");
+    let (_, done, total) = seen[first_drizzle - 1];
+    assert_eq!(done, total, "the integration's counter ended before the drizzle began");
+    // The drizzle's own counter starts at zero, counts the frames it deposits (six frames, one plane) and ends full.
+    let drizzle = &seen[first_drizzle..];
+    assert!(drizzle.iter().all(|(label, _, _)| label == "drizzle"), "{seen:?}");
+    assert_eq!((drizzle[0].1, drizzle[0].2), (0, 6));
+    assert_eq!(drizzle.last().map(|s| (s.1, s.2)), Some((6, 6)));
+    assert!(drizzle.windows(2).all(|w| w[0].1 <= w[1].1), "the counter never goes back: {drizzle:?}");
+}

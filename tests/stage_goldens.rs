@@ -106,9 +106,9 @@ const GOLDENS: &[Golden] = &[
     Golden { stage: "master_flat", platform: "aarch64-macos", versions: &[("ENGINE_VERSION", 1)], checksum: 0x606511c5b2815ad7 },
     Golden { stage: "light_cal", platform: "aarch64-macos", versions: &[("LIGHT_CAL_VERSION", 1)], checksum: 0x1c7a4c66d0374d8c },
     Golden { stage: "cosmetic", platform: "aarch64-macos", versions: &[("LIGHT_CAL_VERSION", 1)], checksum: 0x7f7b15225c17ae02 },
-    // The whole chain (`pipeline::run`, with the drizzle): PIPELINE_VERSION first, then every stage version it runs.
+    // The whole chain (`pipeline::run`, with the drizzle): PIPELINE_VERSION first, then every stage and format version it runs. The checksum hashes plane data only.
     #[cfg(feature = "pipeline")]
-    Golden { stage: "pipeline", platform: "aarch64-macos", versions: &[("PIPELINE_VERSION", 1), ("LIGHT_CAL_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8), ("ALIGN_VERSION", 1), ("LN_MODEL_VERSION", 4), ("INTEGRATE_VERSION", 1), ("SNR_GAIN_VERSION", 2), ("DRIZZLE_KERNEL_VERSION", 2)], checksum: 0xd7addc5b67dd139e },
+    Golden { stage: "pipeline", platform: "aarch64-macos", versions: &[("PIPELINE_VERSION", 1), ("LIGHT_CAL_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8), ("PASS1_ARTIFACT_VERSION", 1), ("ALIGN_VERSION", 1), ("LN_MODEL_VERSION", 4), ("LN_GRID_VERSION", 1), ("FITS_ARTIFACT_VERSION", 3), ("INTEGRATE_VERSION", 1), ("SNR_GAIN_VERSION", 2), ("DRIZZLE_KERNEL_VERSION", 2)], checksum: 0xd7addc5b67dd139e },
 ];
 
 /// The live value of a named version constant.
@@ -904,9 +904,12 @@ fn write_u16_fits(path: &Path, w: usize, h: usize, values: &[u16]) -> PathBuf {
 }
 
 /// `pipeline`: `run` over four raw lights of one star field (a raw master dark among them), default config with the
-/// drizzle on at scale 2 and local normalization driving the rejection: the checksum covers the master and the
-/// drizzled master. It moves with any stage version, and with `PIPELINE_VERSION` when the glue between the stages
-/// changes bytes (the order frames are taken in, the cards a product carries).
+/// drizzle on at scale 2 and the shipped local-normalization setting (local normalization for the rejection only): the
+/// checksum covers the plane data of the master and of the drizzled master, and no header card (the cards are pinned by
+/// the pipeline's own tests, and `SWCREATE`, `SLM_VER` and `SLM_CFG` carry the build). It moves with any stage version
+/// and with the formats the chain writes and reads back (`LN_GRID_VERSION`, `FITS_ARTIFACT_VERSION`,
+/// `PASS1_ARTIFACT_VERSION`), and with `PIPELINE_VERSION` when the glue between the stages changes those bytes (the
+/// order frames are taken in, the gates on local normalization and the rejection bitmaps).
 #[cfg(feature = "pipeline")]
 fn pipeline_row(pool: &Arc<rayon::ThreadPool>, d: &Path) -> Computed {
     use starloom::integration::plane_reader::PlaneReader;
@@ -948,7 +951,8 @@ fn pipeline_row(pool: &Arc<rayon::ThreadPool>, d: &Path) -> Computed {
     }
 }
 
-/// The versions the `pipeline` row is keyed on: the pipeline's own, then every stage version `run` goes through.
+/// The versions the `pipeline` row is keyed on: the pipeline's own, then every stage version and every format version
+/// `run` goes through (the pass-1 artifact, the local-normalization grid and the FITS artifact it writes and reads back).
 #[cfg(feature = "pipeline")]
 const PIPELINE_VERSIONS: &[&str] = &[
     "PIPELINE_VERSION",
@@ -956,8 +960,11 @@ const PIPELINE_VERSIONS: &[&str] = &[
     "ENGINE_VERSION",
     "MEASURE_STAGE_VERSION",
     "MEASURE_VERSION",
+    "PASS1_ARTIFACT_VERSION",
     "ALIGN_VERSION",
     "LN_MODEL_VERSION",
+    "LN_GRID_VERSION",
+    "FITS_ARTIFACT_VERSION",
     "INTEGRATE_VERSION",
     "SNR_GAIN_VERSION",
     "DRIZZLE_KERNEL_VERSION",

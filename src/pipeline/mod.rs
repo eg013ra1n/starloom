@@ -92,8 +92,10 @@ pub use measure::{athf_path, finish, measure, measure_dir, pass1_path, MEASURE_C
 pub use versions::{all_versions, recorded_versions, VERSION_CARDS};
 
 /// The version of the pipeline as a whole: what the cards `SLM_PLV` records, and what a golden row of the whole
-/// chain is keyed on. A change to the pipeline's own glue that moves a product's bytes without moving a stage version
-/// (the order frames are taken in, the cards a product carries) bumps it.
+/// chain is keyed on. A change to the pipeline's own glue that moves the plane data of a product without moving a stage
+/// version (the order frames are taken in, the gates on local normalization and the rejection bitmaps) bumps it. The
+/// golden row of the chain hashes plane data only: a change to the cards a product carries moves no row, and is the
+/// pipeline tests' to catch.
 pub const PIPELINE_VERSION: u32 = 1;
 
 /// The stages that leave an entry in the manifest, in the order a chain runs them. Drizzle is part of `Stack`, and
@@ -129,7 +131,8 @@ impl Stage {
 /// Where a stage reports what it is doing. The caller decides what that is: the command line prints to stderr, a
 /// library caller may ignore it. It is `Sync` because the stages call it from pool threads.
 pub trait Progress: Sync {
-    /// `done` of `total` units of `stage` are finished (a frame, a plane, a step). `stage` is the command's name.
+    /// `done` of `total` units of `stage` are finished (a frame, a plane, a step). `stage` is the command's name, or
+    /// `drizzle` for the drizzle inside `stack`, which counts its own units from zero after the integration's.
     fn step(&self, stage: &str, done: usize, total: usize);
     /// Something a person should know that does not stop the work: a skipped frame, a mismatch that only warns.
     fn warn(&self, message: &str);

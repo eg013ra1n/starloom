@@ -748,6 +748,9 @@ fn remove_parts(parts: impl IntoIterator<Item = PathBuf>) {
 /// With `opts.keep_mosaic`, an OSC light that is debayered also leaves its calibrated, hot-pixel-corrected CFA mosaic
 /// beside it as `c_<name>.fits` (the mono spelling of the same name, always plain FITS, the mosaic's cards, no
 /// `SLM_CDBM`), as Athenaeum's `execute_generation` does for a Bayer drizzle; the mosaic is no product of the entry.
+/// Without `keep_mosaic`, a `c_<name>.fits` an earlier calibrate left beside a debayered frame this call wrote is
+/// removed once the stage is committed: the Bayer drizzle ties a mosaic to its frame by file name, and that mosaic
+/// belongs to another calibration (the same command removes its own stale product, P2-R24).
 ///
 /// Lights are calibrated on the context's pool, as many at once as its memory budget allows; everything that decodes
 /// a pixel runs there (SL-9). A hot-pixel map is measured once per master dark and a flat-normalization divisor
@@ -998,6 +1001,34 @@ pub fn calibrate(
     if let Err(e) = commit_stage(ctx.work_dir, &moves, entry) {
         remove_parts(moves.iter().map(|(part, _)| part.clone()));
         return Err(e);
+    }
+    // A mosaic an earlier calibrate left beside a debayered frame this run wrote describes another calibration: a Bayer
+    // drizzle would deposit its pixels next to this run's frame by file name alone. The command that writes the frame
+    // removes the product it no longer makes, as `stack` does for its own outputs (P2-R24).
+    for (i, dest) in dests.iter().enumerate() {
+        let debayered = opts.debayer_osc && cfa_of(&all_facts[i]).is_some();
+        if !debayered || mosaics[i].is_some() {
+            continue;
+        }
+        let stale = out_dir.join(format!("c_{}.{}", frame_stem(&all_paths[i]), OutputFormat::Fits.extension()));
+        // A name another product of this run took is that product, not a stale mosaic.
+        let is_product = dests.iter().any(|d| d.to_string_lossy().to_lowercase() == stale.to_string_lossy().to_lowercase());
+        if is_product || !stale.is_file() {
+            continue;
+        }
+        match std::fs::remove_file(&stale) {
+            Ok(()) => tracing::info!(path = %stale.display(), frame = %dest.display(), "stale cfa mosaic removed"),
+            Err(e) => {
+                let message = format!(
+                    "{} is a calibrated CFA mosaic of an earlier calibration and could not be removed ({e}); a Bayer drizzle would deposit it beside {}",
+                    stale.display(),
+                    dest.display()
+                );
+                tracing::warn!(path = %stale.display(), error = %e, "cannot remove a stale cfa mosaic");
+                ctx.progress.warn(&message);
+                report.warnings.push(message);
+            }
+        }
     }
     tracing::info!(frames = total, masters = report.masters.len(), "calibrate stage written");
     Ok(report)

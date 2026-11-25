@@ -5,19 +5,22 @@
 //! when `stack` returns), when `drizzle.enabled` is set. What it does, as Athenaeum's block does:
 //!
 //! - The drop is shrunk by `drizzle.dropShrink`, clamped to `[0.5, 1.0]` with a warning; a `drizzle.scale` outside
-//!   1 to 3 is refused before any pixel is read ([`settings`]).
+//!   1 to 3 is refused before any pixel is read (`settings`).
 //! - It deposits the frames the integration kept (`GroupOutput::included`, engine order) with their normalized weights,
 //!   the output normalization pairs the integration computed, and the rejection bitmaps the master was built with: the
-//!   second pass's own set when large-scale rejection ran ([`rejection_paths`]). It follows local normalization only
+//!   second pass's own set when large-scale rejection ran (`rejection_paths`). It follows local normalization only
 //!   when local normalization drives the output (`normalization.local.enabled`): grids computed for the rejection
 //!   alone never normalize the drizzled master.
 //! - It is skipped, with the master untouched, when the rejection bitmaps are unavailable: the set could not be created
-//!   or written, or the large-scale second pass left no set of its own ([`second_pass_unavailable`]).
+//!   or written, or the large-scale second pass left no set of its own (`second_pass_unavailable`).
 //! - A drizzle that fails (a read, the memory refusal, a write) is a warning: the master and its entry stay. A cancel
 //!   is an error.
+//! - It reports its progress under its own label, `drizzle`, with its own counter (the integration's ends at 100%
+//!   under `stack` first).
 //! - Bayer drizzle (`drizzle.bayer`, three planes, the debayer on) deposits each colour from the frame's calibrated CFA
-//!   mosaic, `c_<stem>.fits` beside the debayered `c_<stem>_d.fits` that `calibrate --keep-mosaic` writes
-//!   ([`mosaic_sources`]). A frame with no mosaic is deposited from its debayered planes, with a warning; **a stack in
+//!   mosaic, `c_<stem>.fits` beside the debayered `c_<stem>_d.fits` that `calibrate --keep-mosaic` writes (a plain
+//!   `calibrate` into the same folder removes the mosaics of the frames it writes, so none outlives its calibration; a
+//!   frame not named `c_…_d` has none; `mosaic_sources`). A frame with no mosaic is deposited from its debayered planes, with a warning; **a stack in
 //!   which no frame has one is refused before any pixel is read**, naming the flag (Athenaeum falls back for every frame
 //!   in that case: its calibration stage always keeps the mosaics, and a CLI user may not have asked it to).
 //!
@@ -25,7 +28,8 @@
 //! `<out>/master_drizzle<s>x_weight.fits` (the master's container too, as Athenaeum writes it). Their cards are the
 //! master's with the world-coordinate block scaled by the drizzle factor (`CRPIX`, `CD`, `CDELT` and the SIP terms, as
 //! Athenaeum's `scale_plate_solve` scales the solve) and `SLM_DRZ`, `SLM_DRZP`, `SLM_DRZK` and `SLM_DZV` (P2-R6) in place
-//! of `ATH_DRZ`, `ATH_DRZP` and `ATH_DRZK`. A drizzle coverage map is not written: the pipeline has no coverage-map
+//! of `ATH_DRZ`, `ATH_DRZP` and `ATH_DRZK`; `A_DMAX` and `B_DMAX` (SIP distortion extents in source pixels, which Athenaeum
+//! neither scales nor writes) are not carried. A drizzle coverage map is not written: the pipeline has no coverage-map
 //! setting, and the master has none.
 //!
 //! Everything that decodes, deposits or writes runs on the context's pool (SL-9): `stack` calls this inside it.
@@ -42,7 +46,7 @@ use crate::pipeline::formats::part_path;
 use crate::pipeline::master::{cfa_of, frame_facts};
 use crate::pipeline::register::is_wcs;
 use crate::pipeline::stack::MASTER_STEM;
-use crate::pipeline::{frame_stem, Ctx, Stage};
+use crate::pipeline::{frame_stem, Ctx};
 use crate::stacking::config::{AlgorithmConfig, DrizzleConfig};
 use crate::stacking::drizzle::{
     drizzle_group, CfaSource, DrizzleError, DrizzleFrame, DrizzleInput, DrizzleProgress, DrizzleStats,
@@ -51,6 +55,10 @@ use crate::stacking::integrate::{GroupOutput, StackFrame};
 use crate::stacking::ln::LnFrameGrids;
 use crate::stacking::rej::RejBitmapSet;
 use crate::stacking::run_helpers::wants_cfa_mosaic;
+
+/// The stage label the drizzle reports its progress under: its own counter, which starts over after the integration's.
+/// It is a step of `stack`, not a command, so it is no [`Stage`](crate::pipeline::Stage) name.
+pub(crate) const PROGRESS_STAGE: &str = "drizzle";
 
 /// `SLM_DRZ`: the drizzle's output scale.
 pub const SLM_DRZ: &str = "SLM_DRZ";
@@ -128,9 +136,10 @@ pub(crate) fn bayer_wanted(cfg: &AlgorithmConfig, channels: usize) -> bool {
 }
 
 /// The calibrated CFA mosaic that goes with the debayered frame `frame`: `c_<stem>.fits` in the frame's folder for
-/// `c_<stem>_d.fits`. A frame whose name does not end in `_d` was not debayered by `calibrate`, so it has none.
+/// `c_<stem>_d.fits`. A frame whose name is not `c_…_d` was not debayered by `calibrate`, so it has none: a raw
+/// `X.fits` beside some `X_d.fits` is never taken for a mosaic.
 pub(crate) fn mosaic_of(frame: &Path) -> Option<PathBuf> {
-    let base = frame_stem(frame).strip_suffix("_d")?;
+    let base = frame_stem(frame).strip_suffix("_d").filter(|b| b.starts_with("c_"))?;
     Some(frame.with_file_name(format!("{base}.{}", OutputFormat::Fits.extension())))
 }
 
@@ -160,7 +169,7 @@ pub(crate) fn mosaic_sources(members: &[StackFrame]) -> Vec<Option<(PathBuf, Bay
 /// The rejection bitmaps the drizzle reads, per included frame: the bits the master was built with. With the
 /// large-scale second pass on, that is the second pass's own set; without it, the first pass's. The processed
 /// intermediates are neither. `second_pass_rej_ok` false with the second pass having run means its files are missing
-/// ([`second_pass_unavailable`]), which the caller turns into a skip.
+/// (`second_pass_unavailable`), which the caller turns into a skip.
 pub(crate) fn rejection_paths(set: Option<&RejBitmapSet>, included: usize, second_pass_rej_ok: bool) -> Vec<Option<PathBuf>> {
     (0..included)
         .map(|k| set.map(|s| if second_pass_rej_ok { s.second_pass_path(k) } else { s.path(k).to_path_buf() }))
@@ -244,12 +253,20 @@ fn scaled_wcs_card(card: &Card, s: f64) -> Result<Card> {
     Ok(out)
 }
 
+/// The SIP maximum-distortion cards, in pixels of the grid they were measured on. Athenaeum's `scale_plate_solve` does
+/// not scale them and its header writer never writes them, so the drizzled master carries neither (a value left as it
+/// was would state the distortion in the wrong pixels).
+fn is_distortion_extent(key: &str) -> bool {
+    matches!(key, "A_DMAX" | "B_DMAX")
+}
+
 /// The cards of the drizzled master: the master's with its world-coordinate block taken out and put back scaled by
-/// `settings.scale`, after the others, then `SLM_DRZ`, `SLM_DRZP`, `SLM_DRZK` and `SLM_DZV` (P2-R6).
+/// `settings.scale`, after the others, then `SLM_DRZ`, `SLM_DRZP`, `SLM_DRZK` and `SLM_DZV` (P2-R6). `A_DMAX` and
+/// `B_DMAX` are dropped (see [`is_distortion_extent`]).
 pub(crate) fn drizzle_cards(master: &[Card], settings: Settings, cfg: &DrizzleConfig) -> Result<Vec<Card>> {
     let s = f64::from(settings.scale);
     let mut cards: Vec<Card> = master.iter().filter(|c| !is_wcs(&c.keyword)).cloned().collect();
-    for card in master.iter().filter(|c| is_wcs(&c.keyword)) {
+    for card in master.iter().filter(|c| is_wcs(&c.keyword) && !is_distortion_extent(&c.keyword)) {
         cards.push(scaled_wcs_card(card, s)?);
     }
     let kernel = match serde_json::to_value(cfg.kernel) {
@@ -296,7 +313,7 @@ pub(crate) struct Inputs<'a> {
     pub ln: Option<&'a [Option<LnFrameGrids>]>,
     /// The rejection-bitmap set the integration wrote, when one was created.
     pub rej: Option<&'a RejBitmapSet>,
-    /// Each member's mosaic and pattern under Bayer drizzle ([`mosaic_sources`]); `None` for a plain drizzle.
+    /// Each member's mosaic and pattern under Bayer drizzle (`mosaic_sources`); `None` for a plain drizzle.
     pub mosaics: Option<&'a [Option<(PathBuf, BayerPattern)>]>,
     /// The registration reference's grid: the output grid is this times the scale.
     pub width: usize,
@@ -389,8 +406,8 @@ pub(crate) fn drizzle(ctx: &Ctx<'_>, input: &Inputs<'_>) -> std::result::Result<
         force_exact_overlap_for_measurement: false,
     };
     let total_units = included.len() * input.channels;
-    let on_frame = |done: usize, total: usize| ctx.progress.step(Stage::Stack.name(), done, total);
-    ctx.progress.step(Stage::Stack.name(), 0, total_units);
+    let on_frame = |done: usize, total: usize| ctx.progress.step(PROGRESS_STAGE, done, total);
+    ctx.progress.step(PROGRESS_STAGE, 0, total_units);
     let drz = drizzle_group(&drizzle_input, &ctx.pool, ctx.cancel, &DrizzleProgress { on_frame: &on_frame })?;
 
     let cards = drizzle_cards(input.master_cards, settings, drizzle_cfg).map_err(|e| Failure::Other(format!("{e:#}")))?;
@@ -488,6 +505,9 @@ mod tests {
         assert_eq!(mosaic_of(Path::new("/x/y/c_Light_0001_d.fits")), Some(PathBuf::from("/x/y/c_Light_0001.fits")));
         assert_eq!(mosaic_of(Path::new("c_Light_0001_d.fits.gz")), Some(PathBuf::from("c_Light_0001.fits")));
         assert_eq!(mosaic_of(Path::new("/x/c_Light_0001.fits")), None);
+        // Only a frame `calibrate` wrote (`c_` prefix) has one: a raw `Light_0001.fits` beside `Light_0001_d.fits` is not it.
+        assert_eq!(mosaic_of(Path::new("/x/Light_0001_d.fits")), None);
+        assert_eq!(mosaic_of(Path::new("/x/Xc_Light_0001_d.fits")), None);
     }
 
     #[test]
@@ -522,6 +542,8 @@ mod tests {
             Card::new("IMAGETYP", CardValue::Str("Master Light".into())).unwrap(),
             real("CRPIX1", 10.0),
             real("CD1_1", -2.0e-3),
+            real("A_DMAX", 0.7),
+            real("B_DMAX", 0.9),
             Card::new("SLM_CFG", CardValue::Str("0123456789abcdef".into())).unwrap(),
             Card::new("SLM_REF", CardValue::Str("c_Light_0000.fits".into())).unwrap(),
         ];
@@ -531,6 +553,8 @@ mod tests {
         // The block moves after the others; the drizzle's own cards close the header.
         assert_eq!(keys, ["IMAGETYP", "SLM_CFG", "SLM_REF", "CRPIX1", "CD1_1", "SLM_DRZ", "SLM_DRZP", "SLM_DRZK", "SLM_DZV"]);
         assert_eq!(value_of(&cards, "CRPIX1"), 29.0);
+        // The SIP maximum-distortion cards are in source pixels and Athenaeum never writes them: neither is carried.
+        assert!(cards.iter().all(|c| c.keyword != "A_DMAX" && c.keyword != "B_DMAX"));
         assert_eq!(value_of(&cards, "SLM_DRZP"), 0.8);
         assert_eq!(value_of(&cards, "SLM_DRZ"), 3.0);
         assert!(cards.iter().all(|c| !c.keyword.starts_with("ATH_")));

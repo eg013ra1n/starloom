@@ -140,10 +140,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drizzled files carry the master's cards with the world-coordinate block scaled by the factor and `SLM_DRZ`,
   `SLM_DRZP`, `SLM_DRZK` and `SLM_DZV`; `StackReport::drizzle` reports them. A Bayer drizzle reads each frame's
   calibrated CFA mosaic (`c_<stem>.fits` beside `c_<stem>_d.fits`) and is refused, naming `calibrate --keep-mosaic`,
-  when no frame has one. A drizzle coverage map is not written. `run` is calibrate (which builds the raw masters),
-  measure, register, normalize (when `ln_runs`) and stack over all the groups' lights, with `keep_mosaic` set where
+  when no frame has one; a mosaic is taken only beside a `c_…_d` frame, and a `calibrate` that keeps no mosaic removes
+  the `c_<stem>.fits` an earlier one left beside a debayered frame it writes, so no mosaic outlives its calibration.
+  The drizzle reports its progress under its own label, `drizzle`, with its own counter, and drops the SIP `A_DMAX` and
+  `B_DMAX` cards (pixel distances Athenaeum neither scales nor writes). A drizzle coverage map is not written. `run` is calibrate (which builds the raw
+  masters), measure, register, normalize (when `ln_runs`) and stack over all the groups' lights, with `keep_mosaic` set where
   Athenaeum's calibration sets it. The stage goldens gain a `pipeline` row (a `run` with the drizzle, keyed on
-  `PIPELINE_VERSION` and every stage version it goes through). No stage version moves and no existing row changes.
+  `PIPELINE_VERSION`, every stage version it goes through and the pass-1, local-normalization grid and FITS artifact
+  versions; it hashes plane data only). No stage version moves and no existing row changes.
 
 ## [0.1.2] — 2026-11-23
 
