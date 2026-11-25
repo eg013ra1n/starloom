@@ -109,6 +109,38 @@ const GOLDENS: &[Golden] = &[
     // The whole chain (`pipeline::run`, with the drizzle): PIPELINE_VERSION first, then every stage and format version it runs. The checksum hashes plane data only.
     #[cfg(feature = "pipeline")]
     Golden { stage: "pipeline", platform: "aarch64-macos", versions: &[("PIPELINE_VERSION", 1), ("LIGHT_CAL_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8), ("PASS1_ARTIFACT_VERSION", 1), ("ALIGN_VERSION", 1), ("LN_MODEL_VERSION", 4), ("LN_GRID_VERSION", 1), ("FITS_ARTIFACT_VERSION", 3), ("INTEGRATE_VERSION", 1), ("SNR_GAIN_VERSION", 2), ("DRIZZLE_KERNEL_VERSION", 2)], checksum: 0xd7addc5b67dd139e },
+    // x86_64-linux, GitHub runner ubuntu-26.04, image 20261116.88.1, rustafits 1.10.0 (the revision `Cargo.lock` locks): copied from the CI output of run 45576945801
+    // (PR #2), never computed by hand.
+    Golden { stage: "measure", platform: "x86_64-linux", versions: &[("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xfafe9a98e9d255cb },
+    Golden { stage: "pass1_artifact", platform: "x86_64-linux", versions: &[("MEASURE_STAGE_VERSION", 1), ("PASS1_ARTIFACT_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0x69c33d9f0e6fb503 },
+    Golden { stage: "register", platform: "x86_64-linux", versions: &[("ALIGN_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xb6d64ba321698e0a },
+    Golden { stage: "warp", platform: "x86_64-linux", versions: &[("ALIGN_VERSION", 1)], checksum: 0x57b84de494726d1c },
+    Golden { stage: "ln_model", platform: "x86_64-linux", versions: &[("LN_MODEL_VERSION", 4), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xe7cffc278266b609 },
+    Golden { stage: "integrate", platform: "x86_64-linux", versions: &[("INTEGRATE_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xbeeaee875bbeb3be },
+    Golden { stage: "snr_gain", platform: "x86_64-linux", versions: &[("SNR_GAIN_VERSION", 2), ("INTEGRATE_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0x342c2a8eccd59bdb },
+    Golden { stage: "drizzle", platform: "x86_64-linux", versions: &[("DRIZZLE_KERNEL_VERSION", 2)], checksum: 0xbedfc3aff9989e37 },
+    Golden { stage: "master_bias", platform: "x86_64-linux", versions: &[("ENGINE_VERSION", 1)], checksum: 0x9bda271ac4ddb582 },
+    Golden { stage: "master_flat", platform: "x86_64-linux", versions: &[("ENGINE_VERSION", 1)], checksum: 0x606511c5b2815ad7 },
+    Golden { stage: "light_cal", platform: "x86_64-linux", versions: &[("LIGHT_CAL_VERSION", 1)], checksum: 0x1c7a4c66d0374d8c },
+    Golden { stage: "cosmetic", platform: "x86_64-linux", versions: &[("LIGHT_CAL_VERSION", 1)], checksum: 0x7f7b15225c17ae02 },
+    #[cfg(feature = "pipeline")]
+    Golden { stage: "pipeline", platform: "x86_64-linux", versions: &[("PIPELINE_VERSION", 1), ("LIGHT_CAL_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8), ("PASS1_ARTIFACT_VERSION", 1), ("ALIGN_VERSION", 1), ("LN_MODEL_VERSION", 4), ("LN_GRID_VERSION", 1), ("FITS_ARTIFACT_VERSION", 3), ("INTEGRATE_VERSION", 1), ("SNR_GAIN_VERSION", 2), ("DRIZZLE_KERNEL_VERSION", 2)], checksum: 0xd7addc5b67dd139e },
+    // x86_64-windows, GitHub runner windows-2025-vs2026, image 20261116.315.1, rustafits 1.10.0 (the revision `Cargo.lock` locks): copied from the CI output of run 45576945801
+    // (PR #2), never computed by hand.
+    Golden { stage: "measure", platform: "x86_64-windows", versions: &[("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xc8c964648a697a64 },
+    Golden { stage: "pass1_artifact", platform: "x86_64-windows", versions: &[("MEASURE_STAGE_VERSION", 1), ("PASS1_ARTIFACT_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0x13055e5853f6c832 },
+    Golden { stage: "register", platform: "x86_64-windows", versions: &[("ALIGN_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xb6d64ba321698e0a },
+    Golden { stage: "warp", platform: "x86_64-windows", versions: &[("ALIGN_VERSION", 1)], checksum: 0x57b84de494726d1c },
+    Golden { stage: "ln_model", platform: "x86_64-windows", versions: &[("LN_MODEL_VERSION", 4), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xe7cffc278266b609 },
+    Golden { stage: "integrate", platform: "x86_64-windows", versions: &[("INTEGRATE_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xbeeaee875bbeb3be },
+    Golden { stage: "snr_gain", platform: "x86_64-windows", versions: &[("SNR_GAIN_VERSION", 2), ("INTEGRATE_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xe87910dd854b28d2 },
+    Golden { stage: "drizzle", platform: "x86_64-windows", versions: &[("DRIZZLE_KERNEL_VERSION", 2)], checksum: 0xbedfc3aff9989e37 },
+    Golden { stage: "master_bias", platform: "x86_64-windows", versions: &[("ENGINE_VERSION", 1)], checksum: 0x9bda271ac4ddb582 },
+    Golden { stage: "master_flat", platform: "x86_64-windows", versions: &[("ENGINE_VERSION", 1)], checksum: 0x606511c5b2815ad7 },
+    Golden { stage: "light_cal", platform: "x86_64-windows", versions: &[("LIGHT_CAL_VERSION", 1)], checksum: 0x1c7a4c66d0374d8c },
+    Golden { stage: "cosmetic", platform: "x86_64-windows", versions: &[("LIGHT_CAL_VERSION", 1)], checksum: 0x7f7b15225c17ae02 },
+    #[cfg(feature = "pipeline")]
+    Golden { stage: "pipeline", platform: "x86_64-windows", versions: &[("PIPELINE_VERSION", 1), ("LIGHT_CAL_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8), ("PASS1_ARTIFACT_VERSION", 1), ("ALIGN_VERSION", 1), ("LN_MODEL_VERSION", 4), ("LN_GRID_VERSION", 1), ("FITS_ARTIFACT_VERSION", 3), ("INTEGRATE_VERSION", 1), ("SNR_GAIN_VERSION", 2), ("DRIZZLE_KERNEL_VERSION", 2)], checksum: 0xd7addc5b67dd139e },
 ];
 
 /// The live value of a named version constant.
