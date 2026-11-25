@@ -9,6 +9,7 @@ pub mod combine;
 pub mod engine;
 pub mod io_policy;
 pub mod plane_reader;
+pub mod recipe;
 pub mod registered_source;
 pub mod source;
 pub mod stats;

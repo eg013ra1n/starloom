@@ -7,6 +7,8 @@ Starloom is the astrophotography stacking kernel behind Athenaeum: geometry and 
 | none | base | geometry, resampling, the FITS/XISF writer core, the platform memory probe, light-calibration parameter types | nothing heavy |
 | `engine` | 2 | integration, light calibration, cosmetic correction | `rustafits` |
 | `stack` | 3 | registration, measurement, rejection, drizzle, frame weighting and the algorithm config | `engine`, `solvemyastro`, `postcard` |
+| `pipeline` | 4 | the working-folder stages a command line drives (inputs, config levels, versioned folder formats, `master` to `stack`, `run`) | `stack`, `toml`, `glob` |
+| `cli` | 5 | the `starloom` command, with its logs and history | `pipeline`, `clap`, `tracing-subscriber` |
 | `ts` | — | ts-rs type derives (on by default) | `ts-rs` |
 | `test-support` | — | test hooks and fixtures that dependent crates' tests read; never in default | nothing |
 
@@ -32,6 +34,7 @@ A stage version is a public constant. A change to a stage's output bits bumps th
 | `DRIZZLE_KERNEL_VERSION` (`stacking/config.rs`) | 2 | `stack` | the run-level config hash (hash) |
 | `PASS1_ARTIFACT_VERSION` (`stacking/pass1_artifact.rs`) | 1 | `stack` | the pass-1 artifact file header and its stage hash (hash) |
 | `LN_GRID_VERSION` (`stacking/ln/grid.rs`, the `.athln` `VERSION`) | 1 | `stack` | the `.athln` sidecar header |
+| `FITS_ARTIFACT_VERSION` (`stacking/fits_artifact.rs`, the `.athf` version) | 3 | `stack` | the `.athf` file header and the measurement stage hash (`fitsArtifactVersion`) (hash) |
 | `LIGHT_CAL_VERSION` (`calibration_library/mod.rs`) | 1 | base | nothing inside starloom; the caller marks its calibrated lights with it |
 | `MEASURE_STAGE_VERSION` (`stacking/measure.rs`) | 1 | `stack` | the measurement, registration and normalization hashes when not 1 (hash); a bump also raises `PASS1_ARTIFACT_VERSION` with it, because the pass-1 header checks only rustafits' version. In Athenaeum the pass-1 artifact already misses by key without that raise (its stage hash, `pass1_hash_for`, hashes the measurement subtree, which carries the fold); the raise is for a reader of the header alone (a caller with no hash). A bump also re-points two asserts in the application's `stacking/config.rs` tests ("the shipped helper is the versioned one…" and "the shipped measurement helper is the fits-versioned one…") |
 | `INTEGRATE_VERSION` (`stacking/integrate.rs`) | 1 | `stack` | signal: enters no hash |
@@ -42,7 +45,7 @@ A change that moves a stage's bytes bumps the stage's version in the same change
 
 ## Stage goldens
 
-`tests/stage_goldens.rs` runs every stage (measure, pass-1 artifact, register, warp, normalization model, `.athln` format, integrate, SNR gain, drizzle, master bias, master flat, light calibration, cosmetic correction) on a fixed synthetic input on a 2-thread pool and checksums its output. A change that moves a stage's bytes while its version stays is red, and so is a version bump with no new row.
+`tests/stage_goldens.rs` runs every stage (measure, pass-1 artifact, register, warp, normalization model, `.athln` and `.athf` formats, integrate, SNR gain, drizzle, master bias, master flat, light calibration, cosmetic correction, and with the `pipeline` feature the whole `run` chain with its drizzle) on a fixed synthetic input on a 2-thread pool and checksums its output. A change that moves a stage's bytes while its version stays is red, and so is a version bump with no new row.
 
 - **A row is keyed by** the stage name, the platform and the versions it was recorded at: the stage's own version first, then the upstream versions its hash folds (for example the registration row also carries `MEASURE_STAGE_VERSION` and rustafits' `MEASURE_VERSION`).
 - **The platform key** is `<arch>-<os>`, because `exp` and `powf` round one ulp differently from one system math library to the next. Float rows exist for `aarch64-macos` only; the macOS version and the rustafits revision they were recorded with are in the comment above them. A platform with no rows checks determinism only (two runs agree) and prints the rows it would record. The one float-free stage, the `.athln` format, has the platform `"*"` and holds everywhere. A red float row when neither starloom nor rustafits changed points at the system math library first.

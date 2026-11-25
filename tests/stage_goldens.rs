@@ -48,6 +48,7 @@ use starloom::integration::stats::NormalizationPair;
 use starloom::resample::{warp_rows, Plane};
 use starloom::stacking::config::{DrizzleKernel, DRIZZLE_KERNEL_VERSION};
 use starloom::stacking::drizzle::{drizzle_group, DrizzleFrame, DrizzleInput, DrizzleProgress};
+use starloom::stacking::fits_artifact::{write_fits, FITS_ARTIFACT_VERSION};
 use starloom::stacking::integrate::{
     integrate_group, GroupInput, GroupProgress, IntegrationConfig, NormalizationConfig, StackFrame,
     INTEGRATE_VERSION, SNR_GAIN_VERSION,
@@ -61,12 +62,12 @@ use starloom::stacking::measure::{
     MEASURE_STAGE_VERSION,
 };
 use starloom::stacking::pass1_artifact::{write_pass1, PASS1_ARTIFACT_VERSION};
-use starloom::stacking::psf_signal::PsfModel;
+use starloom::stacking::psf_signal::{PsfModel, StarFit};
 use starloom::stacking::register::align::{SeedPolicy, ALIGN_VERSION};
 use starloom::stacking::register::frame::{reference_stars, register_frame};
 use starloom::stacking::register::{scale_gate_for, RegistrationConfig};
 use starloom::stacking::weights::FrameWeight;
-use starloom::star_measure::MEASURE_VERSION;
+use starloom::star_measure::{StarFlags, MEASURE_VERSION};
 use starloom::storage_class::StorageClass;
 use starloom::test_support::{add_noise, synthetic_star_field};
 
@@ -97,6 +98,7 @@ const GOLDENS: &[Golden] = &[
     Golden { stage: "ln_model", platform: "aarch64-macos", versions: &[("LN_MODEL_VERSION", 4), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xe7cffc278266b609 },
     // Float-free, enforced on every platform.
     Golden { stage: "ln_grid_format", platform: "*", versions: &[("LN_GRID_VERSION", 1)], checksum: 0x0c6a45d93ef3d17b },
+    Golden { stage: "fits_artifact_format", platform: "*", versions: &[("FITS_ARTIFACT_VERSION", 3)], checksum: 0xb83708e283d73471 },
     Golden { stage: "integrate", platform: "aarch64-macos", versions: &[("INTEGRATE_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xbeeaee875bbeb3be },
     Golden { stage: "snr_gain", platform: "aarch64-macos", versions: &[("SNR_GAIN_VERSION", 2), ("INTEGRATE_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8)], checksum: 0xcad258e262200dce },
     Golden { stage: "drizzle", platform: "aarch64-macos", versions: &[("DRIZZLE_KERNEL_VERSION", 2)], checksum: 0xbedfc3aff9989e37 },
@@ -104,6 +106,9 @@ const GOLDENS: &[Golden] = &[
     Golden { stage: "master_flat", platform: "aarch64-macos", versions: &[("ENGINE_VERSION", 1)], checksum: 0x606511c5b2815ad7 },
     Golden { stage: "light_cal", platform: "aarch64-macos", versions: &[("LIGHT_CAL_VERSION", 1)], checksum: 0x1c7a4c66d0374d8c },
     Golden { stage: "cosmetic", platform: "aarch64-macos", versions: &[("LIGHT_CAL_VERSION", 1)], checksum: 0x7f7b15225c17ae02 },
+    // The whole chain (`pipeline::run`, with the drizzle): PIPELINE_VERSION first, then every stage and format version it runs. The checksum hashes plane data only.
+    #[cfg(feature = "pipeline")]
+    Golden { stage: "pipeline", platform: "aarch64-macos", versions: &[("PIPELINE_VERSION", 1), ("LIGHT_CAL_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8), ("PASS1_ARTIFACT_VERSION", 1), ("ALIGN_VERSION", 1), ("LN_MODEL_VERSION", 4), ("LN_GRID_VERSION", 1), ("FITS_ARTIFACT_VERSION", 3), ("INTEGRATE_VERSION", 1), ("SNR_GAIN_VERSION", 2), ("DRIZZLE_KERNEL_VERSION", 2)], checksum: 0xd7addc5b67dd139e },
 ];
 
 /// The live value of a named version constant.
@@ -115,11 +120,14 @@ fn live_version(name: &str) -> u32 {
         "ALIGN_VERSION" => ALIGN_VERSION,
         "LN_MODEL_VERSION" => LN_MODEL_VERSION,
         "LN_GRID_VERSION" => u32::from(LN_GRID_VERSION),
+        "FITS_ARTIFACT_VERSION" => u32::from(FITS_ARTIFACT_VERSION),
         "INTEGRATE_VERSION" => INTEGRATE_VERSION,
         "ENGINE_VERSION" => ENGINE_VERSION,
         "SNR_GAIN_VERSION" => SNR_GAIN_VERSION,
         "DRIZZLE_KERNEL_VERSION" => DRIZZLE_KERNEL_VERSION,
         "LIGHT_CAL_VERSION" => LIGHT_CAL_VERSION,
+        #[cfg(feature = "pipeline")]
+        "PIPELINE_VERSION" => starloom::pipeline::PIPELINE_VERSION,
         other => panic!("stage_goldens: unknown version name {other}"),
     }
 }
@@ -522,6 +530,45 @@ fn compute(pool: &Arc<rayon::ThreadPool>) -> Vec<Computed> {
         checksum: digest(&[&std::fs::read(&grid_path).unwrap()]),
     });
 
+    // fits_artifact_format: five star fits of literal values (binary fractions only, so no float rounding enters), as
+    // `write_fits` lays them out.
+    let fits: Vec<StarFit> = (0..5u32)
+        .map(|i| {
+            let f = f64::from(i);
+            StarFit {
+                x: 100.5 + 64.25 * f,
+                y: 200.25 + 32.5 * f,
+                background: 0.0625 + 0.015625 * f,
+                amplitude: 0.5 + 0.125 * f,
+                fwhm_x: 2.5 + 0.25 * f,
+                fwhm_y: 2.75 + 0.25 * f,
+                fwtm_x: 4.5 + 0.5 * f,
+                fwtm_y: 4.75 + 0.5 * f,
+                theta: 0.125 * f,
+                beta: 3.5 + 0.25 * f,
+                residual: 0.03125 * (f + 1.0),
+                signal: 1024.0 * (f + 1.0),
+                area: 24.0 + f,
+                peak5: f64::NAN,
+                sky_ring: f64::NAN,
+                sky_ring_sigma: f64::NAN,
+                sky_ring_n: 0,
+                ap_sum: if i == 3 { f64::NAN } else { 4096.5 + 512.0 * f },
+                snr: f64::NAN,
+                hfr: f64::NAN,
+                flags: StarFlags(u8::try_from(i).expect("a small index")),
+            }
+        })
+        .collect();
+    let athf_path = d.join("literal.athf");
+    write_fits(&athf_path, &fits).expect("the fits artifact writes");
+    rows.push(Computed {
+        stage: "fits_artifact_format",
+        versions: &["FITS_ARTIFACT_VERSION"],
+        portable: true,
+        checksum: digest(&[&std::fs::read(&athf_path).unwrap()]),
+    });
+
     // integrate + snr_gain: 5 frames 128x128, identity maps, one with a planted hot column.
     let int_stars = random_stars(21, 24, 8.0, 112.0);
     let int_paths: Vec<PathBuf> = (0..5u64)
@@ -814,8 +861,114 @@ fn compute(pool: &Arc<rayon::ThreadPool>) -> Vec<Computed> {
         ]),
     });
 
+    #[cfg(feature = "pipeline")]
+    rows.push(pipeline_row(pool, d));
+
     rows
 }
+
+/// A raw 16-bit 768x512 light of `stars` moved by `(dx, dy)`: DN = 100 + 50000 times the noisy field.
+#[cfg(feature = "pipeline")]
+fn raw_light(path: &Path, stars: &[(f64, f64, f64)], dx: f64, dy: f64, seed: u64) -> PathBuf {
+    let moved: Vec<(f64, f64, f64)> = stars.iter().map(|&(x, y, a)| (x + dx, y + dy, a)).collect();
+    let mut field = starloom::test_support::gaussian_field(768, 512, &moved, 1.8, 0.08);
+    add_noise(&mut field, 0.002, seed);
+    write_u16_fits(path, 768, 512, &field.iter().map(|&v| (100.0 + f64::from(v.clamp(0.0, 1.0)) * 50_000.0).round() as u16).collect::<Vec<_>>())
+}
+
+/// A BITPIX 16 FITS with BZERO 32768, the way a camera writes it.
+#[cfg(feature = "pipeline")]
+fn write_u16_fits(path: &Path, w: usize, h: usize, values: &[u16]) -> PathBuf {
+    let mut cards: Vec<String> = vec![
+        format!("{:<8}= {:>20}", "SIMPLE", "T"),
+        format!("{:<8}= {:>20}", "BITPIX", 16),
+        format!("{:<8}= {:>20}", "NAXIS", 2),
+        format!("{:<8}= {:>20}", "NAXIS1", w),
+        format!("{:<8}= {:>20}", "NAXIS2", h),
+        format!("{:<8}= {:>20}", "BZERO", 32768),
+        format!("{:<8}= {:>20}", "BSCALE", 1),
+        format!("{:<8}= {:>20}", "EXPTIME", "300.0"),
+        "END".to_string(),
+    ];
+    let mut bytes = Vec::new();
+    for c in cards.drain(..) {
+        bytes.extend_from_slice(format!("{c:<80}").as_bytes());
+    }
+    bytes.resize(bytes.len().div_ceil(2880) * 2880, b' ');
+    for &v in values {
+        bytes.extend_from_slice(&((i32::from(v) - 32768) as i16).to_be_bytes());
+    }
+    bytes.resize(bytes.len().div_ceil(2880) * 2880, 0);
+    std::fs::write(path, bytes).unwrap();
+    path.to_path_buf()
+}
+
+/// `pipeline`: `run` over four raw lights of one star field (a raw master dark among them), default config with the
+/// drizzle on at scale 2 and the shipped local-normalization setting (local normalization for the rejection only): the
+/// checksum covers the plane data of the master and of the drizzled master, and no header card (the cards are pinned by
+/// the pipeline's own tests, and `SWCREATE`, `SLM_VER` and `SLM_CFG` carry the build). It moves with any stage version
+/// and with the formats the chain writes and reads back (`LN_GRID_VERSION`, `FITS_ARTIFACT_VERSION`,
+/// `PASS1_ARTIFACT_VERSION`), and with `PIPELINE_VERSION` when the glue between the stages changes those bytes (the
+/// order frames are taken in, the gates on local normalization and the rejection bitmaps).
+#[cfg(feature = "pipeline")]
+fn pipeline_row(pool: &Arc<rayon::ThreadPool>, d: &Path) -> Computed {
+    use starloom::integration::plane_reader::PlaneReader;
+    use starloom::pipeline::{run, CalGroup, CalSource, Ctx, NoProgress, ReferenceChoice};
+    use starloom::stacking::config::{algorithm_preset, StackingPreset};
+
+    let raw = d.join("pipeline-raw");
+    std::fs::create_dir_all(&raw).unwrap();
+    let stars = random_stars(21, 150, 40.0, 440.0);
+    let lights: Vec<PathBuf> = [(0.0, 0.0), (3.0, -2.0), (-4.0, 5.0), (1.0, 2.0)]
+        .iter()
+        .enumerate()
+        .map(|(k, &(dx, dy))| raw_light(&raw.join(format!("Light_{k:04}.fits")), &stars, dx, dy, 700 + k as u64))
+        .collect();
+    let darks: Vec<PathBuf> = (0..4u64)
+        .map(|k| {
+            let mut plane = vec![100.0f32; 768 * 512];
+            add_noise(&mut plane, 2.0, 800 + k);
+            write_u16_fits(&raw.join(format!("Dark_{k:04}.fits")), 768, 512, &plane.iter().map(|&v| v.round() as u16).collect::<Vec<_>>())
+        })
+        .collect();
+    let groups = [CalGroup { lights, dark: Some(CalSource::Raw(darks)), flat: None, bias: None, flat_precal: None }];
+    let mut cfg = algorithm_preset(StackingPreset::Default);
+    cfg.drizzle.enabled = true;
+    let cancel = AtomicBool::new(false);
+    let work = d.join("pipeline-work");
+    let ctx = Ctx { pool: pool.clone(), cancel: &cancel, progress: &NoProgress, memory_budget_bytes: 1 << 30, work_dir: &work };
+    let report = run(&ctx, &groups, &cfg, &ReferenceChoice::Auto, &d.join("pipeline-out"), starloom::fits_writer::OutputFormat::Fits).unwrap();
+    let planes = |path: &Path| {
+        let r = PlaneReader::open(path).unwrap();
+        (0..r.channels()).flat_map(|c| f32_bytes(&r.read_plane(c).unwrap())).collect::<Vec<u8>>()
+    };
+    let drizzled = report.stack.drizzle.as_ref().expect("the drizzle ran");
+    Computed {
+        stage: "pipeline",
+        versions: PIPELINE_VERSIONS,
+        portable: false,
+        checksum: digest(&[&planes(&report.stack.master), &planes(&drizzled.master)]),
+    }
+}
+
+/// The versions the `pipeline` row is keyed on: the pipeline's own, then every stage version and every format version
+/// `run` goes through (the pass-1 artifact, the local-normalization grid and the FITS artifact it writes and reads back).
+#[cfg(feature = "pipeline")]
+const PIPELINE_VERSIONS: &[&str] = &[
+    "PIPELINE_VERSION",
+    "LIGHT_CAL_VERSION",
+    "ENGINE_VERSION",
+    "MEASURE_STAGE_VERSION",
+    "MEASURE_VERSION",
+    "PASS1_ARTIFACT_VERSION",
+    "ALIGN_VERSION",
+    "LN_MODEL_VERSION",
+    "LN_GRID_VERSION",
+    "FITS_ARTIFACT_VERSION",
+    "INTEGRATE_VERSION",
+    "SNR_GAIN_VERSION",
+    "DRIZZLE_KERNEL_VERSION",
+];
 
 fn platform() -> String {
     format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)

@@ -1,14 +1,23 @@
 //! Stacking configuration: the measurement and drizzle sections, the pure items a caller's whole stacking
-//! configuration tree is built from (the caller owns the tree itself and its hashing).
+//! configuration tree is built from, and the resolution of its algorithm sections ([`resolve_algorithm`]); the caller
+//! owns the tree itself and its hashing.
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
-use crate::integration::stats::ScaleEstimator;
-use crate::stacking::measure::MeasureOptions;
+use crate::calibration_library::options::CalibratedLightOptions;
+use crate::integration::stats::{RejectionNormalization, ScaleEstimator};
+use crate::resample::Interpolation;
+use crate::stacking::fits_artifact::FITS_ARTIFACT_VERSION;
+use crate::stacking::integrate::{IntegrationConfig, NormalizationConfig, RejectionChoice};
+use crate::stacking::measure::{MeasureOptions, MEASURE_STAGE_VERSION};
 use crate::stacking::prefilter::SeedPrefilter;
 use crate::stacking::psf_signal::PsfModel;
+use crate::stacking::register::align::ALIGN_VERSION;
+use crate::stacking::register::{DistortionChoice, RegistrationConfig};
 use crate::stacking::structure::SeedDetector;
-use crate::stacking::weights::{FormulaWeights, WeightMode};
+use crate::stacking::weights::{FormulaWeights, SelectionConfig, WeightMode};
+use crate::star_measure::MEASURE_VERSION;
 
 /// The measurement settings of a stacking run, chosen once per run: how frames are weighted, which star profile is
 /// fitted and how stars are found (spec §9.2 `measurement:`).
@@ -337,3 +346,666 @@ pub const MAX_GROWTH: u8 = 4;
 /// pass. That costs those frames one pass on one plan and then settles;
 /// every stored `stacking_artifacts` row is untouched.
 pub const DRIZZLE_KERNEL_VERSION: u32 = 2;
+
+/// spec §9.2: built-in config transforms. Editing any field afterward makes
+/// the effective config "Custom" — that bookkeeping belongs to the caller
+/// (the Stacking tab / run orchestration), not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub enum StackingPreset {
+    /// The shipped default.
+    Default,
+    /// A fast preview: bilinear interpolation, sigma clipping and no local normalization.
+    FastPreview,
+    /// The most the algorithms offer: polynomial distortion, rejection maps, local normalization and 2x drizzle.
+    MaximumQuality,
+}
+
+/// The seven algorithm sections of a stacking configuration: what the stages compute with, and nothing of how a caller
+/// groups frames, where it keeps files or what it does with the intermediates. A whole Athenaeum `StackingConfig`
+/// document parses into it (it reads these seven keys and ignores the others), and a stage hash is built from its
+/// subtrees ([`calibration_subtree`], [`measurement_subtree`], [`registration_subtree`], [`normalization_subtree`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AlgorithmConfig {
+    /// How lights are calibrated.
+    pub calibration: CalibratedLightOptions,
+    /// How stars are measured and frames weighted.
+    pub measurement: MeasurementConfig,
+    /// Which frames are kept.
+    pub selection: SelectionConfig,
+    /// How frames are registered.
+    pub registration: RegistrationConfig,
+    /// How frames and rejection are normalized.
+    pub normalization: NormalizationConfig,
+    /// How frames are rejected and combined.
+    pub integration: IntegrationConfig,
+    /// The drizzle stage.
+    pub drizzle: DrizzleConfig,
+}
+
+impl Default for AlgorithmConfig {
+    fn default() -> Self {
+        AlgorithmConfig {
+            calibration: CalibratedLightOptions::default(),
+            measurement: MeasurementConfig::default(),
+            selection: SelectionConfig::default(),
+            registration: RegistrationConfig::default(),
+            normalization: NormalizationConfig::default(),
+            integration: IntegrationConfig::default(),
+            drizzle: DrizzleConfig::default(),
+        }
+    }
+}
+
+/// Resolves a [`StackingPreset`] to its algorithm sections.
+///
+/// `MaximumQuality` (M3 Task 5, spec §9.2): turns on everything the spec text always described: `distortion`,
+/// `writeRejectionMaps`, LOCAL NORMALIZATION and 2x DRIZZLE.
+///
+/// `FastPreview` (M4a Task 4, ruling R-M4a-18) pins the rejection normalization to `ScaleZeroOffset` (owner ruling
+/// 2026-11-01, OD-3): the shipped default is `Local`, whose Normalize stage costs about as much as the integration
+/// itself, and a preview has no use for it. `Default` and `MaximumQuality` inherit `Local`. A caller's own sections
+/// (Athenaeum's `FastPreview` also turns off the two-pass reference pick and deletes intermediates) are the caller's.
+pub fn algorithm_preset(p: StackingPreset) -> AlgorithmConfig {
+    match p {
+        StackingPreset::Default => AlgorithmConfig::default(),
+        StackingPreset::FastPreview => {
+            let mut c = AlgorithmConfig::default();
+            c.registration.interpolation = Interpolation::Bilinear;
+            c.integration.rejection = RejectionChoice::SigmaClip {
+                sigma_low: 4.0,
+                sigma_high: 3.0,
+            };
+            // OD-3: a preview's promise is speed - no Normalize stage.
+            c.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
+            c
+        }
+        StackingPreset::MaximumQuality => {
+            let mut c = AlgorithmConfig::default();
+            c.registration.distortion = DistortionChoice::Polynomial3;
+            c.integration.write_rejection_maps = true;
+            c.normalization.local.enabled = true;
+            c.drizzle.enabled = true;
+            c.drizzle.scale = 2;
+            c
+        }
+    }
+}
+
+/// The `grouping.exposureToleranceSec` value [`calibration_subtree`] writes, whatever the config says (spec
+/// 2026-11-08 §5.2). It holds the hash shape — a set at the shipped default tolerance keeps a byte-identical hash —
+/// and says nothing about the run: the tolerance decides which frames share a group, never what a calibrated frame
+/// contains.
+pub const CALIBRATION_HASH_GROUPING_TOLERANCE_SEC: f64 = 2.0;
+
+/// Stage 1 (calibration) config subtree (spec §9.3): the frame's
+/// calibration options plus the grouping key's shape, written as the
+/// constant [`CALIBRATION_HASH_GROUPING_TOLERANCE_SEC`] (not the config's
+/// tolerance).
+pub fn calibration_subtree(cfg: &AlgorithmConfig) -> serde_json::Value {
+    // `calibration.format` (the XISF plan, 2026-09-18, ruling R6) is the
+    // container an EXPORT or a SEND writes; the run forces FITS for its own
+    // calibrated frames before the spec is resolved (`stacking::run`), so
+    // the field can never change a cached calibrated artifact and must not
+    // move this hash — otherwise every set would recalibrate once for a
+    // field it ignores. Pinned by `format_moves_the_run_fingerprint_but_no_stage_hash`.
+    let mut calibration =
+        serde_json::to_value(&cfg.calibration).expect("CalibratedLightOptions serializes");
+    if let Some(obj) = calibration.as_object_mut() {
+        obj.remove("format");
+    }
+    // Spec 2026-10-02 §8 (fable C1): the grouping half is written out field
+    // by field, in exactly today's shape. A new `GroupingConfig` field
+    // regroups frames (its group keys change, so group-keyed artifacts are
+    // recomputed under the new keys) but must never move this hash, which
+    // would make every frame set recompute once. Pinned by
+    // `stage_hashes_are_pinned_to_golden_literals`.
+    serde_json::json!({
+        "calibration": calibration,
+        "grouping": { "exposureToleranceSec": CALIBRATION_HASH_GROUPING_TOLERANCE_SEC },
+    })
+}
+
+/// Stage 3 (measurement) config subtree: the measurement settings, the
+/// scale estimator normalization keeps in lockstep with it (see
+/// [`MeasurementConfig::measure_options`]), and
+/// [`crate::star_measure::MEASURE_VERSION`] — the config alone
+/// cannot express "the fitter itself now accepts different stars", which is
+/// what M4a Task 2 did to every stored measurement (ruling R-M4a-15).
+pub fn measurement_subtree(cfg: &AlgorithmConfig) -> serde_json::Value {
+    measurement_subtree_with_fits_artifact_version(cfg, FITS_ARTIFACT_VERSION)
+}
+
+/// [`measurement_subtree`] with the `.athf` format version supplied (Plan D D2c r1): the version the Measure stage's
+/// `fits.<plane>` files are written at is folded beside [`MEASURE_VERSION`] (`fitsArtifactVersion`), so a row measured at
+/// another format version is keyed on another hash and misses by key. The plan gate then needs no read of the file: a
+/// fresh row is its hash and its stat (`plan::is_fresh`). Nothing else should call this with anything but
+/// [`FITS_ARTIFACT_VERSION`]; the pins of earlier versions go through
+/// [`measurement_subtree_with_measure_version`], which keeps the shape from before the fold.
+// doc(hidden): public only for Athenaeum core's pinned hash tests; a stage hash built at another version
+// is not API, so the CLI never calls it.
+#[doc(hidden)]
+pub fn measurement_subtree_with_fits_artifact_version(
+    cfg: &AlgorithmConfig,
+    fits_artifact_version: u16,
+) -> serde_json::Value {
+    let mut subtree = measurement_subtree_with_measure_version(cfg, MEASURE_VERSION);
+    subtree["fitsArtifactVersion"] = serde_json::json!(fits_artifact_version);
+    fold_measure_stage_version(&mut subtree, MEASURE_STAGE_VERSION);
+    subtree
+}
+
+/// Folds starloom's [`MEASURE_STAGE_VERSION`] into a subtree that reads the measure stage's numbers, as
+/// `measureStageVersion`, only when it is not 1: at 1 the key is absent, so every hash keeps the bytes it had before
+/// the version existed (starloom phase 1, P1-R1). A bump recomputes the measurement, registration and normalization
+/// artifacts, and is raised together with `PASS1_ARTIFACT_VERSION`.
+// doc(hidden): public only for Athenaeum core's pinned hash tests; a stage hash built at another version
+// is not API, so the CLI never calls it.
+#[doc(hidden)]
+pub fn fold_measure_stage_version(subtree: &mut serde_json::Value, version: u32) {
+    if version != 1 {
+        subtree["measureStageVersion"] = serde_json::json!(version);
+    }
+}
+
+/// [`measurement_subtree`] with the measure version supplied, so a test can
+/// prove the hash actually follows it (nothing else should call this with
+/// anything but [`MEASURE_VERSION`]).
+// doc(hidden): public only for Athenaeum core's pinned hash tests; a stage hash built at another version
+// is not API, so the CLI never calls it.
+#[doc(hidden)]
+pub fn measurement_subtree_with_measure_version(
+    cfg: &AlgorithmConfig,
+    measure_version: u32,
+) -> serde_json::Value {
+    // Spec 2026-11-08 §5.4: the weights are computed in every run from the stored measurements (`run/`
+    // `stage_measure_with`, `compute_weights`) and no fit reads `weightMode`, `formula` or `keyword`, so they are
+    // written as the shipped defaults: changing the weighting must not re-measure. A set with default weights keeps
+    // its hash byte for byte.
+    let defaults = MeasurementConfig::default();
+    let mut measurement = cfg.measurement.clone();
+    measurement.weight_mode = defaults.weight_mode;
+    measurement.formula = defaults.formula;
+    measurement.keyword = defaults.keyword;
+    serde_json::json!({
+        "measurement": measurement,
+        "normalization": { "scaleEstimator": cfg.normalization.scale_estimator },
+        "measureVersion": measure_version,
+    })
+}
+
+/// Stage 5 (registration) config subtree, plus
+/// [`crate::star_measure::MEASURE_VERSION`] (Tier C Task 3, ruling
+/// C-6): a mono frame's registration star list can now come straight from
+/// Measure's own accepted PSF fits (`stacking::register::detect::
+/// stars_from_fits`) instead of a fresh detection, so a fitter change —
+/// which changes what those fits SAY — has to re-register every mono set
+/// exactly the way it already re-measures and re-normalizes them (the same
+/// reasoning [`measurement_subtree`]/[`normalization_subtree`] already
+/// follow). The first run after this fold-in re-registers every set once
+/// on purpose, rewriting every `registered` artifact
+/// (perf tier A Task 6a) and re-running every downstream stage that reads
+/// it (Normalize, Integrate).
+///
+/// It also carries [`crate::stacking::register::align::ALIGN_VERSION`]
+/// (`alignVersion`, robust quad seed RQ-5): what `align` returns for an
+/// unchanged star list (the seed, the coverage gate) is no config field
+/// either, so a change in it moves this hash the way a fitter change does —
+/// every set re-registers once, and Calibrate and Measure stay cached.
+pub fn registration_subtree(cfg: &AlgorithmConfig) -> serde_json::Value {
+    let mut subtree = registration_subtree_with_versions(cfg, MEASURE_VERSION, ALIGN_VERSION);
+    fold_measure_stage_version(&mut subtree, MEASURE_STAGE_VERSION);
+    subtree
+}
+
+/// [`registration_subtree`] with both versions supplied, so a test can prove
+/// the hash follows each (nothing else should call this with anything but
+/// [`MEASURE_VERSION`] and [`ALIGN_VERSION`]). The measure-version pin
+/// goes through [`registration_subtree_with_measure_version`], which
+/// keeps the shape from before the fold.
+// doc(hidden): public only for Athenaeum core's pinned hash tests; a stage hash built at another version
+// is not API, so the CLI never calls it.
+#[doc(hidden)]
+pub fn registration_subtree_with_versions(
+    cfg: &AlgorithmConfig,
+    measure_version: u32,
+    align_version: u32,
+) -> serde_json::Value {
+    let mut subtree = registration_subtree_with_measure_version(cfg, measure_version);
+    subtree["alignVersion"] = serde_json::json!(align_version);
+    subtree
+}
+
+/// [`registration_subtree`] with the measure version supplied and no
+/// `alignVersion` — see [`measurement_subtree_with_measure_version`].
+// doc(hidden): public only for Athenaeum core's pinned hash tests; a stage hash built at another version
+// is not API, so the CLI never calls it.
+#[doc(hidden)]
+pub fn registration_subtree_with_measure_version(
+    cfg: &AlgorithmConfig,
+    measure_version: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "registration": cfg.registration,
+        "measureVersion": measure_version,
+    })
+}
+
+/// Stage 6 (local normalization, M2) config subtree: the whole
+/// `normalization` block (global output/rejection choice AND the `local`
+/// block — a change to either invalidates a stored `.athln`/reference; this
+/// already covers the PSF model [`crate::stacking::ln::normalize_frame`]
+/// actually hands [`crate::stacking::ln::scale::relative_scale`], which is
+/// `normalization.local.psfModel`, never `measurement.psfModel`) plus
+/// `measurement.maxStars` — the ONE genuinely extra fold-in, since it is the
+/// detection/PSF-fit budget `relative_scale` uses for both planes but lives
+/// under `measurement`, not `normalization`. `measurement.psfModel` rides
+/// along too (harmless — it just widens what invalidates a sidecar — but
+/// plays no role in `relative_scale`'s own model choice; fix round 1, item
+/// 11: an earlier version of this comment claimed otherwise), plus
+/// [`crate::star_measure::MEASURE_VERSION`]: `relative_scale` fits
+/// its matched stars through the same `fit_stars` /
+/// `FitParams::default()` the measurement uses, so a change to what the
+/// fitter accepts silently changes every `.athln` — and no config field
+/// moves when it does (ruling R-M4a-15). It also carries
+/// [`crate::stacking::ln::LN_MODEL_VERSION`] (`lnModelVersion`): a change in
+/// what an existing config's LN model produces moves the hashes the same way.
+pub fn normalization_subtree(cfg: &AlgorithmConfig) -> serde_json::Value {
+    let mut subtree = normalization_subtree_with_measure_version(cfg, MEASURE_VERSION);
+    fold_measure_stage_version(&mut subtree, MEASURE_STAGE_VERSION);
+    subtree
+}
+
+/// [`normalization_subtree`] with the measure version supplied — see
+/// [`measurement_subtree_with_measure_version`].
+// doc(hidden): public only for Athenaeum core's pinned hash tests; a stage hash built at another version
+// is not API, so the CLI never calls it.
+#[doc(hidden)]
+pub fn normalization_subtree_with_measure_version(
+    cfg: &AlgorithmConfig,
+    measure_version: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "normalization": canonical_normalization(cfg),
+        "measurement": {
+            "psfModel": cfg.measurement.psf_model,
+            "maxStars": cfg.measurement.max_stars,
+        },
+        "measureVersion": measure_version,
+        "lnModelVersion": crate::stacking::ln::LN_MODEL_VERSION,
+    })
+}
+
+/// The normalization block as the LN hashes see it (L-19): `scale`,
+/// `scaleMode` and `gridSize` leave it - their effect reaches the hashes as
+/// the resolved-scale token - so auto <-> fixed at the same resolved value
+/// invalidates nothing.
+fn canonical_normalization(cfg: &AlgorithmConfig) -> serde_json::Value {
+    let mut v = serde_json::to_value(&cfg.normalization).expect("NormalizationConfig serializes");
+    if let Some(local) = v.get_mut("local").and_then(|l| l.as_object_mut()) {
+        for key in ["scale", "scaleMode", "gridSize"] {
+            local.remove(key);
+        }
+        // The aperture only matters under the common aperture (spec §7).
+        if cfg.normalization.local.flux_estimator
+            != crate::stacking::integrate::LnFluxEstimator::CommonAperture
+        {
+            local.remove("aperture");
+        }
+    }
+    v
+}
+
+/// The range [`resolve_algorithm`] clamps [`MeasurementConfig::detection_sigma`]
+/// to — the same numbers Athenaeum's Measure panel field offers, enforced on the
+/// backend too because a stored or hand-edited document never went through
+/// that field (M4a Task 2 fix round 3).
+pub const MIN_DETECTION_SIGMA: f64 = 1.0;
+/// The largest [`MeasurementConfig::detection_sigma`] [`resolve_algorithm`] keeps.
+pub const MAX_DETECTION_SIGMA: f64 = 100.0;
+
+/// The range [`resolve_algorithm`] clamps
+/// [`crate::stacking::register::RegistrationConfig::tps_smoothing`] to —
+/// the same 0–10 Athenaeum's Register panel field offers (M4c Task 4 fix round 1,
+/// minor 5). Enforced on the backend for the same reason as
+/// `detectionSigma`: a stored or hand-edited document never went through
+/// that field, and a negative or non-finite λ would otherwise make
+/// `ThinPlateSpline::fit` refuse EVERY frame's spline one at a time, with
+/// a per-frame note instead of one honest warning about the config.
+pub const MIN_TPS_SMOOTHING: f64 = 0.0;
+/// The largest `tps_smoothing` [`resolve_algorithm`] keeps.
+pub const MAX_TPS_SMOOTHING: f64 = 10.0;
+
+/// The smallest `measurement.fitStars` ([`resolve_algorithm`] clamps up to `max(MIN_FIT_STARS, registration.maxStars)`):
+/// mono Register takes Measure's fits whenever they exist and never falls back to detection, so a K under its
+/// budget would starve it (FM-3).
+pub const MIN_FIT_STARS: u32 = 1_000;
+
+/// [`MeasurementConfig::seed_threshold`]'s range (ruling R-OSP-2): the smallest value [`resolve_algorithm`] keeps.
+pub const MIN_SEED_THRESHOLD: f64 = crate::star_measure::seeds::MIN_THRESHOLD;
+/// The largest [`MeasurementConfig::seed_threshold`] [`resolve_algorithm`] keeps.
+pub const MAX_SEED_THRESHOLD: f64 = crate::star_measure::seeds::MAX_THRESHOLD;
+
+/// The algorithm half of Athenaeum's config resolution (its `resolve_config` runs the app half, the grouping clamps
+/// and the version, then this): the `tpsSmoothing` clamp, the large-scale filter's two integer clamps, then
+/// [`resolve_ln_fields`] (the LN fields, the two seed clamps and `fitStars`). A value out of range is clamped with one
+/// `warn!` each. Idempotent. A config resolved here runs and hashes as Athenaeum would run and hash it.
+pub fn resolve_algorithm(config: &mut AlgorithmConfig) {
+    config.registration.tps_smoothing = clamp_tps_smoothing(config.registration.tps_smoothing);
+    // M4c Task 3: the same backend guard for the large-scale filter's two
+    // integers. Out of range these are not preferences but a broken filter
+    // — the window doubles with every layer, so a hand-edited
+    // `protectedLayers: 40` would ask for a 2^41-wide window (and shift a
+    // `usize` past its width), and a large `growth` grows every structure
+    // by a disc of that radius. The UI's own fields already offer exactly
+    // these ranges.
+    if !(MIN_PROTECTED_LAYERS..=MAX_PROTECTED_LAYERS)
+        .contains(&config.integration.large_scale.protected_layers)
+    {
+        let clamped = config
+            .integration
+            .large_scale
+            .protected_layers
+            .clamp(MIN_PROTECTED_LAYERS, MAX_PROTECTED_LAYERS);
+        warn!(
+            value = config.integration.large_scale.protected_layers,
+            clamped, "stacking config: protectedLayers out of range; clamped"
+        );
+        config.integration.large_scale.protected_layers = clamped;
+    }
+    if config.integration.large_scale.growth > MAX_GROWTH {
+        warn!(
+            value = config.integration.large_scale.growth,
+            clamped = MAX_GROWTH,
+            "stacking config: growth above the maximum; clamped"
+        );
+        config.integration.large_scale.growth = MAX_GROWTH;
+    }
+    resolve_ln_fields(config);
+}
+
+/// L-9 and the spec §6 clamps for the LN fields (and the two seed clamps
+/// `detectionSigma` / `seedThreshold`), on any config that came from
+/// storage or from a caller (a stored config, a plan override, a decoded user
+/// preset), and the `measurement.fitStars` clamp (`resolve_fit_stars`). Idempotent.
+pub fn resolve_ln_fields(config: &mut AlgorithmConfig) {
+    // The two seed clamps ride the same shared resolver, so a plan override or
+    // a decoded preset cannot carry an out-of-range value past resolve_config.
+    config.measurement.detection_sigma = clamp_detection_sigma(config.measurement.detection_sigma);
+    config.measurement.seed_threshold = clamp_seed_threshold(config.measurement.seed_threshold);
+    resolve_fit_stars(config);
+    use crate::stacking::integrate::LnScaleMode;
+    use crate::stacking::ln::{effective_scale_mode, snap_ln_scale, MAX_GRID_SIZE, MIN_GRID_SIZE};
+    let local = &mut config.normalization.local;
+    if local.scale_mode.is_none() {
+        let mode = effective_scale_mode(local);
+        tracing::debug!(
+            scale = local.scale,
+            ln_scale_mode = mode.as_str(),
+            "stacking config: legacy LN scale resolved"
+        );
+        local.scale_mode = Some(mode);
+    }
+    if local.scale_mode == Some(LnScaleMode::Fixed) {
+        let snapped = snap_ln_scale(local.scale as f64);
+        if snapped != local.scale {
+            warn!(
+                value = local.scale,
+                clamped = snapped,
+                "stacking config: LN scale is not a supported size; snapped"
+            );
+            local.scale = snapped;
+        }
+    }
+    if !(MIN_GRID_SIZE..=MAX_GRID_SIZE).contains(&local.grid_size) {
+        let clamped = local.grid_size.clamp(MIN_GRID_SIZE, MAX_GRID_SIZE);
+        warn!(
+            value = local.grid_size,
+            clamped, "stacking config: LN gridSize out of range; clamped"
+        );
+        local.grid_size = clamped;
+    }
+    let sel = &mut local.star_selection;
+    // `!(x >= MIN)` so a NaN clamps to the minimum too.
+    if !(sel.min_peak_snr >= 5.0) || sel.min_peak_snr > 200.0 {
+        let clamped = if sel.min_peak_snr > 200.0 { 200.0 } else { 5.0 };
+        warn!(
+            value = sel.min_peak_snr,
+            clamped, "stacking config: LN starSelection.minPeakSnr out of range; clamped"
+        );
+        sel.min_peak_snr = clamped;
+    }
+    if !(20..=5000).contains(&sel.max_stars) {
+        let clamped = sel.max_stars.clamp(20, 5000);
+        warn!(
+            value = sel.max_stars,
+            clamped, "stacking config: LN starSelection.maxStars out of range; clamped"
+        );
+        sel.max_stars = clamped;
+    }
+    if !(sel.saturation >= 0.5) || sel.saturation > 1.0 {
+        let clamped = if sel.saturation > 1.0 { 1.0 } else { 0.5 };
+        warn!(
+            value = sel.saturation,
+            clamped, "stacking config: LN starSelection.saturation out of range; clamped"
+        );
+        sel.saturation = clamped;
+    }
+}
+
+/// `measurement.fitStars` (FM-3): a K under the floor `max(`[`MIN_FIT_STARS`]`, registration.maxStars)` is clamped up
+/// to it with a `warn!`; a K at or above `measurement.maxStars` is All and is stored as `None` (equivalent configs
+/// share hashes); a `selection.minStars` above the effective K warns, since selection reads `stars_fitted` and every
+/// frame would be excluded. Idempotent. The probe passes its K straight to the module and never comes through here.
+fn resolve_fit_stars(config: &mut AlgorithmConfig) {
+    let Some(k) = config.measurement.fit_stars else {
+        return;
+    };
+    let floor = MIN_FIT_STARS.max(u32::try_from(config.registration.max_stars).unwrap_or(u32::MAX));
+    let resolves_to_all = |k: u32| k as usize >= config.measurement.max_stars;
+    let k = if k < floor {
+        if resolves_to_all(floor) {
+            warn!(
+                value = k,
+                clamped = floor,
+                "stacking config: fitStars below the floor; resolves to all"
+            );
+        } else {
+            warn!(
+                value = k,
+                clamped = floor,
+                "stacking config: fitStars below the floor; clamped"
+            );
+        }
+        floor
+    } else {
+        k
+    };
+    if resolves_to_all(k) {
+        config.measurement.fit_stars = None;
+        return;
+    }
+    config.measurement.fit_stars = Some(k);
+    if let Some(min) = config.selection.min_stars {
+        if min > k as usize {
+            warn!(
+                value = min,
+                count = k,
+                "stacking config: selection.minStars above fitStars; every frame would be excluded"
+            );
+        }
+    }
+}
+
+/// [`MeasurementConfig::detection_sigma`] into
+/// `[MIN_DETECTION_SIGMA, MAX_DETECTION_SIGMA]`, warning when it moves.
+///
+/// The UI's own field already offers exactly that range; this is the
+/// backend's guard for a value that never went through it — a stored
+/// document, a hand-edited one, or a caller building the struct directly.
+/// Out of range it is not a preference but a broken detector: at `0` or
+/// below, every pixel clears the level, and at an infinity none does.
+///
+/// `!(x >= MIN)` rather than `x < MIN` so a NaN clamps too (every
+/// comparison against NaN is false) — the same shape the exposure-tolerance
+/// floor uses. JSON cannot express NaN or an infinity (`serde_json` rejects
+/// both the literals and out-of-range magnitudes such as `1e309`), so that
+/// arm only ever fires for a programmatic caller; it is cheap and it means
+/// the value handed to the detector is finite by construction.
+pub fn clamp_detection_sigma(value: f64) -> f64 {
+    if !(value >= MIN_DETECTION_SIGMA) {
+        warn!(
+            detection_sigma = value,
+            min = MIN_DETECTION_SIGMA,
+            "stacking config: detectionSigma below the minimum; clamped"
+        );
+        return MIN_DETECTION_SIGMA;
+    }
+    if value > MAX_DETECTION_SIGMA {
+        warn!(
+            detection_sigma = value,
+            max = MAX_DETECTION_SIGMA,
+            "stacking config: detectionSigma above the maximum; clamped"
+        );
+        return MAX_DETECTION_SIGMA;
+    }
+    value
+}
+
+/// [`MeasurementConfig::seed_threshold`] into [`MIN_SEED_THRESHOLD`]..=[`MAX_SEED_THRESHOLD`], warning when it
+/// moves. `!(x >= MIN)` so a NaN clamps too.
+fn clamp_seed_threshold(value: f64) -> f64 {
+    if !(value >= MIN_SEED_THRESHOLD) {
+        warn!(
+            seed_threshold = value,
+            min = MIN_SEED_THRESHOLD,
+            "stacking config: seedThreshold below the minimum; clamped"
+        );
+        return MIN_SEED_THRESHOLD;
+    }
+    if value > MAX_SEED_THRESHOLD {
+        warn!(
+            seed_threshold = value,
+            max = MAX_SEED_THRESHOLD,
+            "stacking config: seedThreshold above the maximum; clamped"
+        );
+        return MAX_SEED_THRESHOLD;
+    }
+    value
+}
+
+/// [`MIN_TPS_SMOOTHING`]..=[`MAX_TPS_SMOOTHING`], with the one-time
+/// `warn!` the other clamps use. `!(value >= MIN)` rather than
+/// `value < MIN` so a NaN clamps too — every comparison against NaN is
+/// false, and a NaN λ would sink every spline in the run.
+pub fn clamp_tps_smoothing(value: f64) -> f64 {
+    if !(value >= MIN_TPS_SMOOTHING) {
+        warn!(
+            value,
+            min = MIN_TPS_SMOOTHING,
+            "stacking config: tpsSmoothing below the minimum; clamped"
+        );
+        return MIN_TPS_SMOOTHING;
+    }
+    if value > MAX_TPS_SMOOTHING {
+        warn!(
+            value,
+            max = MAX_TPS_SMOOTHING,
+            "stacking config: tpsSmoothing above the maximum; clamped"
+        );
+        return MAX_TPS_SMOOTHING;
+    }
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A whole Athenaeum stacking configuration document parses into the algorithm sections: the other sections
+    /// (grouping, reference, output, paths and the version) are ignored, and the seven it reads come out as the defaults.
+    #[test]
+    fn a_whole_default_stacking_document_parses_into_the_default_algorithm_config() {
+        let text = include_str!("../../tests/fixtures/stacking-config-default.json");
+        let parsed: AlgorithmConfig = serde_json::from_str(text).expect("the fixture parses");
+        assert_eq!(parsed, AlgorithmConfig::default());
+        assert_eq!(algorithm_preset(StackingPreset::Default), AlgorithmConfig::default());
+    }
+
+    #[test]
+    fn the_presets_differ_from_the_default_where_they_say_they_do() {
+        let fast = algorithm_preset(StackingPreset::FastPreview);
+        assert_eq!(fast.registration.interpolation, Interpolation::Bilinear);
+        assert_eq!(fast.normalization.rejection, RejectionNormalization::ScaleZeroOffset);
+        let max = algorithm_preset(StackingPreset::MaximumQuality);
+        assert!(max.drizzle.enabled && max.drizzle.scale == 2);
+        assert!(max.normalization.local.enabled && max.integration.write_rejection_maps);
+        assert_eq!(max.registration.distortion, DistortionChoice::Polynomial3);
+    }
+
+    #[test]
+    fn the_calibration_subtree_drops_the_output_format_and_pins_the_grouping_tolerance() {
+        let mut cfg = AlgorithmConfig::default();
+        let subtree = calibration_subtree(&cfg);
+        assert!(subtree["calibration"].get("format").is_none());
+        assert_eq!(
+            subtree["grouping"]["exposureToleranceSec"],
+            serde_json::json!(CALIBRATION_HASH_GROUPING_TOLERANCE_SEC)
+        );
+        cfg.calibration.format = crate::fits_writer::OutputFormat::Xisf;
+        assert_eq!(calibration_subtree(&cfg), subtree, "the container moves no stage hash");
+    }
+
+    /// The algorithm half of Athenaeum's `resolve_config` (pinned there before it moved): every preset is already
+    /// resolved, an out-of-range value is brought into range, and a second pass changes nothing.
+    #[test]
+    fn resolve_algorithm_keeps_every_preset_clamps_out_of_range_values_and_is_idempotent() {
+        for p in [StackingPreset::Default, StackingPreset::FastPreview, StackingPreset::MaximumQuality] {
+            let mut cfg = algorithm_preset(p);
+            resolve_algorithm(&mut cfg);
+            assert_eq!(cfg, algorithm_preset(p), "{p:?}");
+        }
+        let mut cfg = AlgorithmConfig::default();
+        cfg.registration.tps_smoothing = f64::NAN;
+        cfg.integration.large_scale.protected_layers = 40;
+        cfg.integration.large_scale.growth = 9;
+        cfg.measurement.detection_sigma = 500.0;
+        cfg.measurement.seed_threshold = -1.0;
+        cfg.measurement.fit_stars = Some(5);
+        cfg.normalization.local.scale_mode = None;
+        cfg.normalization.local.scale = 700;
+        cfg.normalization.local.grid_size = 0;
+        cfg.normalization.local.star_selection.saturation = 2.0;
+        resolve_algorithm(&mut cfg);
+        assert_eq!(cfg.registration.tps_smoothing, MIN_TPS_SMOOTHING);
+        assert_eq!(cfg.integration.large_scale.protected_layers, MAX_PROTECTED_LAYERS);
+        assert_eq!(cfg.integration.large_scale.growth, MAX_GROWTH);
+        assert_eq!(cfg.measurement.detection_sigma, MAX_DETECTION_SIGMA);
+        assert_eq!(cfg.measurement.seed_threshold, MIN_SEED_THRESHOLD);
+        let floor = MIN_FIT_STARS.max(cfg.registration.max_stars as u32);
+        assert_eq!(cfg.measurement.fit_stars, Some(floor));
+        assert_eq!(cfg.normalization.local.scale_mode, Some(crate::stacking::integrate::LnScaleMode::Fixed));
+        assert_eq!(cfg.normalization.local.scale, 768, "700 px snaps to the nearest supported size");
+        assert_eq!(cfg.normalization.local.grid_size, crate::stacking::ln::MIN_GRID_SIZE);
+        assert_eq!(cfg.normalization.local.star_selection.saturation, 1.0);
+        let once = cfg.clone();
+        resolve_algorithm(&mut cfg);
+        assert_eq!(cfg, once);
+        // A fitStars at or above measurement.maxStars means all and is stored as None.
+        let mut all = AlgorithmConfig::default();
+        all.measurement.fit_stars = Some(all.measurement.max_stars as u32);
+        resolve_ln_fields(&mut all);
+        assert_eq!(all, AlgorithmConfig::default());
+    }
+
+    #[test]
+    fn a_measure_stage_version_other_than_one_is_folded_into_a_subtree() {
+        let mut subtree = serde_json::json!({});
+        fold_measure_stage_version(&mut subtree, 1);
+        assert!(subtree.get("measureStageVersion").is_none());
+        fold_measure_stage_version(&mut subtree, 2);
+        assert_eq!(subtree["measureStageVersion"], serde_json::json!(2));
+    }
+}

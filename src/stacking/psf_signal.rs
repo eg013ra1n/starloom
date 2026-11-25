@@ -24,7 +24,7 @@ pub use crate::star_measure::{
 // hold one point their `#[ts(as = …)]` at it. Its `///` docs are copied by ts-rs into the generated `PsfModel` type,
 // which is the intent.
 /// The star profile a measurement fits: a Moffat profile whose shape parameter (beta) is either chosen per frame from
-/// the frame's own stars or fixed at 4.
+/// the frame's own stars, fixed at 4 or fixed at a value the caller chooses.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(rename = "PsfModel", rename_all = "camelCase"))]
 pub enum PsfModelTs {
@@ -33,6 +33,8 @@ pub enum PsfModelTs {
     Auto,
     /// Fit a Moffat profile with beta fixed at 4.
     Moffat4,
+    /// Fit a Moffat profile with beta fixed at the caller's value, between 1.5 and 100.
+    Moffat(f64),
 }
 
 /// Fits the star profile to every seed of a plane and returns the accepted fits.
