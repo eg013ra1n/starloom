@@ -123,6 +123,7 @@ const GOLDENS: &[Golden] = &[
     Golden { stage: "master_flat", platform: "x86_64-linux", versions: &[("ENGINE_VERSION", 1)], checksum: 0x606511c5b2815ad7 },
     Golden { stage: "light_cal", platform: "x86_64-linux", versions: &[("LIGHT_CAL_VERSION", 1)], checksum: 0x1c7a4c66d0374d8c },
     Golden { stage: "cosmetic", platform: "x86_64-linux", versions: &[("LIGHT_CAL_VERSION", 1)], checksum: 0x7f7b15225c17ae02 },
+    #[cfg(feature = "pipeline")]
     Golden { stage: "pipeline", platform: "x86_64-linux", versions: &[("PIPELINE_VERSION", 1), ("LIGHT_CAL_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8), ("PASS1_ARTIFACT_VERSION", 1), ("ALIGN_VERSION", 1), ("LN_MODEL_VERSION", 4), ("LN_GRID_VERSION", 1), ("FITS_ARTIFACT_VERSION", 3), ("INTEGRATE_VERSION", 1), ("SNR_GAIN_VERSION", 2), ("DRIZZLE_KERNEL_VERSION", 2)], checksum: 0xd7addc5b67dd139e },
     // x86_64-windows, GitHub runner windows-2025-vs2026, image 20261116.315.1, rustafits 1.10.0 (the revision `Cargo.lock` locks): copied from the CI output of run 45576945801
     // (PR #2), never computed by hand.
@@ -138,6 +139,7 @@ const GOLDENS: &[Golden] = &[
     Golden { stage: "master_flat", platform: "x86_64-windows", versions: &[("ENGINE_VERSION", 1)], checksum: 0x606511c5b2815ad7 },
     Golden { stage: "light_cal", platform: "x86_64-windows", versions: &[("LIGHT_CAL_VERSION", 1)], checksum: 0x1c7a4c66d0374d8c },
     Golden { stage: "cosmetic", platform: "x86_64-windows", versions: &[("LIGHT_CAL_VERSION", 1)], checksum: 0x7f7b15225c17ae02 },
+    #[cfg(feature = "pipeline")]
     Golden { stage: "pipeline", platform: "x86_64-windows", versions: &[("PIPELINE_VERSION", 1), ("LIGHT_CAL_VERSION", 1), ("ENGINE_VERSION", 1), ("MEASURE_STAGE_VERSION", 1), ("MEASURE_VERSION", 8), ("PASS1_ARTIFACT_VERSION", 1), ("ALIGN_VERSION", 1), ("LN_MODEL_VERSION", 4), ("LN_GRID_VERSION", 1), ("FITS_ARTIFACT_VERSION", 3), ("INTEGRATE_VERSION", 1), ("SNR_GAIN_VERSION", 2), ("DRIZZLE_KERNEL_VERSION", 2)], checksum: 0xd7addc5b67dd139e },
 ];
 
