@@ -7,6 +7,8 @@ Starloom is the astrophotography stacking kernel behind Athenaeum: geometry and 
 | none | base | geometry, resampling, the FITS/XISF writer core, the platform memory probe, light-calibration parameter types | nothing heavy |
 | `engine` | 2 | integration, light calibration, cosmetic correction | `rustafits` |
 | `stack` | 3 | registration, measurement, rejection, drizzle, frame weighting and the algorithm config | `engine`, `solvemyastro`, `postcard` |
+| `pipeline` | 4 | the working-folder stages a command line drives (inputs, config levels, versioned folder formats, `master` to `stack`, `run`) | `stack`, `toml`, `glob` |
+| `cli` | 5 | the `starloom` command, with its logs and history | `pipeline`, `clap`, `tracing-subscriber` |
 | `ts` | — | ts-rs type derives (on by default) | `ts-rs` |
 | `test-support` | — | test hooks and fixtures that dependent crates' tests read; never in default | nothing |
 

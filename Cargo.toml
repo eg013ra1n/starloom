@@ -1,6 +1,6 @@
 [package]
 name = "starloom"
-version = "0.1.2"
+version = "0.2.0-dev"
 description = "The astrophotography stacking kernel: geometry, resampling, FITS/XISF writing, calibration, registration, integration and drizzle"
 edition = "2021"
 license = "Apache-2.0"
@@ -94,3 +94,14 @@ required-features = ["pipeline"]
 [[test]]
 name = "pipeline_pool"
 required-features = ["pipeline"]
+
+# The command line: the `cli` layer is the one that builds it, so a build of the library alone never compiles clap.
+[[bin]]
+name = "starloom"
+path = "src/bin/starloom.rs"
+required-features = ["cli"]
+
+# The command's end-to-end tests run the built binary on synthetic frames.
+[[test]]
+name = "cli_e2e"
+required-features = ["cli"]

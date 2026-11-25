@@ -6,7 +6,8 @@
 //! - base (no feature): geometry, resampling, the FITS/XISF writer core and small platform helpers;
 //! - `engine`: integration, light calibration and cosmetic correction (needs `rustafits`);
 //! - `stack`: registration, measurement, rejection, drizzle and weighting (needs `solvemyastro`);
-//! - `pipeline`: the working-folder stages a command line drives (inputs, config levels, versioned folder formats).
+//! - `pipeline`: the working-folder stages a command line drives (inputs, config levels, versioned folder formats);
+//! - `cli`: the `starloom` command over the pipeline (arguments, logs, history).
 //!
 //! # Threads
 //!
@@ -56,6 +57,10 @@ pub mod stacking;
 // `pipeline` layer: the working-folder stages a command line drives.
 #[cfg(feature = "pipeline")]
 pub mod pipeline;
+
+// `cli` layer: the `starloom` command (arguments, logs, history, the stdout and stderr writers).
+#[cfg(feature = "cli")]
+pub mod cli;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

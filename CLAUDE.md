@@ -4,7 +4,7 @@ Guidance for Claude Code working in `starloom`, the stacking kernel crate. The c
 
 ## Layers
 
-Base (no feature), `engine` (needs `rustafits`), `stack` (needs `engine` and `solvemyastro`), plus `ts` and `test-support`. A gate that names a feature the crate does not have fails the build (`unexpected_cfgs = "deny"`).
+Base (no feature), `engine` (needs `rustafits`), `stack` (needs `engine` and `solvemyastro`), `pipeline` (needs `stack`: the working-folder stages, in `src/pipeline/`), `cli` (needs `pipeline`: the `starloom` command, in `src/cli/` and `src/bin/starloom.rs`), plus `ts` and `test-support`. `pipeline` and `cli` have their own `[[test]]`s (`pipeline_e2e`, `cli_e2e`) with `required-features`, so Athenaeum's `cargo test --workspace` skips them. A gate that names a feature the crate does not have fails the build (`unexpected_cfgs = "deny"`).
 
 ## Rules
 
@@ -18,10 +18,10 @@ Base (no feature), `engine` (needs `rustafits`), `stack` (needs `engine` and `so
 - **Contracts.**
   - Every public item has a doc (`#![deny(missing_docs)]`), and a `#[doc(hidden)]` item carries its reason in a comment.
   - SL-8: starloom writes and reads no `ATH_*` card of its own. The header facts Athenaeum owns arrive as parameters.
-  - SL-9: starloom never builds a thread pool outside tests; it runs on the caller's rayon pool.
+  - SL-9: starloom never builds a thread pool outside tests; it runs on the caller's rayon pool. The one exception is the `starloom` command: `cli` builds the single pool (`--threads`) and hands it to the pipeline in `Ctx`; the `pipeline` layer itself builds none.
   - SL-12: `Cargo.toml` is standalone: no `[workspace]` table, no `workspace = true` keys, Apache-2.0. `serde_json` enables only `float_roundtrip`; `rusqlite` is never a dependency.
   - SL-17: test hooks that tests in other crates read exist only under `test-support` (or `cfg(test)`).
 - **Releases** come from `main` only; `CHANGELOG.md` covers every commit since the last tag, the tag `vX.Y.Z` equals the `Cargo.toml` version, and `Cargo.lock` is committed (the goldens are valid for the rustafits it locks).
 - **Environment variables** are `STARLOOM_SCALAR_SELECTION` and `STARLOOM_REQUIRE_VECTOR_KERNEL`. The default XISF creator is `starloom <version>`.
-- **Logging.** `tracing` only; no `println!` or `eprintln!` in production code.
+- **Logging.** `tracing` only; no `println!` or `eprintln!` in production code. The one exception is the `cli` module (P2-R13), the only code that writes to stdout and stderr, through `std::io::Write` handles in `cli::out`: stdout carries command products only (`facts --json`, `config show`), stderr carries progress, warnings, notes and the summary line. The pipeline stages report through `Progress` and `tracing`, never to a stream. Log messages are short stable phrases with snake_case fields.
 - **Tests.** Every test passes on macOS, Linux and Windows; test names use letters, digits, `_` and `-` only.

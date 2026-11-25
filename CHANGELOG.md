@@ -37,6 +37,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the rule that a stage's entry is written only after its products are renamed into place beside their
   destination. Manual mode: the stages are not linked, and nothing compares one stage's products with another's. A
   non-finite float is stored as `null`, as Athenaeum's metrics payloads store it, and reads back as NaN.
+- The `starloom` command (feature `cli`; binary `starloom`, version `0.2.0-dev`): `facts`, `master <bias|dark|flat>`,
+  `calibrate`, `measure`, `register`, `normalize`, `stack`, `run` and `config show` over the `pipeline` layer. A command
+  given no frames takes the previous stage's from the working folder (`-w`, default `starloom-work`); `--measure`,
+  `--transforms` and `--ln` name the products to read instead. Global flags: `--preset`, `--config`, `--set path=value`,
+  `--threads`, `--memory`, `-v`/`-vv`. The short flags (`--psf auto|moffat4|moffat=<beta>`, `--weights`, `--rejection`,
+  `--drizzle`, `--no-debayer`, `--no-hot-pixels`) are each one `--set`. Every command except `facts` and `config show`
+  writes `<work>/logs/<UTC stamp>-<command>.jsonl` (debug-level `tracing` JSON), appends a `history` row to the manifest
+  (also when it fails or is refused) and ends with one summary line on stderr; stdout carries products only. Exit code 0
+  is done, 1 a stage failure, 2 a refusal of the command's inputs. There is no Ctrl-C handler: a killed command leaves
+  only `.tmp/` and part files, which the next writing command clears.
 - The `master` and `calibrate` stages of `pipeline`: `build_master` (a bias, dark or flat from raw frames, Athenaeum's
   master build without the catalog: the automatic recipe, the frames integrated in the order of their full paths, the
   cards of `build_master_cards` with `SLM_*` in place of its own: `SLM_REC` holds what `ATH_REJ` holds (`Average |
