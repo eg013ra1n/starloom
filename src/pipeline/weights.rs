@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use astroimage::header::FrameFacts;
 
 use crate::geometry::PixelMap;
@@ -23,7 +23,8 @@ use crate::pipeline::formats::{
     REGISTRATION_FAILED,
 };
 use crate::pipeline::register::RegisterReport;
-use crate::pipeline::{athf_path, finish, source_facts, Ctx, Manifest};
+use crate::pipeline::measure::athf_in;
+use crate::pipeline::{finish, frame_stem, source_facts, warn_user, Ctx, Manifest};
 use crate::stacking::common_set;
 use crate::stacking::config::AlgorithmConfig;
 use crate::stacking::fits_artifact::read_fits;
@@ -42,7 +43,7 @@ pub fn subset_measure(measure: &MeasureReport, frames: &[PathBuf]) -> Result<Mea
     for frame in frames {
         let abs = std::path::absolute(frame).map_err(|e| anyhow::anyhow!("cannot make {} absolute: {e}", frame.display()))?;
         if !measure.frames.iter().any(|f| f.file == abs) {
-            bail!("{}: no measurement of this frame in measure.json; run `starloom measure` on it", abs.display());
+            refuse!("{}: no measurement of this frame in measure.json; run `starloom measure` on it", abs.display());
         }
         wanted.insert(abs);
     }
@@ -99,8 +100,8 @@ enum PlaneOutcome {
 }
 
 /// A member's readable `.athf` for `plane`; `None` when it is missing or unreadable (an unreadable one is logged).
-fn read_member_fits(work: &Path, file: &Path, plane: usize) -> Option<Vec<StarFit>> {
-    let path = athf_path(work, file, plane);
+fn read_member_fits(fits_root: &Path, file: &Path, plane: usize) -> Option<Vec<StarFit>> {
+    let path = athf_in(fits_root, frame_stem(file), plane);
     match read_fits(&path) {
         Ok(fits) => Some(fits),
         Err(e) => {
@@ -112,9 +113,11 @@ fn read_member_fits(work: &Path, file: &Path, plane: usize) -> Option<Vec<StarFi
 
 /// The common set of one plane and every member's flux over it: the anchor's candidates, then each member's match
 /// through its own stored map, one member's fits resident at a time (`plane_outcome` of Athenaeum's reweigh, reading
-/// the `.athf` files of the working folder).
+/// the `.athf` files of `fits_root`, the folder of the measurement report in use).
+#[allow(clippy::too_many_arguments)]
 fn plane_outcome(
     ctx: &Ctx<'_>,
+    fits_root: &Path,
     frames: &[MeasureFrame],
     members: &[usize],
     maps: &[&PixelMap],
@@ -129,7 +132,7 @@ fn plane_outcome(
         let Some(ch) = plane_of(anchor) else {
             return Ok(missing(anchor));
         };
-        let Some(fits) = read_member_fits(ctx.work_dir, &frames[members[anchor]].file, plane) else {
+        let Some(fits) = read_member_fits(fits_root, &frames[members[anchor]].file, plane) else {
             return Ok(missing(anchor));
         };
         common_set::candidates(&common_set::MemberPlane {
@@ -148,7 +151,7 @@ fn plane_outcome(
         let Some(ch) = plane_of(k) else {
             return Ok(missing(k));
         };
-        let Some(fits) = read_member_fits(ctx.work_dir, &frames[members[k]].file, plane) else {
+        let Some(fits) = read_member_fits(fits_root, &frames[members[k]].file, plane) else {
             return Ok(missing(k));
         };
         usable.push(common_set::match_member(
@@ -180,7 +183,8 @@ fn plane_outcome(
 /// measurements (the fold, the weights, the selection), then Athenaeum's reweigh. `measure` holds the stored
 /// measurements as `measure.json` has them; its frames are the group, so a caller with a subset passes
 /// [`subset_measure`]. The raw lights' facts come from the manifest of the working folder (the exposure weight reads
-/// them), and the `.athf` star fits from `<work>/measure/fits/`.
+/// them), and the `.athf` star fits from the `fits/` folder beside the measurement report in use (`<work>/measure/fits/` for the
+/// working folder's own).
 ///
 /// Under the PSF family every member's weight is recomputed on the stars the members have in common and the weight
 /// floor that Measure deferred is applied to it. In every mode the common set is built and returned in the report, for
@@ -218,12 +222,11 @@ pub(crate) fn keep_named_reference(ctx: &Ctx<'_>, finished: &mut MeasureReport, 
     }
     let reason = frame.reason.clone().unwrap_or_else(|| "excluded".to_string());
     if frame.measurement.is_none() {
-        bail!("the named reference frame {} is excluded: {reason}", frame.file.display());
+        refuse!("the named reference frame {} is excluded: {reason}", frame.file.display());
     }
     frame.included = true;
     frame.reason = None;
-    tracing::warn!(path = %frame.file.display(), note = %reason, "named reference kept despite selection");
-    ctx.progress.warn(&format!("named reference frame {} kept despite selection: {reason}", frame.file.display()));
+    warn_user(ctx, &format!("named reference frame {} kept despite selection: {reason}", frame.file.display()));
     Ok(())
 }
 
@@ -244,7 +247,7 @@ pub(crate) fn weigh(
             Some(t) if t.error.as_deref().is_some_and(|e| e.starts_with(REGISTRATION_FAILED)) => {
                 let reason = t.error.clone().unwrap_or_default();
                 if !cfg.selection.exclude_on_registration_failure {
-                    bail!("{}: {reason}", f.file.display());
+                    refuse!("{}: {reason}", f.file.display());
                 }
                 tracing::warn!(path = %f.file.display(), reason = %reason, "frame excluded");
                 f.included = false;
@@ -257,7 +260,7 @@ pub(crate) fn weigh(
     if !lacking.is_empty() {
         let shown = lacking.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
         let more = if lacking.len() > 3 { format!(" and {} more", lacking.len() - 3) } else { String::new() };
-        bail!(
+        refuse!(
             "{} frame(s) are included under this config but have no transform: {shown}{more}; run `starloom register` \
              with this config",
             lacking.len()
@@ -307,6 +310,7 @@ fn reweigh(
     // PD-19 b: the set is built in every mode; the channel writes and the weights (phases 2 and 3 below) are the PSF
     // family's.
     let psf_family = defers_weight_gate(cfg.measurement.weight_mode);
+    let fits_root = finished.fits_root(ctx.work_dir);
 
     // Phase 1, on shared borrows: the anchor and each plane's outcome.
     let maps: Vec<&PixelMap> = members
@@ -337,7 +341,7 @@ fn reweigh(
         for plane in 0..nch {
             outcomes.push(match anchor {
                 None => PlaneOutcome::Fallback(Fallback::NoAnchor),
-                Some(a) => plane_outcome(ctx, frames, members, &maps, plane, nch, a)?,
+                Some(a) => plane_outcome(ctx, &fits_root, frames, members, &maps, plane, nch, a)?,
             });
         }
         (anchor, outcomes)
@@ -402,7 +406,7 @@ fn reweigh(
                     Fallback::MissingFits(i) => format!(" ({}; {})", f.reason(), finished.frames[*i].file.display()),
                     _ => format!(" ({})", f.reason()),
                 };
-                ctx.progress.warn(&format!("no frame-common star set on plane {plane}{named}; {consequence}"));
+                warn_user(ctx, &format!("no frame-common star set on plane {plane}{named}; {consequence}"));
                 sets.push(None);
             }
         }
@@ -449,8 +453,7 @@ fn reweigh(
         frame.weight = Some(w);
         if let Some(reason) = gate {
             if pinned == Some(frame.file.as_path()) {
-                tracing::warn!(path = %frame.file.display(), reason = %reason, "weights: named reference kept despite the weight floor");
-                ctx.progress.warn(&format!("the reference frame {} is kept despite its weight: {reason}", frame.file.display()));
+                warn_user(ctx, &format!("the reference frame {} is kept despite its weight: {reason}", frame.file.display()));
             } else {
                 tracing::warn!(path = %frame.file.display(), reason = %reason, "frame excluded");
                 frame.included = false;

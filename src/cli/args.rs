@@ -2,8 +2,11 @@
 //! `--set`.
 //!
 //! Every short flag that changes the algorithm is one `--set path=value` ([`sugar`](MeasureArgs::sugar) on each
-//! command): `config show` prints the result, so what a flag did is always visible there. A flag that is not a config
-//! value (a file to read, a place to write, `--gain`) is not sugar.
+//! command), and the command's log file holds the effective config at debug level, so what a flag did is on record. A
+//! flag that is not a config value (a file to read, a place to write, `--gain`) is not sugar.
+//!
+//! `--set` and `-v` may be given before the subcommand, after it, or both ([`Levels`]): clap does not merge a global
+//! flag's values across the two levels, so they are two flags and [`Cli::sets`] / [`Cli::verbose`] join them.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -34,9 +37,37 @@ pub struct Cli {
     /// The flags every command takes.
     #[command(flatten)]
     pub global: Global,
+    /// `--set` and `-v` given before the subcommand.
+    #[command(flatten)]
+    pub early: Levels,
     /// The command.
     #[command(subcommand)]
     pub command: Command,
+}
+
+impl Cli {
+    /// Every `--set`, in the order given: the ones before the subcommand, then the ones after it.
+    pub fn sets(&self) -> Vec<String> {
+        self.early.set.iter().chain(self.command.late().map(|l| &l.set).into_iter().flatten()).cloned().collect()
+    }
+
+    /// How many `-v` were given, before and after the subcommand together.
+    pub fn verbose(&self) -> u8 {
+        self.early.verbose.saturating_add(self.command.late().map_or(0, |l| l.verbose))
+    }
+}
+
+/// The flags that are accepted both before and after the subcommand, and joined: `starloom --set a=1 stack --set b=2`
+/// sets both.
+#[derive(Debug, Clone, Default, Args)]
+pub struct Levels {
+    /// Sets one config value over the file, by dotted camelCase path: `--set integration.minWeight=0.01`. A value is
+    /// JSON when it parses as JSON (`0.2`, `true`, `{"moffat":8}`), else a bare word (`moffat4`). Repeatable.
+    #[arg(long = "set", value_name = "PATH=VALUE")]
+    pub set: Vec<String>,
+    /// More on stderr: `-v` adds the info level, `-vv` the debug level. The log file always holds debug.
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
 }
 
 /// A built-in config preset.
@@ -91,20 +122,14 @@ pub struct Global {
     /// not read are named on stderr.
     #[arg(long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,
-    /// Sets one config value over the file, by dotted camelCase path: `--set integration.minWeight=0.01`. A value is
-    /// JSON when it parses as JSON (`0.2`, `true`, `{"moffat":8}`), else a bare word (`moffat4`). Repeatable.
-    #[arg(long = "set", global = true, value_name = "PATH=VALUE")]
-    pub set: Vec<String>,
-    /// The number of worker threads (the one thread pool the command builds); default: every core.
+    /// The number of worker threads (the one thread pool the command builds); default: rayon's own (every core, or
+    /// `RAYON_NUM_THREADS`).
     #[arg(long, global = true, value_name = "N")]
     pub threads: Option<usize>,
     /// The working memory a stage may plan for: bytes, or a size such as `16GB` (units are 1024-based); default: the
-    /// machine's total RAM.
+    /// machine's total RAM, or 4 GiB (with a warning) when the machine does not say.
     #[arg(long, global = true, value_name = "SIZE")]
     pub memory: Option<String>,
-    /// More on stderr: `-v` adds the info level, `-vv` the debug level. The log file always holds debug.
-    #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
-    pub verbose: u8,
 }
 
 /// The commands.
@@ -132,6 +157,21 @@ pub enum Command {
 }
 
 impl Command {
+    /// The `--set` and `-v` given after the subcommand.
+    pub fn late(&self) -> Option<&Levels> {
+        Some(match self {
+            Command::Facts(a) => &a.late,
+            Command::Master(a) => &a.late,
+            Command::Calibrate(a) => &a.late,
+            Command::Measure(a) => &a.late,
+            Command::Register(a) => &a.late,
+            Command::Normalize(a) => &a.late,
+            Command::Stack(a) => &a.late,
+            Command::Run(a) => &a.late,
+            Command::Config(ConfigCommand::Show(a)) => &a.late,
+        })
+    }
+
     /// The command's name, as the log file, the history and the summary line spell it.
     pub fn name(&self) -> &'static str {
         match self {
@@ -152,12 +192,23 @@ impl Command {
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
     /// Prints the effective config (preset, file, `--set`) as JSON.
-    Show,
+    Show(ShowArgs),
+}
+
+/// `starloom config show`.
+#[derive(Debug, Args)]
+pub struct ShowArgs {
+    /// `--set` and `-v` after the subcommand.
+    #[command(flatten)]
+    pub late: Levels,
 }
 
 /// `starloom facts`.
 #[derive(Debug, Args)]
 pub struct FactsArgs {
+    /// `--set` and `-v` after the subcommand.
+    #[command(flatten)]
+    pub late: Levels,
     /// Frames, folders or globs (compressed raw frames included).
     #[arg(required = true, value_name = "FILES")]
     pub files: Vec<OsString>,
@@ -190,6 +241,9 @@ impl From<MasterKindArg> for MasterKind {
 /// `starloom master`.
 #[derive(Debug, Args)]
 pub struct MasterArgs {
+    /// `--set` and `-v` after the subcommand.
+    #[command(flatten)]
+    pub late: Levels,
     /// What the frames are.
     #[arg(value_enum)]
     pub kind: MasterKindArg,
@@ -214,13 +268,14 @@ pub struct MasterArgs {
 /// The calibration frames of `calibrate` and `run`: one master file, or raw frames to integrate into one.
 #[derive(Debug, Args, Default)]
 pub struct CalFlags {
-    /// The dark: a master file, or raw frames, a folder or a glob.
+    /// The dark: a master file, or raw frames, a folder or a glob (quote a glob, `--dark 'darks/*.fits'`: the shell
+    /// would expand it and `calibrate` would take the other files for lights).
     #[arg(long, value_name = "MASTER|FRAMES")]
     pub dark: Vec<OsString>,
-    /// The flat: a master file, or raw frames, a folder or a glob.
+    /// The flat: a master file, or raw frames, a folder or a glob (quote a glob, `--flat 'flats/*.fits'`).
     #[arg(long, value_name = "MASTER|FRAMES")]
     pub flat: Vec<OsString>,
-    /// The bias, used only when there is no dark: a master file, or raw frames, a folder or a glob.
+    /// The bias, used only when there is no dark: a master file, or raw frames, a folder or a glob (quote a glob).
     #[arg(long, value_name = "MASTER|FRAMES")]
     pub bias: Vec<OsString>,
 }
@@ -228,6 +283,9 @@ pub struct CalFlags {
 /// `starloom calibrate`.
 #[derive(Debug, Args)]
 pub struct CalibrateArgs {
+    /// `--set` and `-v` after the subcommand.
+    #[command(flatten)]
+    pub late: Levels,
     /// Raw lights, folders or globs (compressed frames included).
     #[arg(value_name = "LIGHTS")]
     pub lights: Vec<OsString>,
@@ -268,6 +326,9 @@ impl CalibrateArgs {
 /// `starloom measure`.
 #[derive(Debug, Args)]
 pub struct MeasureArgs {
+    /// `--set` and `-v` after the subcommand.
+    #[command(flatten)]
+    pub late: Levels,
     /// Calibrated frames, folders or globs; default: the products of `calibrate`.
     #[arg(value_name = "FRAMES")]
     pub frames: Vec<OsString>,
@@ -277,7 +338,7 @@ pub struct MeasureArgs {
     /// The star profile: `auto`, `moffat4` or `moffat=<beta>` (`--set measurement.psfModel=...`).
     #[arg(long, value_name = "MODEL")]
     pub psf: Option<String>,
-    /// Also write `stars.csv`, one row per measured star.
+    /// Also write the stars: `measure/stars/<frame>.p<plane>.csv`, one row per measured star.
     #[arg(long)]
     pub stars: bool,
 }
@@ -317,13 +378,17 @@ pub fn psf_sugar(psf: Option<&str>) -> Result<Vec<Set>> {
 /// `starloom register`.
 #[derive(Debug, Args)]
 pub struct RegisterArgs {
+    /// `--set` and `-v` after the subcommand.
+    #[command(flatten)]
+    pub late: Levels,
     /// Calibrated frames, folders or globs; default: the frames `measure` measured.
     #[arg(value_name = "FRAMES")]
     pub frames: Vec<OsString>,
     /// What every frame is registered onto: a calibrated FITS file, or `auto` (the best-weighted frame).
     #[arg(long, value_name = "FILE|auto", default_value = "auto")]
     pub reference: String,
-    /// The measurement report; default `<work>/measure/measure.json`.
+    /// The measurement report; default `<work>/measure/measure.json`. The star fits are read from the `fits/` folder
+    /// beside it, and with no FRAMES the command takes the frames it lists.
     #[arg(long, value_name = "FILE")]
     pub measure: Option<PathBuf>,
     /// Also write every frame resampled into the reference's grid.
@@ -334,10 +399,14 @@ pub struct RegisterArgs {
 /// `starloom normalize`.
 #[derive(Debug, Args)]
 pub struct NormalizeArgs {
+    /// `--set` and `-v` after the subcommand.
+    #[command(flatten)]
+    pub late: Levels,
     /// Calibrated frames, folders or globs; default: the frames `measure` measured.
     #[arg(value_name = "FRAMES")]
     pub frames: Vec<OsString>,
-    /// The measurement report; default `<work>/measure/measure.json`.
+    /// The measurement report; default `<work>/measure/measure.json`. The star fits are read from the `fits/` folder
+    /// beside it, and with no FRAMES the command takes the frames it lists.
     #[arg(long, value_name = "FILE")]
     pub measure: Option<PathBuf>,
     /// The transforms report; default `<work>/register/transforms.json`.
@@ -348,22 +417,27 @@ pub struct NormalizeArgs {
 /// `starloom stack`.
 #[derive(Debug, Args)]
 pub struct StackArgs {
+    /// `--set` and `-v` after the subcommand.
+    #[command(flatten)]
+    pub late: Levels,
     /// Calibrated frames, folders or globs; default: the frames `measure` measured.
     #[arg(value_name = "FRAMES")]
     pub frames: Vec<OsString>,
-    /// The measurement report; default `<work>/measure/measure.json`.
+    /// The measurement report; default `<work>/measure/measure.json`. The star fits are read from the `fits/` folder
+    /// beside it, and with no FRAMES the command takes the frames it lists.
     #[arg(long, value_name = "FILE")]
     pub measure: Option<PathBuf>,
     /// The transforms report; default `<work>/register/transforms.json`.
     #[arg(long, value_name = "FILE")]
     pub transforms: Option<PathBuf>,
-    /// The folder holding `normalize.json` and the `.athln` files; default `<work>/ln`.
+    /// The folder holding `normalize.json` and the `.athln` files; default `<work>/ln`. The grids are read from this
+    /// folder, wherever `normalize` first wrote them.
     #[arg(long, value_name = "DIR")]
     pub ln: Option<PathBuf>,
     /// Also drizzle (`--set drizzle.enabled=true`).
     #[arg(long)]
     pub drizzle: bool,
-    /// The rejection: a method name (`auto`, `none`) or a JSON object (`{"method":"sigma_clip","sigma_low":3,...}`),
+    /// The rejection: a method name (`auto`, `none`) or a JSON object (`{"method":"sigmaClip","sigmaLow":3,"sigmaHigh":3}`),
     /// as `--set integration.rejection=...`.
     #[arg(long, value_name = "JSON|METHOD")]
     pub rejection: Option<String>,
@@ -400,6 +474,9 @@ impl StackArgs {
 /// `starloom run`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
+    /// `--set` and `-v` after the subcommand.
+    #[command(flatten)]
+    pub late: Levels,
     /// Raw lights, folders or globs.
     #[arg(value_name = "LIGHTS")]
     pub lights: Vec<OsString>,
@@ -498,8 +575,30 @@ mod tests {
     }
 
     #[test]
+    fn set_and_v_join_across_the_subcommand() {
+        let cli = Cli::try_parse_from(["starloom", "-v", "--set", "a.b=1", "stack", "--set", "c.d=2", "-v", "--set", "e.f=3"]).unwrap();
+        assert_eq!(cli.sets(), ["a.b=1", "c.d=2", "e.f=3"], "the ones before the subcommand first");
+        assert_eq!(cli.verbose(), 2);
+        let cli = Cli::try_parse_from(["starloom", "config", "show", "-vv", "--set", "x.y=1"]).unwrap();
+        assert_eq!((cli.sets(), cli.verbose()), (vec!["x.y=1".to_string()], 2));
+        let cli = Cli::try_parse_from(["starloom", "facts", "a.fits"]).unwrap();
+        assert!(cli.sets().is_empty());
+        assert_eq!(cli.verbose(), 0);
+    }
+
+    #[test]
+    fn the_rejection_help_spells_the_wire_in_camel_case() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let stack = cmd.find_subcommand("stack").unwrap();
+        let help = stack.get_arguments().find(|a| a.get_id() == "rejection").unwrap().get_help().unwrap().to_string();
+        assert!(help.contains("sigmaClip") && help.contains("sigmaLow") && !help.contains("sigma_low"), "{help}");
+    }
+
+    #[test]
     fn rejection_is_a_method_name_or_json() {
         let args = |r: &str| StackArgs {
+            late: Levels::default(),
             frames: vec![],
             measure: None,
             transforms: None,

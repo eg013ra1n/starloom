@@ -63,8 +63,8 @@ use crate::pipeline::normalize::Ranking;
 use crate::pipeline::register::{header_cards, is_wcs, RegisterReport, SLM_REF};
 use crate::pipeline::weights::{current_weights, subset_measure};
 use crate::pipeline::{
-    athln_path, common_cards, config_hash, frame_stem, ln_dir, ln_runs, parse_date_obs, source_facts, Ctx, Manifest, Progress,
-    Stage,
+    athln_path, common_cards, config_hash, frame_stem, ln_dir, ln_runs, parse_date_obs, source_facts, warn_user, Ctx,
+    Manifest, Progress, Stage,
 };
 use crate::orientation::row_order_is_bottom_up;
 use crate::stacking::config::AlgorithmConfig;
@@ -171,7 +171,7 @@ pub fn stack(
     format: OutputFormat,
 ) -> Result<StackReport> {
     if frames.is_empty() {
-        bail!("no frames to stack");
+        refuse!("no frames to stack");
     }
     let work = std::path::absolute(ctx.work_dir).with_context(|| format!("cannot make {} absolute", ctx.work_dir.display()))?;
     let out_dir = std::path::absolute(out_dir).with_context(|| format!("cannot make {} absolute", out_dir.display()))?;
@@ -217,8 +217,7 @@ impl Progress for WarningTee<'_> {
 
 /// Sends a warning to the log and the context (whose sink the report's warnings are taken from).
 fn warn(ctx: &Ctx<'_>, message: String) {
-    tracing::warn!("{message}");
-    ctx.progress.warn(&message);
+    warn_user(ctx, &message);
 }
 
 /// A config value's serde name (`psfSnr`, `noise`, ...), for a message.
@@ -290,7 +289,7 @@ fn run(
     }
     let included_count = weights.frames.iter().filter(|f| f.included).count();
     if included_count < 3 {
-        bail!(
+        refuse!(
             "fewer than 3 included frames: {included_count} of {} are included under this config; a stack needs at least 3",
             files.len()
         );
@@ -323,7 +322,7 @@ fn run(
         });
     }
     if members.len() < 3 {
-        bail!("{} of {included_count} included frames are registered; at least 3 are needed", members.len());
+        refuse!("{} of {included_count} included frames are registered; at least 3 are needed", members.len());
     }
 
     // Local normalization: each member's grids, read before any pixel is; a frame `normalize` excluded is left out.
@@ -351,7 +350,7 @@ fn run(
             });
         }
         if members.len() < 3 {
-            bail!("local normalization left {} frames; at least 3 are needed", members.len());
+            refuse!("local normalization left {} frames; at least 3 are needed", members.len());
         }
     }
 
@@ -373,7 +372,7 @@ fn run(
     let mosaics = if drizzle_settings.is_some() && drizzle::bayer_wanted(cfg, channels) {
         let sources = drizzle::mosaic_sources(&members);
         if sources.iter().all(Option::is_none) {
-            bail!(
+            refuse!(
                 "Bayer drizzle needs each frame's calibrated CFA mosaic, and none of the {} frames has one beside it; \
                  run `starloom calibrate --keep-mosaic` on the raw lights (with the debayer on), or turn drizzle.bayer off",
                 members.len()
@@ -645,7 +644,7 @@ fn ln_grids(
         None => {
             let path = ln_dir(work).join(NORMALIZE_FILE);
             if !path.is_file() {
-                bail!(
+                refuse!(
                     "local normalization is on and {} is missing, so no frame has its .athln ({}); run `starloom normalize` with this config",
                     path.display(),
                     names()
@@ -657,7 +656,7 @@ fn ln_grids(
     };
     match report.status {
         NormalizeStatus::Ran => {}
-        NormalizeStatus::NotRequested => bail!(
+        NormalizeStatus::NotRequested => refuse!(
             "local normalization is on, and the normalize report says it was not asked for when normalize ran, so no frame \
              has its .athln ({}); run `starloom normalize` with this config",
             names()
@@ -701,7 +700,7 @@ fn ln_grids(
         }
     }
     if !missing.is_empty() {
-        bail!(
+        refuse!(
             "{} frame(s) have no .athln while local normalization is on: {}; run `starloom normalize` with this config",
             missing.len(),
             listed(&missing)

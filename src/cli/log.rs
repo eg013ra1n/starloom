@@ -24,6 +24,17 @@ pub fn stderr_level(verbose: u8) -> &'static str {
     }
 }
 
+/// The stderr filter directives: the level, and the two targets whose events are lines already printed on stderr (a
+/// stage's user warning, which its progress sink prints, and the command's own `error:`, `note:` and `warning:`).
+fn stderr_filter(verbose: u8) -> String {
+    format!(
+        "{},{}=off,{}=off",
+        stderr_level(verbose),
+        crate::pipeline::USER_WARNING_TARGET,
+        crate::cli::out::PRINTED_TARGET
+    )
+}
+
 /// The log file name for a command started at `started`: `<%Y%m%dT%H%M%S%.3fZ>-<command>.jsonl`, with `-<n>` before the
 /// extension for the n-th attempt after a clash (`n` 2 and up).
 fn file_name(started: DateTime<Utc>, command: &str, attempt: u32) -> String {
@@ -60,7 +71,7 @@ pub fn init(verbose: u8, file: Option<File>) {
         .with_ansi(false)
         .with_target(false)
         .without_time()
-        .with_filter(EnvFilter::new(stderr_level(verbose)));
+        .with_filter(EnvFilter::new(stderr_filter(verbose)));
     let json = file.map(|f| {
         tracing_subscriber::fmt::layer()
             .json()
@@ -96,6 +107,14 @@ mod tests {
         let (_b, pb) = open_log(dir.path(), "stack", t).unwrap();
         assert_ne!(pa, pb);
         assert!(pb.file_name().unwrap().to_string_lossy().ends_with("-stack-2.jsonl"));
+    }
+
+    #[test]
+    fn stderr_leaves_out_the_lines_it_already_printed() {
+        let filter = stderr_filter(1);
+        assert!(filter.starts_with("info,"), "{filter}");
+        assert!(filter.contains("starloom::user_warning=off") && filter.contains("starloom::cli::printed=off"), "{filter}");
+        assert!(EnvFilter::try_new(&filter).is_ok());
     }
 
     #[test]

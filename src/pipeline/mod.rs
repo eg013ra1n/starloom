@@ -51,6 +51,51 @@
 //! scratch folder `<work>/.tmp/` when it starts ([`formats::begin_writing`]). One command runs in a working folder at
 //! a time: nothing locks the folder, and two at once would interleave their manifest writes.
 
+/// An input the caller must change: a frame with no transform, a plan with no lights, a calibration that does not fit
+/// the frame size, fewer than three frames to stack. The command line exits 2 on it (and 1 on any other error); a
+/// library caller finds it with [`is_refusal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal(String);
+
+impl Refusal {
+    /// A refusal that says `message`.
+    pub fn new(message: impl Into<String>) -> Refusal {
+        Refusal(message.into())
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// Whether `error`, or anything it wraps, is a [`Refusal`]: the input was at fault, not the machine.
+pub fn is_refusal(error: &anyhow::Error) -> bool {
+    error.chain().any(|e| e.is::<Refusal>())
+}
+
+/// `return Err(Refusal ...)`: `bail!` for an input the caller must change.
+macro_rules! refuse {
+    ($($arg:tt)*) => {
+        return Err($crate::pipeline::Refusal::new(format!($($arg)*)).into())
+    };
+}
+
+/// The target of the event `warn_user` logs. The command line keeps this target off stderr, where the progress sink
+/// prints the same sentence once.
+pub const USER_WARNING_TARGET: &str = "starloom::user_warning";
+
+/// Tells the caller something a person should know that does not stop the work: the sentence goes to the progress sink
+/// (the command line prints it once on stderr; a stage's report collects it) and, as one `warn` event, to the log.
+/// Every user-facing warning of a stage goes through here, so no sink prints it twice.
+pub(crate) fn warn_user(ctx: &Ctx<'_>, message: &str) {
+    tracing::warn!(target: USER_WARNING_TARGET, text = message, "user warning");
+    ctx.progress.warn(message);
+}
+
 pub mod calibrate;
 pub mod cards;
 pub mod config;
@@ -191,6 +236,15 @@ mod tests {
         assert!(ctx.check_cancelled().is_ok());
         cancel.store(true, Ordering::Relaxed);
         assert_eq!(ctx.check_cancelled().unwrap_err().to_string(), "cancelled");
+    }
+
+    #[test]
+    fn a_refusal_is_found_through_context_and_nothing_else_is_one() {
+        let refused = anyhow::Error::from(Refusal::new("no frames to stack")).context("while stacking");
+        assert!(is_refusal(&refused));
+        assert_eq!(format!("{:#}", refused), "while stacking: no frames to stack");
+        assert!(!is_refusal(&anyhow::anyhow!("disk full")));
+        assert!(!is_refusal(&anyhow::Error::from(std::io::Error::other("disk full")).context("while stacking")));
     }
 
     #[test]

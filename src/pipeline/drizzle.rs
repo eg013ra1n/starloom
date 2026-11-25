@@ -46,7 +46,7 @@ use crate::pipeline::formats::part_path;
 use crate::pipeline::master::{cfa_of, frame_facts};
 use crate::pipeline::register::is_wcs;
 use crate::pipeline::stack::MASTER_STEM;
-use crate::pipeline::{frame_stem, Ctx};
+use crate::pipeline::{frame_stem, warn_user, Ctx};
 use crate::stacking::config::{AlgorithmConfig, DrizzleConfig};
 use crate::stacking::drizzle::{
     drizzle_group, CfaSource, DrizzleError, DrizzleFrame, DrizzleInput, DrizzleProgress, DrizzleStats,
@@ -123,8 +123,7 @@ pub(crate) fn settings(ctx: &Ctx<'_>, drizzle: &DrizzleConfig) -> Result<Setting
     } else {
         let clamped = configured.clamp(0.5, 1.0);
         let message = format!("drizzle drop shrink {configured} out of [0.5, 1.0]; clamped to {clamped}");
-        tracing::warn!(drop_shrink = configured, clamped, "drizzle drop shrink out of [0.5, 1.0]; clamped");
-        ctx.progress.warn(&message);
+        warn_user(ctx, &message);
         clamped
     };
     Ok(Settings { scale: drizzle.scale, drop_shrink })
@@ -361,8 +360,7 @@ pub(crate) fn drizzle(ctx: &Ctx<'_>, input: &Inputs<'_>) -> std::result::Result<
     if input.mosaics.is_some() {
         let missing = (0..included.len()).filter(|&k| mosaic_of_included(k).is_none()).count();
         if missing > 0 {
-            tracing::warn!(count = missing, "bayer drizzle: frames without a cfa mosaic fall back to the debayered deposit");
-            ctx.progress.warn(&format!(
+            warn_user(ctx, &format!(
                 "Bayer drizzle deposited {missing} frame(s) from their debayered planes: no calibrated CFA mosaic was available for them"
             ));
         }

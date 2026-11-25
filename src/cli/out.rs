@@ -21,6 +21,31 @@ pub fn stderr_line(text: &str) {
     let _ = writeln!(err, "{text}");
 }
 
+/// The target of the events that record a line the command has just printed on stderr (an `error:`, a `note:`, a
+/// `warning:`). The stderr layer drops this target, so the line shows once there and the log file holds the event.
+pub const PRINTED_TARGET: &str = "starloom::cli::printed";
+
+/// Prints `error: <error>` on stderr and logs the same text (the whole chain) as an `error` event: the log of a refused
+/// or failed command says why it ended.
+pub fn error_line(error: &anyhow::Error) {
+    let text = format!("{error:#}");
+    stderr_line(&format!("error: {text}"));
+    tracing::error!(target: PRINTED_TARGET, text = %text, "command error");
+}
+
+/// Prints `note: <text>` on stderr and logs it.
+pub fn note_line(text: &str) {
+    stderr_line(&format!("note: {text}"));
+    tracing::info!(target: PRINTED_TARGET, text, "command note");
+}
+
+/// Prints `warning: <text>` on stderr and logs it, for a warning the command itself raises (the stages' go through
+/// their progress sink).
+pub fn warning_line(text: &str) {
+    stderr_line(&format!("warning: {text}"));
+    tracing::warn!(target: PRINTED_TARGET, text, "command warning");
+}
+
 /// How often a stage's progress line is printed at most, besides its first and last.
 const PROGRESS_EVERY: Duration = Duration::from_secs(1);
 

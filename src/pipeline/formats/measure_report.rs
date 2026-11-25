@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::{read_versioned, write_json_atomic};
@@ -113,6 +113,12 @@ pub struct MeasureReport {
     /// report once and leaves a folded one as it is (a second fold would scale the substituted planes again).
     #[serde(default, skip_serializing_if = "is_false")]
     pub folded: bool,
+    /// The folder the report was read from (`<work>/measure/` for a report `measure` left), which holds its `fits/`
+    /// folder of `.athf` files: a stage that reads the report from another working folder reads Measure's star fits
+    /// from there, not from its own. Not stored: `measure.json` holds no path of its own folder, so a copied or moved
+    /// folder still finds its fits. `None` for a report built in memory, whose fits are in the working folder's.
+    #[serde(skip)]
+    pub source_dir: Option<PathBuf>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -131,7 +137,13 @@ impl MeasureReport {
             group_c: Vec::new(),
             frames: Vec::new(),
             folded: false,
+            source_dir: None,
         }
+    }
+
+    /// The folder holding this report's `fits/` folder: where it was read from, else `<work>/measure/`.
+    pub fn fits_root(&self, work_dir: &Path) -> PathBuf {
+        self.source_dir.clone().unwrap_or_else(|| crate::pipeline::measure_dir(work_dir))
     }
 
     /// The β every member of the group was fitted at, as Athenaeum's `measure_group_finish` resolves it: the two-pass
@@ -152,7 +164,10 @@ impl MeasureReport {
 
     /// Reads a report; another version or another kind of file is refused.
     pub fn read(path: &Path) -> Result<MeasureReport> {
-        read_versioned(path, MEASURE_REPORT_FORMAT, MEASURE_REPORT_VERSION)
+        let mut report: MeasureReport = read_versioned(path, MEASURE_REPORT_FORMAT, MEASURE_REPORT_VERSION)?;
+        let abs = std::path::absolute(path).with_context(|| format!("cannot make {} absolute", path.display()))?;
+        report.source_dir = abs.parent().map(Path::to_path_buf);
+        Ok(report)
     }
 
     /// Writes the report atomically to `path` (staged beside it, then renamed).

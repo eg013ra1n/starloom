@@ -40,7 +40,7 @@ use crate::pipeline::formats::{
     MEASURE_REPORT_FILE,
 };
 use crate::pipeline::versions::recorded_versions;
-use crate::pipeline::{frame_stem, order_lights, Ctx, Stage};
+use crate::pipeline::{frame_stem, order_lights, warn_user, Ctx, Stage};
 use crate::stacking::config::AlgorithmConfig;
 use crate::stacking::fits_artifact::write_fits;
 use crate::stacking::measure::{
@@ -92,7 +92,7 @@ pub fn pass1_path(work_dir: &Path, frame: &Path) -> PathBuf {
     pass1_in(&measure_dir(work_dir), frame_stem(frame))
 }
 
-fn athf_in(dir: &Path, stem: &str, plane: usize) -> PathBuf {
+pub(crate) fn athf_in(dir: &Path, stem: &str, plane: usize) -> PathBuf {
     dir.join(FITS_DIR).join(format!("{stem}.p{plane}.athf"))
 }
 
@@ -392,11 +392,11 @@ pub fn measure(
     stars_csv: bool,
 ) -> Result<MeasureReport> {
     if frames.is_empty() {
-        bail!("no frames to measure");
+        refuse!("no frames to measure");
     }
     if let Some(g) = gain {
         if !g.is_finite() || g <= 0.0 {
-            bail!("--gain must be a positive number, got {g}");
+            refuse!("--gain must be a positive number, got {g}");
         }
     }
     let work = std::path::absolute(ctx.work_dir).with_context(|| format!("cannot make {} absolute", ctx.work_dir.display()))?;
@@ -404,7 +404,7 @@ pub fn measure(
     for frame in frames {
         let abs = std::path::absolute(frame).with_context(|| format!("cannot make {} absolute", frame.display()))?;
         if let Some((what, hint)) = unsupported_format(&abs) {
-            bail!("{}: measure reads plain FITS only, and this is {what}; {hint}", abs.display());
+            refuse!("{}: measure reads plain FITS only, and this is {what}; {hint}", abs.display());
         }
         files.push(abs);
     }
@@ -412,7 +412,7 @@ pub fn measure(
     let mut seen: BTreeMap<String, &Path> = BTreeMap::new();
     for file in &files {
         if let Some(first) = seen.insert(frame_stem(file).to_lowercase(), file) {
-            bail!("{} and {} have the same name apart from the extension; their products would overwrite each other", first.display(), file.display());
+            refuse!("{} and {} have the same name apart from the extension; their products would overwrite each other", first.display(), file.display());
         }
     }
     ctx.check_cancelled()?;
@@ -461,18 +461,16 @@ fn run(
         let frame_gain = if unreadable.is_none() { gain.or_else(|| header_gain(file)) } else { None };
         members.push(Member { file: file.clone(), stem: frame_stem(file).to_string(), unreadable, size, gain: frame_gain });
     }
-    // The caller's progress sink gets the text; every call site writes its own log line (a stable message, data in fields).
-    let warn = |message: &str| ctx.progress.warn(message);
+    // One user-facing warning: the sentence to the progress sink and the log, once ([`warn_user`]).
+    let warn = |message: &str| warn_user(ctx, message);
     for m in members.iter().filter(|m| m.unreadable.is_some()) {
         let reason = m.unreadable.as_deref().unwrap_or_default();
-        tracing::warn!(path = %m.file.display(), reason = %reason, "frame excluded");
         warn(&format!("{}: {reason}; the frame is excluded", m.file.display()));
     }
     let measurable: Vec<usize> = (0..members.len()).filter(|&i| members[i].unreadable.is_none()).collect();
     if gain.is_none() {
         let missing = measurable.iter().filter(|&&i| members[i].gain.is_none()).count();
         if missing > 0 {
-            tracing::warn!(missing, frames = measurable.len(), "frames without a gain; their SNR has no shot term");
             warn(&format!(
                 "{missing} of {} frames have no gain (EGAIN and SLM_CSCL are not both in their headers), so their SNR has no \
                  shot term; give --gain to set one",
@@ -723,7 +721,6 @@ fn build(
     report.group_c = finished.group_c.clone();
     let included = report.frames.iter().filter(|f| f.included).count();
     if included < 3 {
-        tracing::warn!(included, frames = report.frames.len(), "fewer than 3 frames included; a stack needs at least 3");
         warn(&format!("only {included} of {} frames are included; a stack needs at least 3", report.frames.len()));
     }
     let csv = measure_csv(&finished, sources);

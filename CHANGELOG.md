@@ -44,9 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--threads`, `--memory`, `-v`/`-vv`. The short flags (`--psf auto|moffat4|moffat=<beta>`, `--weights`, `--rejection`,
   `--drizzle`, `--no-debayer`, `--no-hot-pixels`) are each one `--set`. Every command except `facts` and `config show`
   writes `<work>/logs/<UTC stamp>-<command>.jsonl` (debug-level `tracing` JSON), appends a `history` row to the manifest
-  (also when it fails or is refused) and ends with one summary line on stderr; stdout carries products only. Exit code 0
-  is done, 1 a stage failure, 2 a refusal of the command's inputs. There is no Ctrl-C handler: a killed command leaves
-  only `.tmp/` and part files, which the next writing command clears.
+  (also when it fails or is refused, or when a stage panics, which is caught) and ends with one summary line on stderr;
+  stdout carries products only. The exit code is decided by the kind of the error: 0 done, 1 an internal or I/O failure,
+  2 an input the user must change (a usage error, which leaves no log and no history row; a bad `--set` or config; a
+  frame with no transform; a calibration that does not fit; a light whose `IMAGETYP` is Dark, Flat or Bias, which names
+  the unquoted shell glob after `--dark`; fewer than three frames), marked in the pipeline by the typed `Refusal`
+  (`pipeline::is_refusal`). The log file holds every `error:`, `note:` and `warning:` line with its reason and the
+  effective config at debug; a stage's user-facing warning prints once on stderr (`pipeline::warn_user`) and is one
+  event in the log. A product named on the command line is read with its own folder: `--measure X` reads the star fits
+  from the `fits/` folder beside X (and takes X's frames when given none), `--ln DIR` the `.athln` grids from DIR.
+  `--set` and `-v` given both before and after the subcommand are joined. Without `--threads` the pool is rayon's
+  default (`RAYON_NUM_THREADS` is honoured). There is no Ctrl-C handler: a killed command leaves only `.tmp/` and part
+  files, which the next writing command clears.
 - The `master` and `calibrate` stages of `pipeline`: `build_master` (a bias, dark or flat from raw frames, Athenaeum's
   master build without the catalog: the automatic recipe, the frames integrated in the order of their full paths, the
   cards of `build_master_cards` with `SLM_*` in place of its own: `SLM_REC` holds what `ATH_REJ` holds (`Average |

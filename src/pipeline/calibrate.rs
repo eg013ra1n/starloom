@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use astroimage::header::{header_key_map, header_text, FrameFacts, HeaderFormat};
 use rayon::prelude::*;
 
@@ -59,7 +59,7 @@ use crate::pipeline::master::{
     build_master, cfa_of, frame_facts, planes_refusal, scratch_dir, size_of, too_few_frames, MasterKind, MasterReport,
     MIN_MASTER_FRAMES,
 };
-use crate::pipeline::{Ctx, Stage};
+use crate::pipeline::{warn_user, Ctx, Stage};
 use crate::stacking::config::AlgorithmConfig;
 
 /// What one calibrated frame came from and what was done to it.
@@ -160,17 +160,28 @@ fn per_channel_applies(opts: &CalibratedLightOptions, light: Option<CfaGeometry>
     opts.flat_norm && opts.params.cfa_flat_scaling && opts.flat_norm_mode != FlatNormMode::TrimmedMeanWhole && light.is_some()
 }
 
+/// What a light's normalized `IMAGETYP` calls a calibration frame, for the refusal: a dark, flat, bias or dark flat.
+fn calibration_frame_kind(imagetyp: &str) -> Option<&'static str> {
+    match imagetyp {
+        "Dark" => Some("dark"),
+        "Flat" => Some("flat"),
+        "Bias" => Some("bias"),
+        "DarkFlat" => Some("dark flat"),
+        _ => None,
+    }
+}
+
 fn check(groups: &[CalGroup], opts: &CalibratedLightOptions) -> Result<Checked> {
     let mut cache: BTreeMap<PathBuf, FrameFacts> = BTreeMap::new();
     let mut warnings = Vec::new();
     let mut excluded: Vec<Option<&'static str>> = Vec::with_capacity(groups.len());
     if groups.is_empty() {
-        bail!("no groups to calibrate");
+        refuse!("no groups to calibrate");
     }
     for (gi, group) in groups.iter().enumerate() {
         let n = gi + 1;
         if group.lights.is_empty() {
-            bail!("group {n} has no lights");
+            refuse!("group {n} has no lights");
         }
         // Athenaeum's run excludes these lights (one reason each) and calibrates the rest, so nothing here is read.
         let reason = if group.dark.is_none() && group.flat.is_none() && group.bias.is_none() {
@@ -195,7 +206,7 @@ fn check(groups: &[CalGroup], opts: &CalibratedLightOptions) -> Result<Checked> 
         for (role, source) in roles {
             if let Some(CalSource::Raw(frames)) = source {
                 if frames.len() < MIN_MASTER_FRAMES {
-                    bail!("group {n} {role}: {}", too_few_frames(frames.len()));
+                    refuse!("group {n} {role}: {}", too_few_frames(frames.len()));
                 }
             }
         }
@@ -208,8 +219,15 @@ fn check(groups: &[CalGroup], opts: &CalibratedLightOptions) -> Result<Checked> 
         let mut lights: Vec<(&Path, FrameFacts)> = Vec::with_capacity(group.lights.len());
         for light in &group.lights {
             let facts = facts_of(&mut cache, light)?.clone();
+            if let Some(kind) = facts.imagetyp.as_deref().and_then(calibration_frame_kind) {
+                refuse!(
+                    "group {n}: {} is a {kind} frame (its IMAGETYP says so) but it was given as a light; if a shell expanded a \
+                     glob given after --dark, --flat or --bias, quote it: --dark 'darks/*.fits'",
+                    light.display()
+                );
+            }
             if let Some(planes) = facts.planes.filter(|p| *p > 1) {
-                bail!("{}", planes_refusal(light, planes));
+                refuse!("{}", planes_refusal(light, planes));
             }
             lights.push((light.as_path(), facts));
         }
@@ -220,12 +238,12 @@ fn check(groups: &[CalGroup], opts: &CalibratedLightOptions) -> Result<Checked> 
             for path in source_paths(source) {
                 let cal = facts_of(&mut cache, path)?.clone();
                 if let Some(planes) = cal.planes.filter(|p| *p > 1) {
-                    bail!("{}", planes_refusal(path, planes));
+                    refuse!("{}", planes_refusal(path, planes));
                 }
                 for (light_path, light) in &lights {
                     if let (Some(a), Some(b)) = (size_of(&cal), size_of(light)) {
                         if a != b {
-                            bail!(
+                            refuse!(
                                 "Calibration does not fit the frame size — {role} {} is {}×{}, light {} is {}×{}",
                                 path.display(),
                                 a.0,
@@ -269,12 +287,12 @@ fn check(groups: &[CalGroup], opts: &CalibratedLightOptions) -> Result<Checked> 
         if let (Some(FlatPrecalSource::Master(p)), Some(CalSource::Raw(flats))) = (&group.flat_precal, &group.flat) {
             let pre = facts_of(&mut cache, p)?.clone();
             if let Some(planes) = pre.planes.filter(|n| *n > 1) {
-                bail!("{}", planes_refusal(p, planes));
+                refuse!("{}", planes_refusal(p, planes));
             }
             for flat in flats {
                 let f = facts_of(&mut cache, flat)?;
                 if let Some((a, b)) = size_of(&pre).zip(size_of(f)).filter(|(a, b)| a != b) {
-                    bail!(
+                    refuse!(
                         "Calibration does not fit the frame size — flat pre-calibration {} is {}×{}, flat {} is {}×{}",
                         p.display(),
                         a.0,
@@ -302,6 +320,8 @@ pub fn preflight(groups: &[CalGroup]) -> Result<Vec<String>> {
 /// Refused, naming the files:
 /// - a calibration frame whose size differs from a light's: "Calibration does not fit the frame size — dark `file` is
 ///   W×H, light `file` is W×H";
+/// - a light whose `IMAGETYP` is Dark, Flat, Bias or Dark Flat, saying that a shell may have expanded a glob given after
+///   `--dark`, `--flat` or `--bias` (the command line takes the first file as the master and the rest as lights);
 /// - a light or a calibration frame with more than one plane (the reason the integration reader gives);
 /// - a raw calibration set with fewer than [`MIN_MASTER_FRAMES`] frames, naming the group and the role ("calibration
 ///   set has 2 frames — at least 3 are required to build a master");
@@ -767,7 +787,7 @@ pub fn calibrate(
     let checked = check(groups, opts)?;
     let mut report = CalibrateReport { warnings: checked.warnings.clone(), ..CalibrateReport::default() };
     for w in &checked.warnings {
-        ctx.progress.warn(w);
+        warn_user(ctx, w);
     }
     for (gi, g) in groups.iter().enumerate() {
         if let Some(reason) = checked.excluded[gi] {
@@ -787,7 +807,7 @@ pub fn calibrate(
         .flat_map(|(gi, g)| g.lights.iter().map(move |l| (gi, l)))
         .collect();
     if all.is_empty() {
-        bail!("no light could be calibrated: every light was excluded ({})", checked.excluded.iter().flatten().next().copied().unwrap_or(NO_MASTERS));
+        refuse!("no light could be calibrated: every light was excluded ({})", checked.excluded.iter().flatten().next().copied().unwrap_or(NO_MASTERS));
     }
     let all_paths: Vec<PathBuf> = all.iter().map(|(_, l)| (*l).clone()).collect();
     let all_facts: Vec<FrameFacts> = all.iter().map(|(_, l)| checked.facts[*l].clone()).collect();
@@ -804,7 +824,7 @@ pub fn calibrate(
         let mosaic = (opts.keep_mosaic && debayer).then(|| format!("c_{stem}.{}", OutputFormat::Fits.extension()));
         for name in std::iter::once(&file).chain(mosaic.as_ref()) {
             if let Some(first) = seen.insert(name.to_lowercase(), i) {
-                bail!(
+                refuse!(
                     "{} and {} would both become {name}; give lights with distinct names",
                     all_paths[first].display(),
                     light.display()
@@ -860,7 +880,7 @@ pub fn calibrate(
                     });
                     if let HotPixelMapOutcome::Refused(reason) = &measured {
                         let message = format!("Hot-pixel correction skipped for {}: {reason}", dark.display());
-                        ctx.progress.warn(&message);
+                        warn_user(ctx, &message);
                         report.warnings.push(message);
                     }
                     hot_maps.insert(dark.clone(), Arc::new(measured));
@@ -958,8 +978,7 @@ pub fn calibrate(
                 .map(|(i, d)| (&all_facts[*i], d.report.calstat.as_str()))
                 .collect();
             if let Some(message) = subtraction_lost_warning(n, counted.len(), &lost) {
-                tracing::warn!(group = n, count = lost.len(), "dark subtraction left most pixels at or below zero");
-                ctx.progress.warn(&message);
+                warn_user(ctx, &message);
                 report.warnings.push(message);
             }
         }
@@ -1024,8 +1043,7 @@ pub fn calibrate(
                     stale.display(),
                     dest.display()
                 );
-                tracing::warn!(path = %stale.display(), error = %e, "cannot remove a stale cfa mosaic");
-                ctx.progress.warn(&message);
+                warn_user(ctx, &message);
                 report.warnings.push(message);
             }
         }

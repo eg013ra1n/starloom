@@ -38,7 +38,8 @@ use crate::pipeline::formats::{
 use crate::pipeline::measure::fan_out;
 use crate::pipeline::versions::recorded_versions;
 use crate::pipeline::weights::{keep_named_reference, subset_measure, weigh};
-use crate::pipeline::{athf_path, common_cards, config_hash, frame_stem, finish, source_facts, Ctx, Manifest, Stage, SLM_CFG, SLM_PLV, SLM_VER};
+use crate::pipeline::measure::athf_in;
+use crate::pipeline::{common_cards, config_hash, frame_stem, finish, source_facts, warn_user, Ctx, Manifest, Stage, SLM_CFG, SLM_PLV, SLM_VER};
 use crate::resample::{warp_rows, Plane};
 use crate::stacking::config::AlgorithmConfig;
 use crate::stacking::fits_artifact::read_fits;
@@ -142,8 +143,8 @@ fn same_file(a: &Path, b: &Path) -> bool {
 
 /// A single-plane frame's own Measure fits, for detection to reuse (`resolve_register_fits`): `None` when the file is
 /// missing or unreadable, or when the cuts leave too few stars to align on (detection then runs, as in Athenaeum).
-fn frame_fits(work: &Path, file: &Path, cfg: &AlgorithmConfig) -> Option<Vec<StarFit>> {
-    let path = athf_path(work, file, 0);
+fn frame_fits(fits_root: &Path, file: &Path, cfg: &AlgorithmConfig) -> Option<Vec<StarFit>> {
+    let path = athf_in(fits_root, frame_stem(file), 0);
     let fits = match read_fits(&path) {
         Ok(fits) => fits,
         Err(e) => {
@@ -357,7 +358,7 @@ pub fn register(
     write_registered: bool,
 ) -> Result<RegisterReport> {
     if frames.is_empty() {
-        bail!("no frames to register");
+        refuse!("no frames to register");
     }
     let work = std::path::absolute(ctx.work_dir).with_context(|| format!("cannot make {} absolute", ctx.work_dir.display()))?;
     let sub = subset_measure(measure, frames)?;
@@ -403,7 +404,8 @@ fn run(
     // grid only (P2-R3).
     let reuse_fits = finished.frames.iter().filter_map(|f| f.measurement.as_ref()).all(|m| m.channels.len() == 1);
     let ref_planes = ref_idx.and_then(|i| finished.frames[i].measurement.as_ref()).map(|m| m.channels.len());
-    let ref_fits = if reuse_fits && ref_planes == Some(1) { frame_fits(work, &ref_file, cfg) } else { None };
+    let fits_root = finished.fits_root(ctx.work_dir);
+    let ref_fits = if reuse_fits && ref_planes == Some(1) { frame_fits(&fits_root, &ref_file, cfg) } else { None };
     let ref_stars: ReferenceStars = reference_stars(&ref_file, &cfg.registration, Some(&ctx.pool), ref_fits.as_deref())
         .map_err(|e| anyhow!("reference star detection failed for {}: {e}", ref_file.display()))?;
     let (ref_w, ref_h) = (ref_stars.width, ref_stars.height);
@@ -422,7 +424,7 @@ fn run(
     // The frames to register: the included ones, and the reference when it is a frame.
     let members: Vec<usize> = (0..files.len()).filter(|&i| finished.frames[i].included || Some(i) == ref_idx).collect();
     if members.is_empty() {
-        bail!("no frame is included under this config; there is nothing to register");
+        refuse!("no frame is included under this config; there is nothing to register");
     }
     let included = finished.frames.iter().filter(|f| f.included).count();
     if included < 3 {
@@ -430,8 +432,7 @@ fn run(
             "only {included} of {} frames are included; a stack needs at least 3 (Athenaeum's run skips such a group)",
             files.len()
         );
-        tracing::warn!("{message}");
-        ctx.progress.warn(&message);
+        warn_user(ctx, &message);
     }
 
     let planes = members.iter().filter_map(|&i| finished.frames[i].measurement.as_ref()).map(|m| m.channels.len()).max().unwrap_or(1);
@@ -459,7 +460,7 @@ fn run(
             let outcome = register_one(
                 ctx,
                 cfg,
-                work,
+                &fits_root,
                 &ref_stars,
                 ref_scale,
                 &sources,
@@ -500,7 +501,7 @@ fn run(
             match outcome.registration.and_then(|r| r.outcome.map_err(|e| format!("{REGISTRATION_FAILED}: {e}"))) {
                 Ok(alignment) => {
                     for note in &alignment.warnings {
-                        ctx.progress.warn(&format!("{}: {note}", f.file.display()));
+                        warn_user(ctx, &format!("{}: {note}", f.file.display()));
                     }
                     if Some(i) != ref_idx {
                         inlier_rows.push((i as i64, alignment.inliers));
@@ -514,10 +515,9 @@ fn run(
                     // A registration that failed is excluded or refuses the run, as Athenaeum's does.
                     let reason = if reason.starts_with(REGISTRATION_FAILED) { reason } else { format!("{REGISTRATION_FAILED}: {reason}") };
                     if !cfg.selection.exclude_on_registration_failure {
-                        bail!("{}: {reason}", f.file.display());
+                        refuse!("{}: {reason}", f.file.display());
                     }
-                    tracing::warn!(path = %f.file.display(), reason = %reason, "frame excluded");
-                    ctx.progress.warn(&format!("{}: {reason}; the frame is excluded", f.file.display()));
+                    warn_user(ctx, &format!("{}: {reason}; the frame is excluded", f.file.display()));
                     transforms.frames.push(unmapped_row(&f.file, reason));
                 }
             }
@@ -569,7 +569,7 @@ fn run(
 fn register_one(
     ctx: &Ctx<'_>,
     cfg: &AlgorithmConfig,
-    work: &Path,
+    fits_root: &Path,
     ref_stars: &ReferenceStars,
     ref_scale: Option<f64>,
     sources: &std::collections::BTreeMap<PathBuf, FrameFacts>,
@@ -588,7 +588,7 @@ fn register_one(
             let gate = scale_gate_for(frame_scale, ref_scale);
             let policy = if ratio_wants_seed(scale_ratio_for(frame_scale, ref_scale)) { SeedPolicy::WcsFirst } else { SeedPolicy::QuadFirst };
             let planes = frame.measurement.as_ref().map_or(0, |m| m.channels.len());
-            let fits = if reuse_fits && planes == 1 { frame_fits(work, &frame.file, cfg) } else { None };
+            let fits = if reuse_fits && planes == 1 { frame_fits(fits_root, &frame.file, cfg) } else { None };
             let detected = detect_frame_stars(&frame.file, &cfg.registration, Some(&ctx.pool), fits.as_deref())
                 .map_err(|e| format!("{REGISTRATION_FAILED}: {e}"))?;
             if ctx.check_cancelled().is_err() {

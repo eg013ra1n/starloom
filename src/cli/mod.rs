@@ -15,17 +15,28 @@
 //!
 //! # Exit codes
 //!
+//! The code is decided by the kind of the error, not by where it arises:
+//!
 //! - 0: done;
-//! - 1: a stage failed (an I/O error, an unreadable frame, a frame with no transform);
-//! - 2: the command refused its inputs before running a stage: a usage error, a bad `--set` or config, a bound
+//! - 1: the machine or the code failed: an I/O error, a thread pool that would not build, a stage that panicked (it is
+//!   caught, logged, summarised and recorded like any failure), a frame that would not decode;
+//! - 2: the input is at fault and the user must change it: a usage error (clap's own, which leaves no log and no
+//!   history row, the working folder being unknown before the command line is read), a bad `--set` or config, a bound
 //!   (`--psf moffat=1`), a file named on the command line that is missing or not a frame, a product a stage needs that
-//!   is not there, and no frames to work on.
+//!   is not there, no frames to work on, a frame with no transform, a calibration that does not fit, a light that is
+//!   really a dark (a shell expanded a glob), fewer than three frames to stack. The pipeline marks these with a typed
+//!   [`Refusal`]; every other error it returns is a failure.
+//!
+//! A refusal and a failure both keep their log file (which holds the `error:` line and why) and append a history row.
 //!
 //! There is no Ctrl-C handler this cycle: a killed command leaves only `<work>/.tmp/` and part files, which the next
 //! writing command clears, and no log close or history row.
 //!
 //! The stages are not linked (P2-R24): a command reads the products it is given (`--measure`, `--transforms`, `--ln`)
-//! or else the ones in the working folder, and never judges them stale.
+//! or else the ones in the working folder, and never judges them stale. A product named on the command line is read
+//! with its own folder: Measure's `.athf` star fits from the `fits/` folder beside `--measure`'s report, the `.athln`
+//! grids from `--ln`'s folder, so a stage run in a fresh working folder on products made in another gets the same
+//! result.
 
 pub mod args;
 pub mod log;
@@ -33,11 +44,12 @@ pub mod out;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use clap::Parser;
 
@@ -48,7 +60,7 @@ use crate::pipeline::formats::{
     MEASURE_REPORT_FILE, NORMALIZE_FILE, TRANSFORMS_FILE,
 };
 use crate::pipeline::{
-    append_history, begin_writing, build_master, calibrate, calibrated_dir, config_hash, effective_config,
+    is_refusal, Refusal, append_history, begin_writing, build_master, calibrate, calibrated_dir, config_hash, effective_config,
     expand_calibration_frames, expand_inputs, frames_or_upstream, ln_dir, measure, measure_dir, normalize, read_plan, register,
     register_dir, run, stack, stack_dir, CalGroup, CalSource, Ctx, FlatPrecalSource, HistoryRow, InputKind, Manifest, MasterKind,
     ReferenceChoice, RegisterReport, Stage,
@@ -57,7 +69,7 @@ use crate::stacking::config::AlgorithmConfig;
 
 use args::{parse_memory, parse_set, CalFlags, CalibrateArgs, Cli, Command, ConfigCommand, FactsArgs, Global, MasterArgs,
     MeasureArgs, NormalizeArgs, RegisterArgs, RunArgs, Set, StackArgs};
-use out::{product_line, stderr_line, StderrProgress};
+use out::{error_line, note_line, product_line, stderr_line, warning_line, StderrProgress};
 
 /// How a command ended when it did not finish: refused (exit code 2) or failed (exit code 1).
 #[derive(Debug)]
@@ -88,9 +100,22 @@ impl Fail {
     }
 }
 
+impl Fail {
+    /// An error of the pipeline or the machine: a refusal when the pipeline typed it as one, else a failure.
+    fn of(error: anyhow::Error) -> Fail {
+        if is_refusal(&error) {
+            Fail::Refused(error)
+        } else {
+            Fail::Failed(error)
+        }
+    }
+}
+
 /// Classifies an error as a refusal (exit 2) or a failure (exit 1).
 trait Classify<T> {
+    /// Always a refusal: for a call whose every error is the input's (a pattern that matched nothing, a bad `--set`).
     fn refuse(self) -> Result<T, Fail>;
+    /// By kind: a refusal when the error is a typed [`Refusal`], else a failure (an I/O or internal error).
     fn fail(self) -> Result<T, Fail>;
 }
 
@@ -100,8 +125,13 @@ impl<T, E: Into<anyhow::Error>> Classify<T> for Result<T, E> {
     }
 
     fn fail(self) -> Result<T, Fail> {
-        self.map_err(|e| Fail::Failed(e.into()))
+        self.map_err(|e| Fail::of(e.into()))
     }
+}
+
+/// A refusal that says `message`.
+fn refusal(message: impl Into<String>) -> Fail {
+    Fail::Refused(Refusal::new(message).into())
 }
 
 /// What a finished command made, for the summary line.
@@ -156,12 +186,38 @@ pub fn run_args(args: Vec<OsString>) -> i32 {
     }
 }
 
+/// The message of a panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_string())
+}
+
+/// Runs `run`, turning a panic (also one of a pool worker, which rayon hands to the caller) into a failure: the panic
+/// is logged with its place by a hook (so the default hook does not print it a second time), and the command goes on to
+/// its summary line and its history row.
+fn guarded<T>(run: impl FnOnce() -> Result<T, Fail>) -> Result<T, Fail> {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|info| {
+        let place = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        tracing::error!(place = %place, text = %panic_message(info.payload()), "stage panicked");
+    }));
+    let result = std::panic::catch_unwind(AssertUnwindSafe(run));
+    std::panic::set_hook(previous);
+    match result {
+        Ok(r) => r,
+        Err(payload) => Err(Fail::Failed(anyhow!("internal error: a stage panicked: {}", panic_message(&*payload)))),
+    }
+}
+
 /// A command that only reads: no work folder, log file or history row.
 fn read_only(cli: &Cli) -> i32 {
-    log::init(cli.global.verbose, None);
+    log::init(cli.verbose(), None);
     let result = match &cli.command {
         Command::Facts(a) => facts(a),
-        Command::Config(ConfigCommand::Show) => config_show(&cli.global),
+        Command::Config(ConfigCommand::Show(_)) => config_show(cli),
         _ => unreachable!("only the read-only commands come here"),
     };
     match result {
@@ -175,6 +231,11 @@ fn read_only(cli: &Cli) -> i32 {
 
 /// A command that writes: the log, the stage, the summary line and the history row.
 fn logged(cli: &Cli, args: &[OsString]) -> i32 {
+    logged_with(cli, args, |work, hash| execute(cli, work, hash))
+}
+
+/// [`logged`] with the stage to run given: the log, the stage (its panic caught), the summary line and the history row.
+fn logged_with(cli: &Cli, args: &[OsString], run: impl FnOnce(&Path, &mut String) -> Result<Outcome, Fail>) -> i32 {
     let name = cli.command.name();
     let started = Utc::now();
     let clock = Instant::now();
@@ -195,11 +256,11 @@ fn logged(cli: &Cli, args: &[OsString]) -> i32 {
             return 1;
         }
     };
-    log::init(cli.global.verbose, Some(file));
+    log::init(cli.verbose(), Some(file));
     tracing::info!(command = name, version = env!("CARGO_PKG_VERSION"), "command started");
 
     let mut hash = String::new();
-    let result = execute(cli, &work, &mut hash);
+    let result = guarded(|| run(&work, &mut hash));
     let elapsed = elapsed_text(clock.elapsed());
     let (mut code, summary) = match &result {
         Ok(o) => (
@@ -213,11 +274,11 @@ fn logged(cli: &Cli, args: &[OsString]) -> i32 {
             ),
         ),
         Err(f) => {
-            stderr_line(&format!("error: {:#}", f.error()));
+            error_line(f.error());
             (f.code(), format!("starloom {name}: {} in {elapsed}; log {}", f.verb(), log_file.display()))
         }
     };
-    tracing::info!(command = name, exit_code = code, "command finished");
+    tracing::info!(command = name, exit_code = code, summary = %summary, "command finished");
     stderr_line(&summary);
     let row = HistoryRow {
         command: name.to_string(),
@@ -250,37 +311,42 @@ fn elapsed_text(d: Duration) -> String {
     }
 }
 
-/// The user's `--set`s, parsed.
-fn user_sets(global: &Global) -> Result<Vec<Set>> {
-    global.set.iter().map(|s| parse_set(s)).collect()
+/// The user's `--set`s, parsed: the ones before the subcommand, then the ones after it.
+fn user_sets(cli: &Cli) -> Result<Vec<Set>> {
+    cli.sets().iter().map(|s| parse_set(s)).collect()
 }
 
 /// The effective config of a command: its short flags' `--set`s, then the user's. Names the keys a file did not read.
-fn build_config(global: &Global, mut sets: Vec<Set>) -> Result<AlgorithmConfig> {
-    sets.extend(user_sets(global)?);
+fn build_config(cli: &Cli, mut sets: Vec<Set>) -> Result<AlgorithmConfig> {
+    sets.extend(user_sets(cli)?);
+    let global = &cli.global;
     let (cfg, ignored) = effective_config(global.preset.map(Into::into), global.config.as_deref(), &sets)?;
     if !ignored.is_empty() {
         let file = global.config.as_deref().map(|p| p.display().to_string()).unwrap_or_default();
-        stderr_line(&format!("note: config {file}: keys not read: {}", ignored.join(", ")));
+        note_line(&format!("config {file}: keys not read: {}", ignored.join(", ")));
     }
     Ok(cfg)
 }
 
 /// What `--threads` and `--memory` ask for: the pool (the one starloom builds) and the memory budget.
-fn pool_and_memory(global: &Global) -> Result<(Arc<rayon::ThreadPool>, u64)> {
+///
+/// Without `--threads` the pool has rayon's own count (every core, or `RAYON_NUM_THREADS`). Without `--memory` the
+/// budget is the machine's RAM; when the machine does not say, 4 GiB, with a warning. A bad `--memory` is a refusal; a
+/// pool that will not build is a failure.
+fn pool_and_memory(global: &Global) -> Result<(Arc<rayon::ThreadPool>, u64), Fail> {
     let memory = match &global.memory {
-        Some(raw) => parse_memory(raw)?,
-        None => crate::sys::total_ram_bytes().unwrap_or(4 << 30),
+        Some(raw) => parse_memory(raw).refuse()?,
+        None => crate::sys::total_ram_bytes().unwrap_or_else(|| {
+            warning_line("the machine's RAM is unknown; planning for 4 GiB of working memory (give --memory to say)");
+            4 << 30
+        }),
     };
-    let threads = match global.threads {
-        Some(n) if n > 0 => n,
-        _ => std::thread::available_parallelism().map_or(1, usize::from),
-    };
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .context("cannot build the thread pool")?;
-    tracing::debug!(threads, memory_bytes = memory, "thread pool built");
+    let mut builder = rayon::ThreadPoolBuilder::new();
+    if let Some(n) = global.threads.filter(|n| *n > 0) {
+        builder = builder.num_threads(n);
+    }
+    let pool = builder.build().context("cannot build the thread pool").fail()?;
+    tracing::debug!(threads = pool.current_num_threads(), memory_bytes = memory, "thread pool built");
     Ok((Arc::new(pool), memory))
 }
 
@@ -293,9 +359,10 @@ fn execute(cli: &Cli, work: &Path, hash: &mut String) -> Result<Outcome, Fail> {
         Command::Run(a) => a.sugar().refuse()?,
         _ => Vec::new(),
     };
-    let cfg = build_config(&cli.global, sugar).refuse()?;
+    let cfg = build_config(cli, sugar).refuse()?;
     *hash = config_hash(&cfg);
-    let (pool, memory) = pool_and_memory(&cli.global).refuse()?;
+    tracing::debug!(config = %serde_json::to_string(&cfg).map_err(anyhow::Error::from).fail()?, "effective config");
+    let (pool, memory) = pool_and_memory(&cli.global)?;
     begin_writing(work).fail()?;
     let env = Env { work: work.to_path_buf(), cfg, pool, cancel: AtomicBool::new(false), progress: StderrProgress::new(), memory };
     match &cli.command {
@@ -314,41 +381,66 @@ fn execute(cli: &Cli, work: &Path, hash: &mut String) -> Result<Outcome, Fail> {
 // Inputs
 // ---------------------------------------------------------------------------------------------------------------
 
-/// The frames of a stage: the ones on the command line, else the previous stage's from the manifest (P2-R20).
-fn frames_for(env: &Env, stage: Stage, given: &[OsString]) -> Result<Vec<PathBuf>, Fail> {
+/// The frames of a stage: the ones on the command line, else the ones of the measurement report the command was given
+/// (`--measure`), else the previous stage's from the manifest (P2-R20).
+fn frames_for(env: &Env, stage: Stage, given: &[OsString], explicit: Option<&MeasureReport>) -> Result<Vec<PathBuf>, Fail> {
     let named = if given.is_empty() { Vec::new() } else { expand_inputs(given, InputKind::Calibrated).refuse()? };
-    let manifest = Manifest::load(&env.work).refuse()?;
+    if let (true, Some(report)) = (named.is_empty(), explicit) {
+        return Ok(report.frames.iter().map(|f| f.file.clone()).collect());
+    }
+    let manifest = Manifest::load(&env.work).fail()?;
     frames_or_upstream(&manifest, stage, named).refuse()
+}
+
+/// The frames of a stage and its measurement report: the report named by `--measure`, else the working folder's.
+fn frames_and_measure(
+    env: &Env,
+    stage: Stage,
+    given: &[OsString],
+    measure: Option<&Path>,
+) -> Result<(Vec<PathBuf>, MeasureReport), Fail> {
+    let explicit = measure.map(|p| load_measure(env, Some(p))).transpose()?;
+    let frames = frames_for(env, stage, given, explicit.as_ref())?;
+    let measured = match explicit {
+        Some(m) => m,
+        None => load_measure(env, None)?,
+    };
+    Ok((frames, measured))
+}
+
+/// `path` made absolute; a failure is the machine's, not the input's.
+fn absolute(path: &Path) -> Result<PathBuf, Fail> {
+    std::path::absolute(path).with_context(|| format!("cannot make {} absolute", path.display())).fail()
 }
 
 /// A calibration source from `--dark`, `--flat` or `--bias`: one existing file is a master, anything else is raw frames
 /// to integrate into one.
-fn cal_source(values: &[OsString], what: &str) -> Result<Option<CalSource>> {
+fn cal_source(values: &[OsString], what: &str) -> Result<Option<CalSource>, Fail> {
     if values.is_empty() {
         return Ok(None);
     }
     if let [one] = values {
         let p = Path::new(one);
         if p.is_file() {
-            return Ok(Some(CalSource::Master(std::path::absolute(p).with_context(|| format!("cannot make {} absolute", p.display()))?)));
+            return Ok(Some(CalSource::Master(absolute(p)?)));
         }
     }
-    Ok(Some(CalSource::Raw(expand_calibration_frames(values).with_context(|| format!("--{what}"))?)))
+    Ok(Some(CalSource::Raw(expand_calibration_frames(values).with_context(|| format!("--{what}")).refuse()?)))
 }
 
 /// The calibration groups of `calibrate` and `run`: a plan's, or one group from the lights and the flags.
-fn cal_groups(lights: &[OsString], cal: &CalFlags, plan: Option<&Path>) -> Result<Vec<CalGroup>> {
+fn cal_groups(lights: &[OsString], cal: &CalFlags, plan: Option<&Path>) -> Result<Vec<CalGroup>, Fail> {
     if let Some(plan) = plan {
         if !lights.is_empty() || !cal.dark.is_empty() || !cal.flat.is_empty() || !cal.bias.is_empty() {
-            bail!("--plan replaces LIGHTS and --dark, --flat and --bias; give one or the other");
+            return Err(refusal("--plan replaces LIGHTS and --dark, --flat and --bias; give one or the other"));
         }
-        return read_plan(plan);
+        return Ok(read_plan(plan).refuse()?);
     }
     if lights.is_empty() {
-        bail!("no lights given; give LIGHTS or --plan");
+        return Err(refusal("no lights given; give LIGHTS or --plan"));
     }
     Ok(vec![CalGroup {
-        lights: expand_inputs(lights, InputKind::Raw)?,
+        lights: expand_inputs(lights, InputKind::Raw).refuse()?,
         dark: cal_source(&cal.dark, "dark")?,
         flat: cal_source(&cal.flat, "flat")?,
         bias: cal_source(&cal.bias, "bias")?,
@@ -357,24 +449,25 @@ fn cal_groups(lights: &[OsString], cal: &CalFlags, plan: Option<&Path>) -> Resul
 }
 
 /// `--reference`: `auto`, or a file that exists.
-fn reference_choice(raw: &str) -> Result<ReferenceChoice> {
+fn reference_choice(raw: &str) -> Result<ReferenceChoice, Fail> {
     if raw == "auto" {
         return Ok(ReferenceChoice::Auto);
     }
     let path = Path::new(raw);
     if !path.is_file() {
-        bail!("--reference {raw} is not a file; give a calibrated FITS file or `auto`");
+        return Err(refusal(format!("--reference {raw} is not a file; give a calibrated FITS file or `auto`")));
     }
-    Ok(ReferenceChoice::File(std::path::absolute(path).with_context(|| format!("cannot make {raw} absolute"))?))
+    Ok(ReferenceChoice::File(absolute(path)?))
 }
 
-/// The measurement report: the one named, else `<work>/measure/measure.json`.
+/// The measurement report: the one named, else `<work>/measure/measure.json`. A report that is not one, or that another
+/// starloom made, is a refusal; one that cannot be read is a failure.
 fn load_measure(env: &Env, explicit: Option<&Path>) -> Result<MeasureReport, Fail> {
     let path = explicit.map_or_else(|| measure_dir(&env.work).join(MEASURE_REPORT_FILE), Path::to_path_buf);
     if !path.is_file() {
-        return Err(Fail::Refused(anyhow!("no measurement report at {}; give --measure or run `starloom measure`", path.display())));
+        return Err(refusal(format!("no measurement report at {}; give --measure or run `starloom measure`", path.display())));
     }
-    MeasureReport::read(&path).with_context(|| format!("cannot read {}", path.display())).refuse()
+    MeasureReport::read(&path).with_context(|| format!("cannot read {}", path.display())).fail()
 }
 
 /// The transforms: the report named, else `<work>/register/transforms.json`. The weights a later stage uses are never
@@ -382,16 +475,33 @@ fn load_measure(env: &Env, explicit: Option<&Path>) -> Result<MeasureReport, Fai
 fn load_register(env: &Env, explicit: Option<&Path>) -> Result<RegisterReport, Fail> {
     let path = explicit.map_or_else(|| register_dir(&env.work).join(TRANSFORMS_FILE), Path::to_path_buf);
     if !path.is_file() {
-        return Err(Fail::Refused(anyhow!("no transforms at {}; give --transforms or run `starloom register`", path.display())));
+        return Err(refusal(format!("no transforms at {}; give --transforms or run `starloom register`", path.display())));
     }
-    let transforms = TransformsReport::read(&path).with_context(|| format!("cannot read {}", path.display())).refuse()?;
+    let transforms = TransformsReport::read(&path).with_context(|| format!("cannot read {}", path.display())).fail()?;
     let weights = WeightsReport::new(WeightSettings {
         weight_mode: env.cfg.measurement.weight_mode,
-        formula: env.cfg.measurement.formula,
+        formula: env.cfg.measurement.formula.clone(),
         keyword: env.cfg.measurement.keyword.clone(),
         selection: env.cfg.selection,
     });
     Ok(RegisterReport { transforms, weights, registered: Vec::new() })
+}
+
+/// The normalization report of `dir` (`--ln`), its `.athln` rows pointing into `dir`: `normalize` recorded the paths
+/// where it wrote them, and a folder that was copied or moved keeps the files, not those paths.
+fn load_normalize(dir: &Path) -> Result<NormalizeReport, Fail> {
+    let dir = absolute(dir)?;
+    let path = dir.join(NORMALIZE_FILE);
+    if !path.is_file() {
+        return Err(refusal(format!("no {NORMALIZE_FILE} in {}; give --ln or run `starloom normalize`", dir.display())));
+    }
+    let mut report = NormalizeReport::read(&path).with_context(|| format!("cannot read {}", path.display())).fail()?;
+    for row in &mut report.frames {
+        if let Some(name) = row.athln.as_ref().and_then(|p| p.file_name()) {
+            row.athln = Some(dir.join(name));
+        }
+    }
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -431,8 +541,8 @@ fn facts(args: &FactsArgs) -> Result<(), Fail> {
 }
 
 /// `config show`: the effective config as JSON.
-fn config_show(global: &Global) -> Result<(), Fail> {
-    let cfg = build_config(global, Vec::new()).refuse()?;
+fn config_show(cli: &Cli) -> Result<(), Fail> {
+    let cfg = build_config(cli, Vec::new()).refuse()?;
     product_line(&serde_json::to_string_pretty(&cfg).map_err(anyhow::Error::from).fail()?);
     Ok(())
 }
@@ -452,7 +562,7 @@ fn cmd_master(env: &Env, a: &MasterArgs) -> Result<Outcome, Fail> {
             if !p.is_file() {
                 return Err(Fail::Refused(anyhow!("--precal {} is not a file", p.display())));
             }
-            Some(FlatPrecalSource::Master(std::path::absolute(p).map_err(anyhow::Error::from).refuse()?))
+            Some(FlatPrecalSource::Master(absolute(p)?))
         }
         (None, Some(dn)) => Some(FlatPrecalSource::SyntheticBias(dn)),
         (None, None) => None,
@@ -462,7 +572,7 @@ fn cmd_master(env: &Env, a: &MasterArgs) -> Result<Outcome, Fail> {
         None => None,
     };
     let out = match &a.out {
-        Some(p) => std::path::absolute(p).map_err(anyhow::Error::from).refuse()?,
+        Some(p) => absolute(p)?,
         None => env.work.join("masters").join(format!("{}.fits", kind.name())),
     };
     if let Some(parent) = out.parent() {
@@ -474,7 +584,7 @@ fn cmd_master(env: &Env, a: &MasterArgs) -> Result<Outcome, Fail> {
 }
 
 fn cmd_calibrate(env: &Env, a: &CalibrateArgs) -> Result<Outcome, Fail> {
-    let groups = cal_groups(&a.lights, &a.cal, a.plan.as_deref()).refuse()?;
+    let groups = cal_groups(&a.lights, &a.cal, a.plan.as_deref())?;
     let lights: usize = groups.iter().map(|g| g.lights.len()).sum();
     let mut opts = env.cfg.calibration.clone();
     opts.keep_mosaic = a.keep_mosaic;
@@ -484,7 +594,7 @@ fn cmd_calibrate(env: &Env, a: &CalibrateArgs) -> Result<Outcome, Fail> {
 }
 
 fn cmd_measure(env: &Env, a: &MeasureArgs) -> Result<Outcome, Fail> {
-    let frames = frames_for(env, Stage::Measure, &a.frames)?;
+    let frames = frames_for(env, Stage::Measure, &a.frames, None)?;
     let report = measure(&env.ctx(), &env.cfg, &frames, a.gain, a.stars).fail()?;
     Ok(Outcome {
         frames: report.frames.len(),
@@ -494,9 +604,8 @@ fn cmd_measure(env: &Env, a: &MeasureArgs) -> Result<Outcome, Fail> {
 }
 
 fn cmd_register(env: &Env, a: &RegisterArgs) -> Result<Outcome, Fail> {
-    let frames = frames_for(env, Stage::Register, &a.frames)?;
-    let measured = load_measure(env, a.measure.as_deref())?;
-    let reference = reference_choice(&a.reference).refuse()?;
+    let (frames, measured) = frames_and_measure(env, Stage::Register, &a.frames, a.measure.as_deref())?;
+    let reference = reference_choice(&a.reference)?;
     let report = register(&env.ctx(), &frames, &measured, &reference, &env.cfg, a.write_registered).fail()?;
     Ok(Outcome {
         frames: report.transforms.frames.len(),
@@ -506,12 +615,11 @@ fn cmd_register(env: &Env, a: &RegisterArgs) -> Result<Outcome, Fail> {
 }
 
 fn cmd_normalize(env: &Env, a: &NormalizeArgs) -> Result<Outcome, Fail> {
-    let frames = frames_for(env, Stage::Normalize, &a.frames)?;
-    let measured = load_measure(env, a.measure.as_deref())?;
+    let (frames, measured) = frames_and_measure(env, Stage::Normalize, &a.frames, a.measure.as_deref())?;
     let registered = load_register(env, a.transforms.as_deref())?;
     let report = normalize(&env.ctx(), &frames, &measured, &registered, &env.cfg).fail()?;
     if let (NormalizeStatus::NotRequested | NormalizeStatus::Off, Some(note)) = (report.status, &report.note) {
-        stderr_line(&format!("note: {note}"));
+        note_line(note);
     }
     let product = (report.status != NormalizeStatus::NotRequested).then(|| ln_dir(&env.work).join(NORMALIZE_FILE));
     Ok(Outcome {
@@ -522,27 +630,17 @@ fn cmd_normalize(env: &Env, a: &NormalizeArgs) -> Result<Outcome, Fail> {
 }
 
 fn cmd_stack(env: &Env, a: &StackArgs) -> Result<Outcome, Fail> {
-    let frames = frames_for(env, Stage::Stack, &a.frames)?;
-    let measured = load_measure(env, a.measure.as_deref())?;
+    let (frames, measured) = frames_and_measure(env, Stage::Stack, &a.frames, a.measure.as_deref())?;
     let registered = load_register(env, a.transforms.as_deref())?;
-    let normalized: Option<NormalizeReport> = match &a.ln {
-        Some(dir) => {
-            let path = dir.join(NORMALIZE_FILE);
-            if !path.is_file() {
-                return Err(Fail::Refused(anyhow!("no {NORMALIZE_FILE} in {}; give --ln or run `starloom normalize`", dir.display())));
-            }
-            Some(NormalizeReport::read(&path).with_context(|| format!("cannot read {}", path.display())).refuse()?)
-        }
-        None => None,
-    };
+    let normalized: Option<NormalizeReport> = a.ln.as_deref().map(load_normalize).transpose()?;
     let out = match &a.out {
-        Some(p) => std::path::absolute(p).map_err(anyhow::Error::from).refuse()?,
+        Some(p) => absolute(p)?,
         None => stack_dir(&env.work),
     };
     std::fs::create_dir_all(&out).with_context(|| format!("cannot create {}", out.display())).fail()?;
     let report = stack(&env.ctx(), &env.cfg, &frames, &measured, &registered, normalized.as_ref(), &out, a.format.into()).fail()?;
     if let Some(note) = &report.reweighed {
-        stderr_line(&format!("note: {note}"));
+        note_line(note);
     }
     Ok(Outcome {
         frames: report.frames.len(),
@@ -552,20 +650,53 @@ fn cmd_stack(env: &Env, a: &StackArgs) -> Result<Outcome, Fail> {
 }
 
 fn cmd_run(env: &Env, a: &RunArgs) -> Result<Outcome, Fail> {
-    let groups = cal_groups(&a.lights, &a.cal, a.plan.as_deref()).refuse()?;
-    let reference = reference_choice(&a.reference).refuse()?;
+    let groups = cal_groups(&a.lights, &a.cal, a.plan.as_deref())?;
+    let reference = reference_choice(&a.reference)?;
     let out = match &a.out {
-        Some(p) => std::path::absolute(p).map_err(anyhow::Error::from).refuse()?,
+        Some(p) => absolute(p)?,
         None => stack_dir(&env.work),
     };
     std::fs::create_dir_all(&out).with_context(|| format!("cannot create {}", out.display())).fail()?;
     let report = run(&env.ctx(), &groups, &env.cfg, &reference, &out, a.format.into()).fail()?;
     if let Some(note) = &report.stack.reweighed {
-        stderr_line(&format!("note: {note}"));
+        note_line(note);
     }
     Ok(Outcome {
         frames: report.stack.frames.len(),
         excluded: report.stack.weights.frames.iter().filter(|f| !f.included).count(),
         product: Some(report.stack.master),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_becomes_a_failure_with_its_message() {
+        let result: Result<(), Fail> = guarded(|| panic!("the stage broke"));
+        let fail = result.unwrap_err();
+        assert_eq!(fail.code(), 1);
+        assert!(format!("{:#}", fail.error()).contains("the stage broke"), "{:#}", fail.error());
+        assert_eq!(guarded(|| Ok::<_, Fail>(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn a_panicking_stage_still_leaves_its_summary_its_history_row_and_exit_1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let args: Vec<OsString> = ["starloom", "-w", work.to_str().unwrap(), "measure", "a.fits"].map(OsString::from).to_vec();
+        let cli = Cli::try_parse_from(&args).unwrap();
+        let code = logged_with(&cli, &args, |_, _| -> Result<Outcome, Fail> { panic!("boom in a stage") });
+        assert_eq!(code, 1);
+        let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(work.join("starloom.json")).unwrap()).unwrap();
+        let rows = manifest["history"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["exitCode"], 1);
+        assert!(rows[0]["summary"].as_str().unwrap().starts_with("starloom measure: failed in"), "{}", rows[0]["summary"]);
+        // The log says why (the subscriber is the first one this test process installs).
+        let log_dir = work.join("logs");
+        let log = std::fs::read_to_string(std::fs::read_dir(log_dir).unwrap().next().unwrap().unwrap().path()).unwrap();
+        assert!(log.contains("boom in a stage"), "{log}");
+    }
 }

@@ -19,7 +19,8 @@ pub mod weights;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+use crate::pipeline::Refusal;
 use serde::de::{DeserializeOwned, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -142,20 +143,21 @@ impl<'de> MapAccess<'de> for Fields<'de> {
 /// ("made by another starloom: <tag> version N, this build reads M"). A `null` float reads as NaN (module docs).
 pub(crate) fn read_versioned<T: DeserializeOwned>(path: &Path, tag: &str, version: u32) -> Result<T> {
     let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let head: Head = serde_json::from_str(&text).with_context(|| format!("{} is not a starloom file", path.display()))?;
+    let refused = |what: String, e: serde_json::Error| anyhow::Error::from(Refusal::new(format!("{} {what}: {e}", path.display())));
+    let head: Head = serde_json::from_str(&text).map_err(|e| refused("is not a starloom file".to_string(), e))?;
     if head.format.as_deref() != Some(tag) {
-        bail!("{} is not a {tag} file (format {:?})", path.display(), head.format.as_deref().unwrap_or("none"));
+        refuse!("{} is not a {tag} file (format {:?})", path.display(), head.format.as_deref().unwrap_or("none"));
     }
     match head.version {
         Some(v) if v == u64::from(version) => {}
-        found => bail!(
+        found => refuse!(
             "{}: made by another starloom: {tag} version {}, this build reads {version}",
             path.display(),
             found.map_or_else(|| "none".to_string(), |v| v.to_string()),
         ),
     }
-    let value: Value = serde_json::from_str(&text).with_context(|| format!("{} is not JSON", path.display()))?;
-    T::deserialize(NonFinite(&value)).with_context(|| format!("{} does not read as a {tag} file", path.display()))
+    let value: Value = serde_json::from_str(&text).map_err(|e| refused("is not JSON".to_string(), e))?;
+    T::deserialize(NonFinite(&value)).map_err(|e| refused(format!("does not read as a {tag} file"), e))
 }
 
 /// Where a product bound for `dest` is built: `<dest>.part`, in `dest`'s own folder, so the rename that puts it in
@@ -338,7 +340,12 @@ mod tests {
         let report = measure_report(work);
         let path = work.join("measure").join(MEASURE_REPORT_FILE);
         report.write(&path).unwrap();
-        let back = MeasureReport::read(&path).unwrap();
+        let mut back = MeasureReport::read(&path).unwrap();
+        // A report read from a file knows its folder (where its `fits/` is); that is the one thing it does not store.
+        assert_eq!(back.source_dir.as_deref(), path.parent());
+        assert_eq!(back.fits_root(work), path.parent().unwrap());
+        assert_eq!(report.fits_root(work), work.join("measure"));
+        back.source_dir = None;
         assert_eq!(back, report);
         assert_eq!(back.group_beta.unwrap().to_bits(), report.group_beta.unwrap().to_bits());
         assert_eq!(

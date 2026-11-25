@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use astroimage::header::{read_frame_facts, FrameFacts};
 use chrono::{DateTime, Utc};
 
@@ -32,7 +32,7 @@ use crate::pipeline::cards::{common_cards, SLM_N, SLM_REC, SLM_TMAX, SLM_TMIN};
 use crate::pipeline::config::config_hash;
 use crate::pipeline::formats::TMP_DIR;
 use crate::pipeline::inputs::{parse_date_obs, FlatPrecalSource};
-use crate::pipeline::Ctx;
+use crate::pipeline::{warn_user, Ctx};
 use crate::stacking::config::AlgorithmConfig;
 use crate::storage_class::{read_concurrency, StorageClass};
 
@@ -429,19 +429,19 @@ fn load_precal_master(path: &Path, scratch: &Path) -> Result<FlatPrecal> {
 /// Returns their facts, in order.
 fn check_frames(frames: &[PathBuf]) -> Result<Vec<FrameFacts>> {
     if frames.len() < MIN_MASTER_FRAMES {
-        bail!("{}", too_few_frames(frames.len()));
+        refuse!("{}", too_few_frames(frames.len()));
     }
     let mut facts = Vec::with_capacity(frames.len());
     let mut first: Option<(&Path, (i64, i64))> = None;
     for path in frames {
         let f = frame_facts(path)?;
         if f.planes.is_some_and(|p| p > 1) {
-            bail!("{}", planes_refusal(path, f.planes.unwrap_or(0)));
+            refuse!("{}", planes_refusal(path, f.planes.unwrap_or(0)));
         }
         if let Some(size) = size_of(&f) {
             match first {
                 None => first = Some((path, size)),
-                Some((other, other_size)) if other_size != size => bail!(
+                Some((other, other_size)) if other_size != size => refuse!(
                     "frames of different sizes: {} is {}×{}, {} is {}×{}",
                     other.display(),
                     other_size.0,
@@ -484,7 +484,7 @@ pub fn build_master(
     format: OutputFormat,
 ) -> Result<MasterReport> {
     if precal.is_some() && kind != MasterKind::Flat {
-        bail!("a pre-calibration applies to flats only, not to {} frames", kind.name());
+        refuse!("a pre-calibration applies to flats only, not to {} frames", kind.name());
     }
     let mut sorted: Vec<PathBuf> = frames.to_vec();
     sorted.sort_by_cached_key(|p| p.to_string_lossy().into_owned());
@@ -493,10 +493,10 @@ pub fn build_master(
     if let (Some(FlatPrecalSource::Master(p)), Some(size)) = (precal, facts.iter().find_map(size_of)) {
         let pf = frame_facts(p)?;
         if pf.planes.is_some_and(|n| n > 1) {
-            bail!("{}", planes_refusal(p, pf.planes.unwrap_or(0)));
+            refuse!("{}", planes_refusal(p, pf.planes.unwrap_or(0)));
         }
         if let Some(psize) = size_of(&pf).filter(|s| *s != size) {
-            bail!(
+            refuse!(
                 "pre-calibration master {} is {}×{}, the flats are {}×{}",
                 p.display(),
                 psize.0,
@@ -574,7 +574,7 @@ pub fn build_master(
     write_image_f32(out, integrated.width, integrated.height, 1, &integrated.data, &cards, format, XisfBounds::Adu16)
         .with_context(|| format!("cannot write {}", out.display()))?;
     for w in &warnings {
-        ctx.progress.warn(w);
+        warn_user(ctx, w);
     }
     tracing::info!(path = %out.display(), kind = kind.name(), "master written");
     Ok(MasterReport {

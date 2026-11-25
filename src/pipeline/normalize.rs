@@ -43,7 +43,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use astroimage::header::FrameFacts;
 
 use crate::integration::plane_reader::PlaneReader;
@@ -57,7 +57,8 @@ use crate::pipeline::measure::fan_out;
 use crate::pipeline::register::RegisterReport;
 use crate::pipeline::versions::recorded_versions;
 use crate::pipeline::weights::{current_weights, subset_measure};
-use crate::pipeline::{athf_path, common_cards, config_hash, frame_stem, ln_runs, source_facts, Ctx, Manifest, Stage};
+use crate::pipeline::measure::athf_in;
+use crate::pipeline::{common_cards, config_hash, frame_stem, ln_runs, source_facts, warn_user, Ctx, Manifest, Stage};
 use crate::resample::Interpolation;
 use crate::stacking::config::AlgorithmConfig;
 use crate::stacking::fits_artifact::read_fits;
@@ -142,8 +143,7 @@ impl Ranking {
     pub(crate) fn anchor(&self, ctx: &Ctx<'_>) -> Option<usize> {
         let (pick, coverage_dropped) = pick_ln_anchor(&self.weights, &self.star_counts, &self.sky, &self.coverage);
         if let Some(count) = coverage_dropped {
-            tracing::warn!(count, min_coverage = MIN_REFERENCE_COVERAGE, "reference-coverage filter dropped for the anchor: fewer than 3 members pass");
-            ctx.progress.warn(&format!(
+            warn_user(ctx, &format!(
                 "reference-coverage filter dropped for normalization anchoring: only {count} member(s) cover the reference geometry (need >= 3)"
             ));
         }
@@ -152,8 +152,7 @@ impl Ranking {
             return None;
         };
         if let Some(count) = sky_fallback {
-            tracing::warn!(count, "no admissible member has a usable measured background; anchoring by weight alone");
-            ctx.progress.warn(&format!(
+            warn_user(ctx, &format!(
                 "no admissible member has a usable measured background: anchored by weight alone among {count} candidate(s)"
             ));
         }
@@ -164,10 +163,10 @@ impl Ranking {
 
 /// A frame's own star fits, one list per plane, for the seeds of its scale. A missing file is a plane with no seeds (the
 /// scale then falls back to detection); an unreadable one is logged, at `warn` where `loud` (the calibration's frames).
-fn load_fits(work: &Path, file: &Path, planes: usize, loud: bool) -> Vec<Vec<StarFit>> {
+fn load_fits(fits_root: &Path, file: &Path, planes: usize, loud: bool) -> Vec<Vec<StarFit>> {
     (0..planes)
         .map(|plane| {
-            let path = athf_path(work, file, plane);
+            let path = athf_in(fits_root, frame_stem(file), plane);
             if !path.exists() {
                 tracing::debug!(path = %path.display(), plane, "ln: no fits artifact; falling back to detection for this plane");
                 return Vec::new();
@@ -211,7 +210,7 @@ pub fn normalize(
     cfg: &AlgorithmConfig,
 ) -> Result<NormalizeReport> {
     if frames.is_empty() {
-        bail!("no frames to normalize");
+        refuse!("no frames to normalize");
     }
     if !ln_runs(cfg) {
         let note = "local normalization is not asked for (normalization.local.enabled is off and normalization.rejection is not local); nothing to do".to_string();
@@ -272,8 +271,7 @@ fn fallback_warning(rejection_only: bool, what: &Fallback<'_>) -> String {
 /// are gone), committed with the stage's manifest entry.
 fn off(ctx: &Ctx<'_>, work: &Path, cfg: &AlgorithmConfig, files: &[PathBuf], what: Fallback<'_>) -> Result<NormalizeReport> {
     let note = fallback_warning(!cfg.normalization.local.enabled, &what);
-    tracing::warn!("{note}");
-    ctx.progress.warn(&note);
+    warn_user(ctx, &note);
     let report = NormalizeReport::idle(NormalizeStatus::Off, note, cfg.clone(), recorded_versions());
     let final_dir = ln_dir(work);
     let part_dir = part_path(&final_dir);
@@ -326,7 +324,7 @@ fn run(ctx: &Ctx<'_>, work: &Path, sub: &MeasureReport, register: &RegisterRepor
         });
     }
     if stack_frames.len() < 3 {
-        bail!(
+        refuse!(
             "local normalization needs at least 3 included, registered frames; {} of {} qualify under this config",
             stack_frames.len(),
             files.len()
@@ -357,7 +355,7 @@ fn run(ctx: &Ctx<'_>, work: &Path, sub: &MeasureReport, register: &RegisterRepor
     // The anchor, then the LN reference's members: the same sky-penalized ranking over the members that cover the
     // reference rectangle (the filter is dropped, with a warning, for a group where fewer than 3 pass).
     let Some(anchor) = ranking.anchor(ctx) else {
-        bail!("no included frame can anchor the normalization");
+        refuse!("no included frame can anchor the normalization");
     };
     let coverage_mask: Vec<bool> = ranking.coverage.iter().map(|&c| c >= MIN_REFERENCE_COVERAGE).collect();
     let admissible = coverage_mask.iter().filter(|&&ok| ok).count();
@@ -367,8 +365,7 @@ fn run(ctx: &Ctx<'_>, work: &Path, sub: &MeasureReport, register: &RegisterRepor
         let message = format!(
             "reference-coverage filter dropped for the LN reference's member list: only {admissible} member(s) cover the reference geometry (need >= 3)"
         );
-        tracing::warn!(count = admissible, min_coverage = MIN_REFERENCE_COVERAGE, "reference-coverage filter dropped for this group: fewer than 3 members pass");
-        ctx.progress.warn(&message);
+        warn_user(ctx, &message);
         vec![true; stack_frames.len()]
     };
     let ranked = sky_penalized_order(&ranking.weights, &included_mask, &ranking.star_counts, &ranking.sky);
@@ -391,6 +388,7 @@ fn run(ctx: &Ctx<'_>, work: &Path, sub: &MeasureReport, register: &RegisterRepor
     let built = build(
         ctx,
         work,
+        &sub.fits_root(work),
         cfg,
         &part_dir,
         &stack_frames,
@@ -433,8 +431,7 @@ fn run(ctx: &Ctx<'_>, work: &Path, sub: &MeasureReport, register: &RegisterRepor
                 "local normalization left {} frame(s); a stack needs at least 3",
                 survivors.len()
             );
-            tracing::warn!("{message}");
-            ctx.progress.warn(&message);
+            warn_user(ctx, &message);
         } else {
             let refs: Vec<&StackFrame> = survivors.iter().map(|&k| &stack_frames[k]).collect();
             report.anchor_after_exclusions = Ranking::of(&refs, ref_w, ref_h).anchor(ctx).map(|i| member_file(survivors[i]));
@@ -475,6 +472,7 @@ enum Built {
 fn build(
     ctx: &Ctx<'_>,
     work: &Path,
+    fits_root: &Path,
     cfg: &AlgorithmConfig,
     part_dir: &Path,
     stack_frames: &[StackFrame],
@@ -583,7 +581,7 @@ fn build(
     let seeds_calibration: Option<SeedsCalibration> = if calibration_indices.is_empty() {
         None
     } else {
-        let load = |i: usize| load_fits(work, &stack_frames[i].path, stack_frames[i].measurement.channels.len(), true);
+        let load = |i: usize| load_fits(fits_root, &stack_frames[i].path, stack_frames[i].measurement.channels.len(), true);
         let run_jobs = |count: usize, job: &(dyn Fn(usize) -> Option<LnFrameOutcome> + Sync)| -> Vec<Option<LnFrameOutcome>> {
             fan_out(ctx, count, concurrency, job).into_iter().map(Option::flatten).collect()
         };
@@ -617,7 +615,7 @@ fn build(
     // Every member against the reference.
     let results = fan_out(ctx, stack_frames.len(), concurrency, |k| {
         let frame = &stack_frames[k];
-        let fits = load_fits(work, &frame.path, frame.measurement.channels.len(), false);
+        let fits = load_fits(fits_root, &frame.path, frame.measurement.channels.len(), false);
         let sidecar = part_dir.join(format!("{}.athln", frame_stem(&frame.path)));
         let out = normalize_frame(
             &ln_reference,
@@ -677,12 +675,10 @@ fn build(
         // global normalization with a warning.
         let fail = |row: &mut NormalizeFrame, reason: String| {
             if ln_drives_output {
-                tracing::warn!(path = %file.display(), reason = %reason, "frame excluded: local normalization");
-                ctx.progress.warn(&format!("{}: {reason}; the frame is excluded", file.display()));
+                warn_user(ctx, &format!("{}: {reason}; the frame is excluded", file.display()));
                 row.status = FrameStatus::Excluded;
             } else {
-                tracing::warn!(path = %file.display(), reason = %reason, "local normalization failed; frame keeps global normalization");
-                ctx.progress.warn(&format!(
+                warn_user(ctx, &format!(
                     "{}: local rejection normalization could not be computed ({reason}); this frame's rejection used the global normalization",
                     file.display()
                 ));
@@ -739,8 +735,7 @@ fn build(
         let message = format!(
             "{aperture_shortfalls} frame(s) were left out of local normalization because the common aperture could not measure enough stars on them; Star flux: PSF signal may keep them"
         );
-        tracing::warn!(count = aperture_shortfalls, "local normalization excluded frames the common aperture could not measure");
-        ctx.progress.warn(&message);
+        warn_user(ctx, &message);
     }
     if low_overlap > 0 {
         let percent = LN_MIN_OVERLAP * 100.0;
@@ -749,8 +744,7 @@ fn build(
         } else {
             format!("{low_overlap} frame(s) used the global normalization for rejection: under {percent:.0} % overlap with the reference frame")
         };
-        tracing::warn!(count = low_overlap, "local normalization kept frames with little overlap on global normalization");
-        ctx.progress.warn(&message);
+        warn_user(ctx, &message);
     }
     Ok(Built::Ran { report, normalized })
 }

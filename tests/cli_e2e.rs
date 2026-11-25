@@ -152,7 +152,8 @@ fn raw_set(dir: &Path, n: usize) -> (PathBuf, PathBuf) {
     }
     for k in 0..8 {
         let v: Vec<u16> = (0..768 * 512).map(|i| 100 + (6.0 * noise(k as u64 + 1, i)) as u16).collect();
-        write_u16(&darks.join(format!("Dark_{k:04}.fits")), 768, 512, &v, &[("EXPTIME", "300.0".to_string())]);
+        let extra = [("EXPTIME", "300.0".to_string()), ("IMAGETYP", "'Dark'".to_string())];
+        write_u16(&darks.join(format!("Dark_{k:04}.fits")), 768, 512, &v, &extra);
     }
     (lights, darks)
 }
@@ -288,7 +289,7 @@ fn stack_with_a_frame_never_registered_fails_naming_it_and_register() {
     args.extend(frames.iter().map(|f| f.clone().into_os_string()));
     args.extend(NO_LN.iter().map(Into::into));
     let out = in_work(&work, &args);
-    assert_ne!(code(&out), 0);
+    assert_eq!(code(&out), 2, "a frame with no transform is the input's fault: {}", stderr(&out));
     let err = stderr(&out);
     assert!(err.contains("c_Light_0003.fits") && err.contains("starloom register"), "{err}");
     assert!(!work.join("stack").join("master.fits").exists());
@@ -312,6 +313,23 @@ fn stack_with_another_weight_mode_re_weighs_from_the_stored_measurements() {
     assert_eq!(measured["config"]["measurement"]["weightMode"], "psfSignalWeight", "measure's own record is untouched");
 }
 
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn os(args: &[&std::ffi::OsStr]) -> Vec<std::ffi::OsString> {
+    args.iter().map(|a| (*a).to_os_string()).collect()
+}
+
 #[test]
 fn explicit_product_paths_override_the_working_folder() {
     let tmp = tempfile::tempdir().unwrap();
@@ -320,30 +338,74 @@ fn explicit_product_paths_override_the_working_folder() {
     let named = |extra: Vec<std::ffi::OsString>| -> Vec<std::ffi::OsString> {
         extra.into_iter().chain(frames.iter().map(|f| f.clone().into_os_string())).collect()
     };
+    // The chain in its own folder: the master and its weights are the reference.
     ok(&in_work(&work_a, &named(vec!["measure".into()])));
     let measure_json = work_a.join("measure").join("measure.json");
-    // `register` in another folder reads the measurement it is given.
-    ok(&in_work(
+    ok(&in_work(&work_a, &named(vec!["register".into(), "--reference".into(), frames[0].clone().into_os_string()])));
+    let mut args = named(vec!["stack".into()]);
+    args.extend(NO_LN.iter().map(Into::into));
+    ok(&in_work(&work_a, &args));
+    let (master_a, weights_a) = (work_a.join("stack").join("master.fits"), work_a.join("stack").join("weights.json"));
+
+    // `register` in another folder reads the measurement it is given, and its star fits from beside it (nothing is
+    // detected again), taking the frames the report lists when it is given none.
+    let out = in_work(
         &work_b,
-        &named(vec!["register".into(), "--reference".into(), frames[0].clone().into_os_string(), "--measure".into(), measure_json.clone().into_os_string()]),
-    ));
+        &os(&["register".as_ref(), "--reference".as_ref(), frames[0].as_os_str(), "--measure".as_ref(), measure_json.as_os_str()]),
+    );
+    ok(&out);
+    assert!(!stderr(&out).contains("no readable fits artifact"), "register reused Measure's fits:\n{}", stderr(&out));
     assert!(!work_b.join("measure").exists());
-    // `stack` in a third folder reads both, and writes where `-o` says.
+    // `stack` in a third folder reads both and writes where `-o` says; the weights (which read the `.athf` files) and
+    // the master are the in-folder chain's.
     let out_dir = tmp.path().join("elsewhere");
-    let mut args = named(vec![
-        "stack".into(),
-        "--measure".into(),
-        measure_json.into_os_string(),
-        "--transforms".into(),
-        work_b.join("register").join("transforms.json").into_os_string(),
-        "-o".into(),
-        out_dir.clone().into_os_string(),
+    let mut args = os(&[
+        "stack".as_ref(),
+        "--measure".as_ref(),
+        measure_json.as_os_str(),
+        "--transforms".as_ref(),
+        work_b.join("register").join("transforms.json").as_os_str(),
+        "-o".as_ref(),
+        out_dir.as_os_str(),
     ]);
     args.extend(NO_LN.iter().map(Into::into));
-    ok(&in_work(&work_c, &args));
-    assert!(out_dir.join("master.fits").is_file());
+    let out = in_work(&work_c, &args);
+    ok(&out);
+    assert!(!stderr(&out).contains("without a readable .athf"), "{}", stderr(&out));
     assert!(!work_c.join("stack").join("master.fits").exists());
     assert!(!work_c.join("measure").exists() && !work_c.join("register").exists());
+    assert_eq!(std::fs::read(work_c.join("stack").join("weights.json")).unwrap(), std::fs::read(&weights_a).unwrap(), "the same weights");
+    assert_eq!(std::fs::read(out_dir.join("master.fits")).unwrap(), std::fs::read(&master_a).unwrap(), "the same master");
+}
+
+#[test]
+fn stack_reads_the_grids_from_the_ln_folder_it_is_given() {
+    let tmp = tempfile::tempdir().unwrap();
+    let frames = calibrated_frames(&tmp.path().join("cal"), 4);
+    let (work_a, work_b) = (tmp.path().join("a"), tmp.path().join("b"));
+    measured_and_registered(&work_a, &frames);
+    ok(&in_work(&work_a, &["normalize"]));
+    ok(&in_work(&work_a, &["stack"]));
+    let master_a = std::fs::read(work_a.join("stack").join("master.fits")).unwrap();
+
+    // The folder is copied and the original removed: the paths `normalize.json` recorded lead nowhere.
+    let copy = tmp.path().join("ln-copy");
+    copy_dir(&work_a.join("ln"), &copy);
+    std::fs::remove_dir_all(work_a.join("ln")).unwrap();
+    let out = in_work(
+        &work_b,
+        &os(&[
+            "stack".as_ref(),
+            "--measure".as_ref(),
+            work_a.join("measure").join("measure.json").as_os_str(),
+            "--transforms".as_ref(),
+            work_a.join("register").join("transforms.json").as_os_str(),
+            "--ln".as_ref(),
+            copy.as_os_str(),
+        ]),
+    );
+    ok(&out);
+    assert_eq!(std::fs::read(work_b.join("stack").join("master.fits")).unwrap(), master_a, "the same master");
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -365,10 +427,15 @@ fn every_command_writes_a_jsonl_log_a_history_row_and_a_summary_line() {
     let name = logs[0].file_name().unwrap().to_string_lossy().into_owned();
     assert!(name.ends_with("Z-measure.jsonl") && name.len() == "20261125T101010.123Z-measure.jsonl".len(), "{name}");
     let text = std::fs::read_to_string(&logs[0]).unwrap();
-    assert!(text.lines().count() > 0);
-    for line in text.lines() {
-        serde_json::from_str::<Value>(line).unwrap_or_else(|e| panic!("log line is not JSON ({e}): {line}"));
-    }
+    let events: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("log line is not JSON ({e}): {line}")))
+        .collect();
+    assert!(!events.is_empty());
+    // The file always holds debug, and `--threads 2` (which the helper passes) is what the pool was built with.
+    let pool = events.iter().find(|e| e["fields"]["message"] == "thread pool built").expect("a `thread pool built` event");
+    assert_eq!((pool["level"].as_str(), pool["fields"]["threads"].as_u64()), (Some("DEBUG"), Some(2)), "{pool}");
+    assert!(events.iter().any(|e| e["fields"]["message"] == "effective config"), "the effective config is logged at debug");
 
     let rows = history(&work);
     assert_eq!(rows.len(), 1);
@@ -388,6 +455,14 @@ fn a_refused_command_leaves_its_log_and_a_history_row_with_code_2() {
     assert_eq!(code(&out), 2);
     assert!(stderr(&out).contains("noSuchKey"), "{}", stderr(&out));
     assert_eq!(log_files(&work).len(), 1);
+    // The log says why the command ended, not only that it did.
+    let log = std::fs::read_to_string(&log_files(&work)[0]).unwrap();
+    let why = log
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|e| e["level"] == "ERROR")
+        .expect("an error event in the log");
+    assert!(why["fields"]["text"].as_str().unwrap().contains("noSuchKey"), "{why}");
     let rows = history(&work);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["exitCode"], 2);
@@ -437,4 +512,85 @@ fn the_version_flag_prints_the_crate_version() {
     let out = starloom(&["--version"]);
     ok(&out);
     assert_eq!(stdout(&out).trim(), format!("starloom {}", env!("CARGO_PKG_VERSION")));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Review round: warnings, exit codes by kind, the shell-glob refusal, merged flags
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_warning_shows_once_on_stderr_and_once_in_the_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Two frames: fewer than the three a stack needs, which `measure` warns about.
+    let frames = calibrated_frames(&tmp.path().join("cal"), 2);
+    let work = tmp.path().join("work");
+    let mut args: Vec<std::ffi::OsString> = vec!["measure".into()];
+    args.extend(frames.iter().map(|f| f.clone().into_os_string()));
+    let out = in_work(&work, &args);
+    ok(&out);
+    let sentence = "frames are included; a stack needs at least 3";
+    assert_eq!(stderr(&out).matches(sentence).count(), 1, "stderr:\n{}", stderr(&out));
+    let log = std::fs::read_to_string(&log_files(&work)[0]).unwrap();
+    let events: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let warned = events.iter().filter(|e| e["fields"]["text"].as_str().is_some_and(|t| t.contains(sentence))).count();
+    assert_eq!(warned, 1, "the log holds the warning once");
+}
+
+#[test]
+fn the_exit_code_follows_the_kind_of_the_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let frames = calibrated_frames(&tmp.path().join("cal"), 3);
+    let frame = frames[0].as_os_str();
+
+    // A manifest that is not a starloom file is the input's fault; one that cannot be read at all is the machine's.
+    let bad = tmp.path().join("bad");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(bad.join("starloom.json"), "this is not json").unwrap();
+    assert_eq!(code(&in_work(&bad, &["measure".as_ref(), frame])), 2);
+    let unreadable = tmp.path().join("unreadable");
+    std::fs::create_dir_all(unreadable.join("starloom.json")).unwrap();
+    let out = in_work(&unreadable, &["measure".as_ref(), frame]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+
+    // A measurement report that is not one is a refusal.
+    let report = tmp.path().join("measure.json");
+    std::fs::write(&report, "{\"format\": \"something-else\"}").unwrap();
+    let out = in_work(&tmp.path().join("w"), &["register".as_ref(), "--measure".as_ref(), report.as_os_str(), frame]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+}
+
+#[test]
+fn a_dark_given_as_a_light_names_the_shell_glob() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (lights, darks) = raw_set(tmp.path(), 3);
+    // `calibrate lights --dark darks/*.fits` as a shell passes it: `--dark` gets the first dark, the others are lights.
+    let mut args: Vec<std::ffi::OsString> = vec!["calibrate".into(), lights.clone().into_os_string(), "--dark".into()];
+    for k in 0..4 {
+        args.push(darks.join(format!("Dark_{k:04}.fits")).into_os_string());
+    }
+    let work = tmp.path().join("work");
+    let out = in_work(&work, &args);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("Dark_0001.fits") && err.contains("a shell expanded") && err.contains("quote it"), "{err}");
+    assert!(!work.join("calibrated").exists(), "nothing was calibrated");
+
+    // Quoted, the program expands the glob itself and the same command works.
+    let glob = darks.join("*.fits");
+    let out = in_work(&work, &["calibrate".as_ref(), lights.as_os_str(), "--dark".as_ref(), glob.as_os_str()]);
+    ok(&out);
+}
+
+#[test]
+fn set_and_v_before_and_after_the_subcommand_are_merged() {
+    let out = starloom(&["--set", "measurement.weightMode=psfSnr", "config", "show", "--set", "integration.minWeight=0.25"]);
+    ok(&out);
+    let shown: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(shown["measurement"]["weightMode"], "psfSnr", "the set before the subcommand is kept");
+    assert_eq!(shown["integration"]["minWeight"], 0.25, "the set after it too");
+
+    // Later wins, as for two `--set`s on one side: the one after the subcommand is the later.
+    let out = starloom(&["--set", "integration.minWeight=0.1", "config", "show", "--set", "integration.minWeight=0.3"]);
+    ok(&out);
+    assert_eq!(serde_json::from_str::<Value>(&stdout(&out)).unwrap()["integration"]["minWeight"], 0.3);
 }
