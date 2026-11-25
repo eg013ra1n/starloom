@@ -74,6 +74,7 @@ every stage version stays and every existing golden row is unchanged.
 - `[profile.release]` is `lto = "thin"`, `codegen-units = 4`, Athenaeum's release profile. Equality with Athenaeum is
   claimed for that profile only.
 - CI runs the `cli` layer on Linux, macOS and Windows and installs the binary on Linux.
+- The stage golden rows now cover x86_64 Linux and Windows as well as macOS, each copied from its own CI run, so every platform checks its numbers and not only their determinism.
 
 ### Differences from Athenaeum's own run
 
